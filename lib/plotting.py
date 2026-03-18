@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from lib.paths import PLOTS
-
+from lib.utils import _halfspace_polygon_4ineq
 
 # ====================== PLOTTING UTILITIES ======================
 
@@ -649,3 +649,103 @@ def plot_weather_snapshot(map, weather, variable="current_x", t_index=0, show: b
     )
 
     _save_and_maybe_show(fig, f"weather_snapshot_{variable}_t{t_index}", show)
+
+def plot_zones_and_points(
+    ship_pos: np.ndarray,
+    zone_ineq: np.ndarray,
+    eps_in: float = 0.0,
+    eps_poly: float = 1e-9,
+    name: str = "zones_and_trajectory",
+    show: bool = False,
+):
+    ship_pos = np.asarray(ship_pos, dtype=float)
+
+    if ship_pos.ndim == 1:
+        assert ship_pos.shape == (2,), \
+            f"ship_pos must be shape (2,) or (T,2), got {ship_pos.shape}"
+        ship_pos = ship_pos[None, :]
+
+    assert ship_pos.ndim == 2 and ship_pos.shape[1] == 2, \
+        f"ship_pos must be shape (T,2), got {ship_pos.shape}"
+
+    T = ship_pos.shape[0]
+    nb_zones = zone_ineq.shape[2]
+
+    x = ship_pos[:, 0]
+    y = ship_pos[:, 1]
+
+    vals_all = (
+        y[:, None, None] * zone_ineq[0, :, :]
+        + x[:, None, None] * zone_ineq[1, :, :]
+        + zone_ineq[2, :, :]
+    )
+    in_zone = np.all(vals_all >= -eps_in, axis=1).astype(int)
+
+    print("in_zone[t, z] = 1 means inside zone z at timestep t")
+    for t in range(T):
+        zones_t = np.where(in_zone[t])[0].tolist()
+        print(f"t={t}: zones = {zones_t}")
+
+    fig, ax = plt.subplots(figsize=(7.2, 6.0), dpi=140)
+    cmap = plt.get_cmap("tab20")
+    any_poly = False
+
+    for z in range(nb_zones):
+        A = np.column_stack([
+            zone_ineq[1, :, z],
+            zone_ineq[0, :, z],
+        ])
+        b = zone_ineq[2, :, z].astype(float)
+
+        verts, _ = _halfspace_polygon_4ineq(A, b, eps=eps_poly)
+
+        color = cmap(z % cmap.N)
+        if verts is not None:
+            any_poly = True
+            ax.fill(verts[:, 0], verts[:, 1], alpha=0.25, color=color)
+            ax.plot(
+                np.r_[verts[:, 0], verts[0, 0]],
+                np.r_[verts[:, 1], verts[0, 1]],
+                linewidth=1.0,
+                color=color,
+            )
+            c = verts.mean(axis=0)
+            ax.text(c[0], c[1], str(z), fontsize=9)
+
+    ax.plot(x, y, "-o", linewidth=1.5, markersize=4, label="trajectory")
+    ax.scatter(x[0], y[0], s=80, marker="s", label="start")
+    ax.scatter(x[-1], y[-1], s=80, marker="*", label="end")
+
+    if any_poly:
+        all_verts = []
+        for z in range(nb_zones):
+            A = np.column_stack([zone_ineq[1, :, z], zone_ineq[0, :, z]])
+            b = zone_ineq[2, :, z].astype(float)
+            verts, _ = _halfspace_polygon_4ineq(A, b, eps=eps_poly)
+            if verts is not None:
+                all_verts.append(verts)
+
+        if all_verts:
+            all_verts = np.vstack(all_verts)
+            xmin, ymin = all_verts.min(axis=0)
+            xmax, ymax = all_verts.max(axis=0)
+            dx = max(1e-6, xmax - xmin)
+            dy = max(1e-6, ymax - ymin)
+            pad = 0.08
+            ax.set_xlim(xmin - pad * dx, xmax + pad * dx)
+            ax.set_ylim(ymin - pad * dy, ymax + pad * dy)
+    else:
+        xmin, ymin = ship_pos.min(axis=0)
+        xmax, ymax = ship_pos.max(axis=0)
+        ax.set_xlim(xmin - 50, xmax + 50)
+        ax.set_ylim(ymin - 50, ymax + 50)
+
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, which="both", linestyle="--", linewidth=0.6, alpha=0.6)
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_title("Zones (filled) and ship trajectory")
+    ax.legend()
+
+    _save_and_maybe_show(fig, name, show)
+    return in_zone
