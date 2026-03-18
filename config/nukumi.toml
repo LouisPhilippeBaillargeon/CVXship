@@ -1,0 +1,141 @@
+# ============================
+# SHIP GENERAL INFO
+# max_speed     : maximal ship speed (m/s)
+# weight        : current weight of the ship( kg)
+# rho_water     : water density (kg/m^3)
+# displacement  : volume of water displaced by the ship (m^3)
+# rho_air       : air density (kg/m^3)
+# g             : gravitational constant
+# ============================
+[info]
+max_speed       = 7.2
+weight          = 32085000
+rho_water       = 1025
+displacement    = 31302
+rho_air         = 1.224
+g               = 9.81
+
+# ============================
+# HULL
+# B             : Beam_len (m) largeur
+# L             : Length_total (m)
+# LPP           : Length between perpendiculars (m) 
+# CB            : Block coefficient 
+# kyy           : Non-dimensional radius of gyration of pitch, % LPP distribution de la masse
+# T             : Draught at midship (m) #equipage
+# TF            : Draught at F.P. (m)
+# TA            : Draught at A.P. (m)
+# E1            : Waterline angle (rad), See https://www.sciencedirect.com/science/article/pii/S0029801821013020
+# E1            : Waterline angle (rad), See https://www.sciencedirect.com/science/article/pii/S0029801821013020
+# AL_air        : Side above water projected area (m^2)
+# AF_air        : Front above water projected area (m^2)
+# AL_water      : Side bellow water projected area (m^2)
+# AF_water      : Front bellow water projected area (m^2)
+# CDt           : Coefficient for Blenderman wind computation, see https://github.com/cybergalactic/FossenHandbook chap 10
+# CDlAF_bow     : Coefficient for Blenderman wind computation, see https://github.com/cybergalactic/FossenHandbook chap 10
+# CDlAF_stern   : Coefficient for Blenderman wind computation, see https://github.com/cybergalactic/FossenHandbook chap 10
+# delta         : Coefficient for Blenderman wind computation, see https://github.com/cybergalactic/FossenHandbook chap 10
+# kappa         : Coefficient for Blenderman wind computation, see https://github.com/cybergalactic/FossenHandbook chap 10
+# ============================
+[hull]
+B               = 23.76
+L               = 225.5
+LPP             = 223.76
+CB              = 0.92
+kyy             = 
+T               = 8.16
+TF              = 8.16
+TA              = 8.16
+E1              = 
+E2              = 
+AL_air          = 
+AF_air          = 
+AF_water        = 
+AL_water        = 
+CDt             = 
+CDlAF_bow       = 
+CDlAF_stern     = 
+delta           = 
+kappa           = 
+
+# ============================
+# PROPULSION
+# D             : Screw diameter (m)
+# pitch         : Screw ptich (m)
+# AE_AO         : Blade-area ratio
+# nb_blades     : Blades per propellers
+# nb_propellers : Propellers per ship
+# min_n         : Minmimum rotational speed (turns/sec)
+# max_n         : Maximum rotational speed (turns/sec)
+# min_pow       : Minimum propulsion power (MW)
+# max_pow       : Maximum propulsion power (MW)
+# min_thrust    : Minimum propulsion thrust (MN)
+# max_thrust    : Maximum propulsion thrust (MN)
+# wake_fraction : Water relative speed is slower on the stern than on the bow, because ships accelerate water. This is the fraction of relative speed reduced due to this effect, assumed constant.
+# ============================
+[propulsion]
+D               = 4.95
+pitch           = 
+AE_AO           = 
+nb_blades       = 4
+nb_propellers   = 2
+min_n           = 
+max_n           = 
+min_pow         = 0
+max_pow         = 4 # chaque (2), inventé
+min_thrust      = 
+max_thrust      = 
+wake_fraction   = 
+
+
+# ============================
+# BATTERY
+# capacity      : (MWh)
+# max_charge_pow: (MW)
+# max_discharge_pow: (MW)
+# discharge_eff : (/1)
+# charge_eff    : (/1)
+# leak          : (/1)
+# ============================
+[battery]
+capacity        = 1
+max_charge_pow  = 0.5
+max_discharge_pow= 0.5
+discharge_eff   = 0.95
+charge_eff      = 0.95
+leak            = 0.995
+
+
+# ============================
+# SOLAR PANNELS
+# area          : (m^2)
+# efficiency    : (/1)
+# ============================
+[solarPannels]
+area            = 100
+efficiency      = 0.3
+
+# ============================
+# GENERATORS
+# power         : list of breakpoints (MW)
+# eff           : fuel rate at each breakpoint power (kg/MW)
+# ============================
+[[generators]]
+name            = "Gen1"
+power           = [0.28, 0.56, 1.4, 1.96, 2.08, 2.4, 2.8]
+eff             = [232, 215, 185, 180, 183, 185, 190]
+
+[[generators]]
+name            = "Gen2"
+power           = [0.28, 0.56, 1.4, 1.96, 2.08, 2.4, 2.8]
+eff             = [232, 215, 185, 180, 183, 185, 190]
+
+[[generators]]
+name            = "Gen3"
+power           = [0.28, 0.56, 1.4, 1.96, 2.08, 2.4, 2.8]
+eff             = [232, 215, 185, 180, 183, 185, 190]
+
+[[generators]]
+name            = "Gen4"
+power           = [0.28, 0.56, 1.4, 1.96, 2.08, 2.4, 2.8]
+eff             = [232, 215, 185, 180, 183, 185, 190]

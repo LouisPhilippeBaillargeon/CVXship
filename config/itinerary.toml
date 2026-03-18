@@ -1,0 +1,40 @@
+# ============================
+# PARAMETERS
+# soc_i              : Initial state of charge (MWh)
+# soc_f              : Desired final state of charge (MWh)
+# timestep           : Duration of one timestep (h). 
+# fuel_price         : ($/kg)
+#Note : if there is not an integer amount of timesteps in the total duration of your trip (eg : trip duration = 4h37, timestep = 1h), then trip will be constrained to be done in 4h.
+# ============================
+[params]
+soc_i               = 10
+soc_f               = 20
+timestep            = 0.25
+fuel_price          = 1.396
+
+# ============================
+# List of transit cities considered in the problem
+#city                : Name
+#arrival_datetime    : "YYYY-MM-DDTHH:MM" in the UTC timezone
+#departure_datetime  : "YYYY-MM-DDTHH:MM" in the UTC timezone
+#lat                 : lattitude
+#lon                 : longitude
+#power_cost          : ($/MWh)
+# ============================
+[[transit]]
+city                = "Halifax"
+arrival_datetime    = "2025-06-01T00:00"
+departure_datetime  = "2025-06-01T04:00"
+lat                 = 44.5513889
+lon                 = -63.384444
+power_cost          = 183
+max_charge_power    = 5
+
+[[transit]]
+city                = "GrandeEntree"
+arrival_datetime    = "2025-06-01T22:00"
+departure_datetime  = "2025-06-02T04:00"
+lat                 = 45.970663
+lon                 = -62.350969
+power_cost          = 36.81
+max_charge_power    = 5
