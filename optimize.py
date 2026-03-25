@@ -333,6 +333,11 @@ if __name__ == "__main__":
 
     if path.sol is None:
         raise RuntimeError("ShortestPath did not produce a solution.")
+    
+    T_future = itinerary.nb_timesteps - states.timesteps_completed
+    instant_sail, port_idx, interval_sail_fraction = classify_timesteps(itinerary)
+    instant_sail = instant_sail[states.timesteps_completed:]
+    sail_time = np.sum(instant_sail)*itinerary.timestep
 
     optimizer = MICPOptimizer_Fixed_Path(
     wave_model=wave_model,
@@ -346,6 +351,7 @@ if __name__ == "__main__":
     ship=ship,
     waypoints=path.sol.waypoints,
     path_zone_ids=path.sol.zone_sequence,
+    ref_speed = (path.sol.total_distance/sail_time)*1000/3600
     )
 
     optimizer.states.timesteps_completed = 40

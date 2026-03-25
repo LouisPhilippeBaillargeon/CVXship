@@ -765,6 +765,8 @@ class MICPOptimizer_Fixed_Path:
     # Fixed path
     waypoints           : np.ndarray
     path_zone_ids       : List[int]
+    ref_speed           : float
+    
 
     sol: Optional[Solution] = field(default=None, init=False)
 
@@ -922,6 +924,14 @@ class MICPOptimizer_Fixed_Path:
         constraints += [normalized_rel_speed == speed_rel_water_mag/self.ship.info.max_speed]
         constraints += [normalized_speed == speed_mag/self.ship.info.max_speed]
 
+        #Get CT calm water coefficient based on ref speed
+        print("self.ref_speed", self.ref_speed)
+        Fr = self.ref_speed/np.sqrt(self.ship.info.g*self.ship.hull.LPP)
+        CD = np.interp(
+            Fr,
+            self.ship.hull.CD_water_breakpoints,
+            self.ship.hull.CD_water_curve
+        )
         
         wind_model_future = self.wind_model.thrust_coeffs[:, self.states.timesteps_completed : self.states.timesteps_completed + T_future, :]  # shape [nb_zones, T_future, nb_coeff]
         wave_model_future = self.wave_model.thrust_coeffs[:, self.states.timesteps_completed : self.states.timesteps_completed + T_future, :]  # shape [nb_zones, T_future, nb_coeff]
@@ -950,7 +960,7 @@ class MICPOptimizer_Fixed_Path:
                                     wave_model_future[z,t,8]*speed_rel_water[t,1]/self.ship.info.max_speed + wave_model_future[z,t,9]*cp.power(speed_rel_water[t,1]/self.ship.info.max_speed,2) + 
                                     wave_model_future[z,t,10]*cp.power(speed_rel_water[t,1]/self.ship.info.max_speed,4) - (wave_max_res_future[z,t]+1)*(1 - seg[t, z])
                     ]
-                constraints += [current_resistance[t] >= cp.power(speed_rel_water_mag[t],2)*self.ship.hull.AF_water*self.ship.info.rho_water/1000000]
+                constraints += [current_resistance[t] >= 0.5*CD*cp.power(speed_rel_water_mag[t],2)*self.ship.hull.AF_water*self.ship.info.rho_water/1000000]
                 
             else: # if at a port
                 constraints += [wave_resistance[t] == 0]
@@ -965,7 +975,7 @@ class MICPOptimizer_Fixed_Path:
 
         #==================================================PROPULSION=======================================================
         res_per_prop = cp.Variable(T_future)
-        prop_power = cp.Variable(T_future)
+        prop_power = cp.Variable(T_future, nonneg = True)
         advance_speed = cp.Variable(T_future)
         norm_adv_speed = cp.Variable(T_future)
         
