@@ -5,7 +5,8 @@ import time
 from lib.load_params import load_config
 from lib.models import PropulsionModel, WaveModel, WindModel, GeneratorModel, save_obj, load_obj
 from lib.paths import WIND_MODEL, WAVE_MODEL, PROPULSION_MODEL, GENERATOR_MODEL
-from lib.plotting import summarize_and_plot_solution, plot_weather_snapshot, summarize_and_plot_solutions_overlay
+
+from lib.plotting import summarize_and_plot_solution, plot_weather_snapshot, summarize_and_plot_solutions_overlay, plot_zones_and_points
 from lib.optimizers import MICPOptimizer, GreedyController, Solution, MinDist_ConstSpeed_FixedStep, MICPOptimizer_Integer, _compute_tight_big_M_zone, _compute_tight_big_M_transition, MICPOptimizer_Fixed_Path, ShortestPath
 from lib.utils import point_in_zones, dx_dy_km, plot_zones_and_points, classify_timesteps, compute_port_zone_indices
 
