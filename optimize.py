@@ -5,9 +5,10 @@ import time
 from lib.load_params import load_config
 from lib.models import PropulsionModel, WaveModel, WindModel, GeneratorModel, save_obj, load_obj
 from lib.paths import WIND_MODEL, WAVE_MODEL, PROPULSION_MODEL, GENERATOR_MODEL
+
 from lib.plotting import summarize_and_plot_solution, plot_weather_snapshot, summarize_and_plot_solutions_overlay, plot_zones_and_points
-from lib.optimizers import MICPOptimizer, GreedyController, Solution, MinDist_ConstSpeed_FixedStep, MICPOptimizer_Integer, _compute_tight_big_M_zone, _compute_tight_big_M_transition
-from lib.utils import point_in_zones, dx_dy_km, classify_timesteps, compute_port_zone_indices
+from lib.optimizers import MICPOptimizer, GreedyController, Solution, MinDist_ConstSpeed_FixedStep, MICPOptimizer_Integer, _compute_tight_big_M_zone, _compute_tight_big_M_transition, MICPOptimizer_Fixed_Path, ShortestPath
+from lib.utils import point_in_zones, dx_dy_km, plot_zones_and_points, classify_timesteps, compute_port_zone_indices
 
 
 new_weather = False
@@ -313,8 +314,62 @@ if __name__ == "__main__":
     _assert_finite("map.zone_adj", map.zone_adj)
     _assert_finite("map.trans_ineq_to", map.trans_ineq_to)
     _assert_finite("map.trans_ineq_from", map.trans_ineq_from)
+
+
+    x, y, _ = dx_dy_km(map, itinerary.transits[-1].lat, itinerary.transits[-1].lon)
     
-    optimizer = MICPOptimizer(
+
+    path = ShortestPath(
+        map                 = map,
+        itinerary           = itinerary,
+        states              = states,
+        weather             = weather,
+        ship                = ship,)
+    path.states.timesteps_completed = 40
+    path.states.current_x_pos = 200
+    path.states.current_y_pos = 400
+    path.states.current_heading = -2
+    path.compute([x,y])
+
+    if path.sol is None:
+        raise RuntimeError("ShortestPath did not produce a solution.")
+
+    optimizer = MICPOptimizer_Fixed_Path(
+    wave_model=wave_model,
+    wind_model=wind_model,
+    propulsion_model=propulsion_model,
+    generator_models=generatorModels,
+    map=map,
+    itinerary=itinerary,
+    states=states,
+    weather=weather,
+    ship=ship,
+    waypoints=path.sol.waypoints,
+    path_zone_ids=path.sol.zone_sequence,
+    )
+
+    optimizer.states.timesteps_completed = 40
+    optimizer.states.current_x_pos = 200
+    optimizer.states.current_y_pos = 400
+    optimizer.states.current_heading = -2
+
+    ok = optimizer.optimize(
+        unit_commitment=False,
+        debug=True,
+    )
+
+    if ok:
+        print("Optimization succeeded.")
+        print("Waypoints:")
+        print(path.sol.waypoints)
+        print("Estimated cost:", optimizer.sol.estimated_cost)
+        summarize_and_plot_solution(optimizer.sol, show = True)
+        n_all, non_conv_sol, dt_h = compute_non_convex_cost_all_timesteps(optimizer, debug=False)
+    else:
+        print("Optimization failed.")
+    
+    '''
+    optimizer = MICPOptimizer_Fixed_Path(
         wave_model          = wave_model,
         wind_model          = wind_model,
         propulsion_model    = propulsion_model,
@@ -376,9 +431,7 @@ if __name__ == "__main__":
     print("zone: ")
     print(optimizer.sol.zone)
     print(non_conv_sol.zone)
-
-
-
+  
     greedy = GreedyController(map, itinerary, states, weather, ship)
     greedy.compute()
     plot_zones_and_points(greedy.sol.ship_pos, greedy.map.zone_ineq)
@@ -396,10 +449,9 @@ if __name__ == "__main__":
     print("Greedy max speed |ship_speed|:", np.max(np.linalg.norm(greedy.sol.ship_speed, axis=1)))
     print("Greedy total distance traveled (km):", np.sum(np.linalg.norm(np.diff(greedy.sol.ship_pos, axis=0), axis=1)))
     
-    summarize_and_plot_solutions_overlay(non_conv_sol, non_conv_sol_greedy,"Optimal", "Greedy")
+    #summarize_and_plot_solutions_overlay(non_conv_sol, non_conv_sol_greedy,"Optimal", "Greedy")
 
 
-    '''
     greedy = MinDist_ConstSpeed_FixedStep(map, itinerary, states, weather, ship)
     greedy.compute(debug=False)
     plot_zones_and_points(greedy.sol.ship_pos, greedy.map.zone_ineq)
