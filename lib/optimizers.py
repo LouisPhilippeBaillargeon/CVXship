@@ -13,7 +13,7 @@ faulthandler.enable()
 from lib.load_params import Ship, Map, Itinerary, States
 from lib.models import WaveModel, WindModel, PropulsionModel, GeneratorModel
 from lib.weather import Weather
-from lib.utils import classify_timesteps, dx_dy_km, compute_port_zone_indices
+from lib.utils import classify_timesteps, dx_dy_km, compute_port_zone_indices, point_in_zones
 from lib.paths import CORNERS, ZONES
 
 
@@ -187,6 +187,7 @@ def _zone_edges_from_corner_ids(zone_corner_ids: dict[int, list[int]]) -> dict[i
 
 def _compute_min_crossing_distance_per_zone(corners_path, zone_corners_path) -> dict[int, float]:
     """
+    Re-factor needed : Corners should be stored in the map object and this function should use it.
     For each zone, compute the shortest valid segment that represents a minimum
     crossing distance through that zone.
 
@@ -301,7 +302,8 @@ def _compute_min_crossing_distance_per_zone(corners_path, zone_corners_path) -> 
 
 def _compute_min_zone_timesteps(corners_path, zone_corners_path, ship_max_speed_mps: float, timestep_h: float) -> dict[int, int]:
     """
-    Convert min crossing distance [km] into minimum required number of timesteps.
+    Convert min crossing distance [km] into minimum required number of timesteps. 
+    Re-factor needed : Corners should be stored in the map object and this function should use it.
     """
     if ship_max_speed_mps <= 0:
         raise ValueError("ship_max_speed_mps must be > 0.")
@@ -760,6 +762,10 @@ class MICPOptimizer_Fixed_Path:
     weather             : Weather
     ship                : Ship
 
+    # Fixed path
+    waypoints           : np.ndarray
+    path_zone_ids       : List[int]
+
     sol: Optional[Solution] = field(default=None, init=False)
 
     def optimize(self,
@@ -782,7 +788,28 @@ class MICPOptimizer_Fixed_Path:
         for t in range(T_future):
             if instant_sail[t]:
                 T_sail_local.append(t)
+
+        # ================================= PATH GEOMETRY FROM WAYPOINTS =================================
+        waypoints = np.asarray(self.waypoints, dtype=float)   # shape (N_wp, 2)
+
+        if waypoints.ndim != 2 or waypoints.shape[1] != 2:
+            raise ValueError("self.waypoints must have shape (N, 2).")
+        if waypoints.shape[0] < 2:
+            raise ValueError("self.waypoints must contain at least 2 points.")
         
+        path_zone_ids = np.asarray(self.path_zone_ids, dtype=int)
+        nb_path_zones = len(path_zone_ids)
+
+        segment_vecs = waypoints[1:] - waypoints[:-1]                 # shape (N_seg, 2)
+        segment_lengths = np.linalg.norm(segment_vecs, axis=1)        # shape (N_seg,)
+
+        if np.any(segment_lengths <= 0):
+            raise ValueError("Consecutive waypoints must be distinct.")
+
+        # cumulative distance traveled at each waypoint
+        D_breaks = np.concatenate(([0.0], np.cumsum(segment_lengths)))   # shape (N_seg+1,)
+        total_path_length = float(D_breaks[-1])
+
         #==================================================ITTINERARY==================================================
         d = cp.Variable(T_future+1)
         #initial position
@@ -795,11 +822,10 @@ class MICPOptimizer_Fixed_Path:
                 if p==0:
                     constraints += [d[t] == 0]
                 else:
-                    constraints += [d[t] == 160]
+                    constraints += [d[t] == total_path_length]
         
         #======================================================ZONES===================================================
-        seg = cp.Variable((T_future + 1, self.map.nb_zones), boolean=True)
-        D_breaks = np.array([0, 20, 40, 60, 80, 100, 120, 140, 160])
+        seg = cp.Variable((T_future + 1, nb_path_zones), boolean=True)
         
         #position must be in the chosen zone
         for t in range(T_future+1):
@@ -807,7 +833,8 @@ class MICPOptimizer_Fixed_Path:
 
             lower_expr = 0
             upper_expr = 0
-            for s in range(self.map.nb_zones):
+            for s in range(nb_path_zones):
+            #for s in range(2):
                 lower_expr += D_breaks[s] * seg[t, s]
                 upper_expr += D_breaks[s + 1] * seg[t, s]
 
@@ -842,6 +869,18 @@ class MICPOptimizer_Fixed_Path:
         wind_y_seg = self.weather.wind_y[:,self.states.timesteps_completed : self.states.timesteps_completed + T_future]
         irr_seg = self.weather.irradiance[:, self.states.timesteps_completed : self.states.timesteps_completed + T_future]  # shape [nb_zones, T_future]
 
+        print("current_x_seg", np.min(current_x_seg), np.max(current_x_seg))
+        print("current_y_seg", np.min(current_y_seg), np.max(current_y_seg))
+        print("wind_x_seg", np.min(wind_x_seg), np.max(wind_x_seg))
+        print("wind_y_seg", np.min(wind_y_seg), np.max(wind_y_seg))
+        print("irr_seg", np.min(irr_seg), np.max(irr_seg))
+
+        current_x_seg = self.weather.current_x[path_zone_ids, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
+        current_y_seg = self.weather.current_y[path_zone_ids, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
+        wind_x_seg    = self.weather.wind_x[path_zone_ids, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
+        wind_y_seg    = self.weather.wind_y[path_zone_ids, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
+        irr_seg       = self.weather.irradiance[path_zone_ids, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
+
         for t in range(T_future):
             constraints += [irr[t]       == seg[t, :] @ irr_seg[:, t]]
             constraints += [current_x[t] == seg[t, :] @ current_x_seg[:, t]]
@@ -851,15 +890,16 @@ class MICPOptimizer_Fixed_Path:
 
         #==================================================REL SPEED=======================================================
         #Get vx, vy from chose speed mag and fixed path angle, without disjunctive constraints
-        theta_seg = np.array([0,0.5,1.0,1.5,2.0,2.5,3.0,3.5])          # shape (S,)
+        segment_vecs = waypoints[1:] - waypoints[:-1]  # shape (N_seg, 2)
+        theta_seg = np.arctan2(segment_vecs[:, 1], segment_vecs[:, 0])  # radians
         cos_seg = np.cos(theta_seg)
         sin_seg = np.sin(theta_seg)
-        speed_seg = cp.Variable((T_future,self.map.nb_zones), nonneg=True)
+        speed_seg = cp.Variable((T_future,nb_path_zones), nonneg=True)
         ship_speed = cp.Variable((T_future,2))
 
         constraints += [speed_mag == cp.sum(speed_seg, axis=1)]
         for t in range(T_future):
-            for s in range(self.map.nb_zones):
+            for s in range(nb_path_zones):
                 constraints += [speed_seg[t, s] <= self.ship.info.max_speed * seg[t, s]]
 
         constraints += [ship_speed[:,0] == cp.sum(cp.multiply(speed_seg, cos_seg[None, :]), axis=1)]
@@ -888,9 +928,14 @@ class MICPOptimizer_Fixed_Path:
         wind_max_res_future = self.wind_model.max_convex_resistance[:,self.states.timesteps_completed : self.states.timesteps_completed + T_future]
         wave_max_res_future = self.wave_model.max_convex_resistance[:,self.states.timesteps_completed : self.states.timesteps_completed + T_future]
 
+        wind_model_future = self.wind_model.thrust_coeffs[path_zone_ids, self.states.timesteps_completed : self.states.timesteps_completed + T_future, :]
+        wave_model_future = self.wave_model.thrust_coeffs[path_zone_ids, self.states.timesteps_completed : self.states.timesteps_completed + T_future, :]
+        wind_max_res_future = self.wind_model.max_convex_resistance[path_zone_ids, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
+        wave_max_res_future = self.wave_model.max_convex_resistance[path_zone_ids, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
+
         for t in range(T_future):
             if interval_sail_fraction[t]> 0.01: #If Sailing
-                for z in range(self.map.nb_zones):
+                for z in range(nb_path_zones):
                     constraints += [wind_resistance[t] >= wind_model_future[z,t,0] + wind_model_future[z,t,1]*normalized_speed[t] + 
                                     wind_model_future[z,t,2]*cp.square(normalized_speed[t]) + wind_model_future[z,t,3]*cp.power(normalized_speed[t],3) + 
                                     wind_model_future[z,t,4]*cp.power(normalized_speed[t],4) + wind_model_future[z,t,5]*ship_speed[t,0]/self.ship.info.max_speed +
@@ -947,6 +992,7 @@ class MICPOptimizer_Fixed_Path:
         #=================================================SOLAR POWER==================================================
         solar_power = cp.Variable(T_future)
         irr_future = self.weather.irradiance[:, self.states.timesteps_completed : self.states.timesteps_completed + T_future]  # shape [nb_zones, T_future]
+        irr_future = self.weather.irradiance[path_zone_ids, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
         constraints += [solar_power>=0]
         for t in range(T_future):
             zone_avg_t = (seg[t, :] + seg[t+1, :]) / 2.0
@@ -1026,7 +1072,46 @@ class MICPOptimizer_Fixed_Path:
         print("T_future : ",T_future)
         print("weather : ",self.weather.current_x.shape[1])
 
-        
+        # ============================== RECONSTRUCT 2D POSITIONS / SPEEDS ===============================
+        d_opt = np.asarray(d.value, dtype=float).reshape(-1)   # shape (T_future+1,)
+
+        waypoints = np.asarray(self.waypoints, dtype=float)
+        segment_vecs = waypoints[1:] - waypoints[:-1]                  # shape (N_seg, 2)
+        segment_lengths = np.linalg.norm(segment_vecs, axis=1)         # shape (N_seg,)
+        segment_dirs = segment_vecs / segment_lengths[:, None]         # unit directions, shape (N_seg, 2)
+        D_breaks = np.concatenate(([0.0], np.cumsum(segment_lengths))) # shape (N_seg+1,)
+
+        # ---- Reconstruct 2D position from traveled distance d ----
+        ship_pos_2d = np.zeros((len(d_opt), 2), dtype=float)
+
+        for t, dist in enumerate(d_opt):
+            # clamp to path bounds
+            dist = min(max(dist, 0.0), D_breaks[-1])
+
+            if dist >= D_breaks[-1]:
+                ship_pos_2d[t] = waypoints[-1]
+                continue
+
+            seg_idx = np.searchsorted(D_breaks, dist, side="right") - 1
+            seg_idx = max(0, min(seg_idx, len(segment_lengths) - 1))
+
+            local_dist = dist - D_breaks[seg_idx]
+            ship_pos_2d[t] = waypoints[seg_idx] + local_dist * segment_dirs[seg_idx]
+
+        # ---- Reconstruct 2D speed from 1D speed along the path ----
+        speed_mag_opt = (np.diff(d_opt) / self.itinerary.timestep) * 1000 / 3600   # m/s, shape (T_future,)
+        ship_speed_2d = np.zeros((len(speed_mag_opt), 2), dtype=float)
+
+        for t, speed_mag_t in enumerate(speed_mag_opt):
+            dist = min(max(d_opt[t], 0.0), D_breaks[-1])
+
+            if dist >= D_breaks[-1]:
+                seg_idx = len(segment_lengths) - 1
+            else:
+                seg_idx = np.searchsorted(D_breaks, dist, side="right") - 1
+                seg_idx = max(0, min(seg_idx, len(segment_lengths) - 1))
+
+            ship_speed_2d[t] = speed_mag_t * segment_dirs[seg_idx]
 
         #===================================================RESULTS====================================================
         if problem.status not in ["infeasible", "unbounded"]:
@@ -1042,10 +1127,10 @@ class MICPOptimizer_Fixed_Path:
                 instant_sail            = instant_sail,
                 port_idx                = port_idx,
                 interval_sail_fraction  = interval_sail_fraction,
-
                 zone                    = np.array(seg.value),
-                ship_pos                = np.array(d.value),
-                ship_speed              = np.array(ship_speed.value),
+
+                ship_pos                = ship_pos_2d,
+                ship_speed              = ship_speed_2d,
                 speed_rel_water         = np.array(speed_rel_water.value),
                 speed_rel_water_mag     = np.array(speed_rel_water_mag.value),
 
@@ -1660,6 +1745,232 @@ class GreedyController:
             print("Greedy total distance traveled (km):", float(np.sum(np.linalg.norm(np.diff(ship_pos_out, axis=0), axis=1))))
 
         return 1
+    
+
+from dataclasses import dataclass, field
+from typing import Optional, List, Dict, Tuple
+import numpy as np
+import pandas as pd
+import cvxpy as cp
+
+
+@dataclass
+class ShortestPathSolution:
+    waypoints: np.ndarray              # shape (n_points, 2), includes start + transitions + end
+    transition_points: np.ndarray      # shape (n_transitions, 2)
+    zone_sequence: List[int]
+    portal_endpoints: List[np.ndarray] # each item shape (2, 2): [[x1,y1],[x2,y2]]
+    total_distance: float
+    status: str
+
+
+def _ordered_zone_corner_ids(zone_corners_df: pd.DataFrame) -> Dict[int, List[int]]:
+    """
+    Returns {zone_id: [corner_id_1, corner_id_2, ...]} ordered by the 'order' column.
+    """
+    out = {}
+    for zone_id, g in zone_corners_df.groupby("zone_id"):
+        g = g.sort_values("order")
+        out[int(zone_id)] = g["corner_id"].astype(int).tolist()
+    return out
+
+
+def _zone_edges_from_corner_ids(zone_corner_ids: Dict[int, List[int]]) -> Dict[int, set[frozenset[int]]]:
+    """
+    Returns unordered polygon edges for each zone.
+    Each edge is represented as frozenset({corner_i, corner_j}).
+    """
+    zone_edges = {}
+    for zone_id, corners in zone_corner_ids.items():
+        edges = set()
+        n = len(corners)
+        for i in range(n):
+            c1 = int(corners[i])
+            c2 = int(corners[(i + 1) % n])
+            edges.add(frozenset((c1, c2)))
+        zone_edges[zone_id] = edges
+    return zone_edges
+
+
+@dataclass
+class ShortestPath:
+    map: "Map"
+    itinerary: "Itinerary"
+    states: "States"
+    weather: "Weather"
+    ship: "Ship"
+
+    sol: Optional[ShortestPathSolution] = field(default=None, init=False)
+
+    def compute(
+        self,
+        end_pos,
+        debug: bool = False,
+        solver: Optional[str] = None,
+    ) -> ShortestPathSolution:
+        """
+        Compute shortest path from current ship position to end_pos through the unique
+        monotone sequence of adjacent convex zones.
+
+        Returns waypoints:
+            [start, transition_1, transition_2, ..., end]
+        with exactly one transition waypoint per crossed interface.
+        """
+        start = np.asarray([self.states.current_x_pos, self.states.current_y_pos], dtype=float)
+        end = np.asarray(end_pos, dtype=float)
+
+        init_zone = int(np.argmax(point_in_zones(start, self.map.zone_ineq)))
+        end_zone = int(np.argmax(point_in_zones(end, self.map.zone_ineq)))
+
+        if debug:
+            print(f"start = {start}, init_zone = {init_zone}")
+            print(f"end   = {end}, end_zone  = {end_zone}")
+
+        # Same zone: straight line, no transition point needed
+        if init_zone == end_zone:
+            waypoints = np.vstack([start, end])
+            total_distance = float(np.linalg.norm(end - start))
+            self.sol = ShortestPathSolution(
+                waypoints=waypoints,
+                transition_points=np.zeros((0, 2)),
+                zone_sequence=[init_zone],
+                portal_endpoints=[],
+                total_distance=total_distance,
+                status="same_zone",
+            )
+            return self.sol
+
+        zone_seq_idx = self._build_zone_sequence(init_zone, end_zone)   # 0-based indices
+        zone_seq = [z + 1 for z in zone_seq_idx]                        # CSV ids assumed 1-based
+
+        # Re-factor later if corners move into self.map
+        corners_df = pd.read_csv(CORNERS)
+        zone_corners_df = pd.read_csv(ZONES)
+
+        corner_xy = {
+            int(r.corner_id): np.array([float(r.x), float(r.y)], dtype=float)
+            for r in corners_df.itertuples(index=False)
+        }
+
+        zone_corner_ids = _ordered_zone_corner_ids(zone_corners_df)
+        zone_edges = _zone_edges_from_corner_ids(zone_corner_ids)
+
+        portals = self._extract_portals(zone_seq, zone_edges, corner_xy, debug=debug)
+        n_portals = len(portals)
+
+        if n_portals == 0:
+            raise ValueError("No portal found, but start and end are in different zones.")
+
+        # Optimization variables: lambda_i in [0,1] for each portal segment
+        lam = cp.Variable(n_portals)
+
+        transition_exprs = []
+        constraints = [lam >= 0, lam <= 1]
+
+        for i, (a, b) in enumerate(portals):
+            transition_exprs.append(a + lam[i] * (b - a))
+
+        objective = cp.norm(start - transition_exprs[0], 2)
+        for i in range(n_portals - 1):
+            objective += cp.norm(transition_exprs[i + 1] - transition_exprs[i], 2)
+        objective += cp.norm(end - transition_exprs[-1], 2)
+
+        problem = cp.Problem(cp.Minimize(objective), constraints)
+
+        solve_kwargs = {}
+        if solver is not None:
+            solve_kwargs["solver"] = solver
+
+        problem.solve(**solve_kwargs)
+
+        if problem.status not in ("optimal", "optimal_inaccurate"):
+            raise RuntimeError(f"ShortestPath solve failed with status: {problem.status}")
+
+        lam_val = np.asarray(lam.value).reshape(-1)
+        transition_points = np.zeros((n_portals, 2), dtype=float)
+        for i, (a, b) in enumerate(portals):
+            transition_points[i] = a + lam_val[i] * (b - a)
+
+        waypoints = np.vstack([start, transition_points, end])
+        total_distance = self._polyline_length(waypoints)
+
+        if debug:
+            print(f"zone_seq = {zone_seq}")
+            print(f"n_portals = {n_portals}")
+            print(f"lambda = {lam_val}")
+            print(f"transition_points =\n{transition_points}")
+            print(f"total_distance = {total_distance}")
+
+        self.sol = ShortestPathSolution(
+            waypoints=waypoints,
+            transition_points=transition_points,
+            zone_sequence=zone_seq,
+            portal_endpoints=portals,
+            total_distance=float(total_distance),
+            status=problem.status,
+        )
+        return self.sol
+
+    @staticmethod
+    def _build_zone_sequence(init_zone: int, end_zone: int) -> List[int]:
+        """
+        Unique monotone zone sequence, since zone i is only adjacent to i-1 and i+1.
+        """
+        step = 1 if end_zone > init_zone else -1
+        return list(range(init_zone, end_zone + step, step))
+
+    @staticmethod
+    def _extract_portals(
+        zone_seq: List[int],
+        zone_edges: Dict[int, set[frozenset[int]]],
+        corner_xy: Dict[int, np.ndarray],
+        debug: bool = False,
+    ) -> List[np.ndarray]:
+        """
+        For each consecutive pair of zones, find the unique shared edge.
+        Returns a list of arrays, each shaped (2,2):
+            [[x1,y1],
+             [x2,y2]]
+        """
+        portals = []
+
+        for z1, z2 in zip(zone_seq[:-1], zone_seq[1:]):
+            shared_edges = zone_edges[z1] & zone_edges[z2]
+
+            if len(shared_edges) != 1:
+                raise ValueError(
+                    f"Expected exactly one shared edge between zones {z1} and {z2}, "
+                    f"got {len(shared_edges)}."
+                )
+
+            shared_edge = next(iter(shared_edges))
+            corner_ids = list(shared_edge)
+
+            if len(corner_ids) != 2:
+                raise ValueError(
+                    f"Shared edge between zones {z1} and {z2} does not contain 2 corners."
+                )
+
+            a = corner_xy[int(corner_ids[0])]
+            b = corner_xy[int(corner_ids[1])]
+            portal = np.vstack([a, b])
+
+            portals.append(portal)
+
+            if debug:
+                print(f"portal {z1}->{z2}: corner_ids={corner_ids}, a={a}, b={b}")
+
+        return portals
+
+    @staticmethod
+    def _polyline_length(points: np.ndarray) -> float:
+        """
+        Sum of Euclidean lengths of consecutive polyline segments.
+        """
+        if len(points) <= 1:
+            return 0.0
+        diffs = points[1:] - points[:-1]
+        return float(np.sum(np.linalg.norm(diffs, axis=1)))
     
 
 @dataclass
