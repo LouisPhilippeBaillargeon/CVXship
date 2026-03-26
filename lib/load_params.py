@@ -40,6 +40,7 @@ class Hull:
     AF_air          : float # Front above water area
     AF_water        : float # Front bellow water area
     AL_water        : float # Side bellow water area
+    total_wet_area  : float
     sL              : float # xb coordinate of the centroid of ALw in the ship body reference frame
     sH              : float # yb coordinate of the centroid of ALw in the ship body reference frame
     CDt             : float # Coefficient for Blenderman computation
@@ -47,8 +48,8 @@ class Hull:
     CDlAF_stern     : float # Coefficient for Blenderman computation
     delta           : float # Coefficient for Blenderman computation
     kappa           : float # Coefficient for Blenderman computation
-    CD_water_curve        : List[float]
-    CD_water_breakpoints  : List[float]
+    CT_water_curve        : List[float]
+    CT_water_breakpoints  : List[float]
 
 @dataclass
 class Generator:
@@ -124,8 +125,8 @@ def load_ship() -> Ship:
         )
 
     max_Fr = info.max_speed/np.sqrt(info.g*hull.LPP)
-    if(max_Fr>max(hull.CD_water_breakpoints)):
-        print("Warning : max Froude number ", max_Fr, "at max configured speed ", info.max_speed, "is outside the bounds of ship.hull.CD_water_breakpoints. This can lead to underestimation of water resistance at high speeds.")
+    if(max_Fr>max(hull.CT_water_breakpoints)):
+        print("Warning : max Froude number ", max_Fr, "at max configured speed ", info.max_speed, "is outside the bounds of ship.hull.CT_water_breakpoints. This can lead to underestimation of water resistance at high speeds.")
 
     return Ship(
         hull=hull,

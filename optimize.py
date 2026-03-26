@@ -7,7 +7,7 @@ from lib.models import PropulsionModel, WaveModel, WindModel, GeneratorModel, sa
 from lib.paths import WIND_MODEL, WAVE_MODEL, PROPULSION_MODEL, GENERATOR_MODEL
 
 from lib.plotting import summarize_and_plot_solution, plot_weather_snapshot, summarize_and_plot_solutions_overlay, plot_zones_and_points
-from lib.optimizers import MICPOptimizer, GreedyController, Solution, MinDist_ConstSpeed_FixedStep, MICPOptimizer_Integer, _compute_tight_big_M_zone, _compute_tight_big_M_transition, MICPOptimizer_Fixed_Path, ShortestPath
+from lib.optimizers import MICPOptimizer, GreedyController, Solution, MICPOptimizer_Integer, _compute_tight_big_M_zone, _compute_tight_big_M_transition, MICPOptimizer_Fixed_Path, ShortestPath
 from lib.utils import point_in_zones, dx_dy_km, classify_timesteps, compute_port_zone_indices
 
 
@@ -155,7 +155,15 @@ def compute_non_convex_cost_all_timesteps(runner, eps=1e-9, debug=False):
                 )
             )
 
-            current_resistance[t] = (Vs**2) * ship.hull.AF_water * ship.info.rho_water / 1_000_000.0
+            #Get CD calm water coefficient based on speed
+            Fr = Vs/np.sqrt(ship.info.g*ship.hull.LPP)
+            CD = np.interp(
+                Fr,
+                ship.hull.CT_water_breakpoints,
+                ship.hull.CT_water_curve
+            )
+
+            current_resistance[t] = 0.5 * CD * ship.hull.total_wet_area * (Vs**2) * ship.info.rho_water / 1_000_000.0
 
             total_resistance[t] = max(0.0, wind_resistance[t] + wave_resistance[t] + current_resistance[t]+acc_force_arr[t])
 
@@ -361,7 +369,7 @@ if __name__ == "__main__":
 
     ok = optimizer.optimize(
         unit_commitment=False,
-        debug=True,
+        debug=False,
     )
 
     if ok:
@@ -369,12 +377,18 @@ if __name__ == "__main__":
         print("Waypoints:")
         print(path.sol.waypoints)
         print("Estimated cost:", optimizer.sol.estimated_cost)
-        summarize_and_plot_solution(optimizer.sol, show = True)
-        n_all, non_conv_sol, dt_h = compute_non_convex_cost_all_timesteps(optimizer, debug=False)
+        summarize_and_plot_solution(optimizer.sol, show = False)
+        n_all, fixed_path_sol, dt_h = compute_non_convex_cost_all_timesteps(optimizer, debug=False)
+        print("dt_h", dt_h)
+        print("convex cost : ", np.sum(optimizer.sol.estimated_cost))
+        print("non-convex cost : ", np.sum(fixed_path_sol.estimated_cost))
+        print("Optimal total distance traveled (km):",
+        np.sum(np.linalg.norm(np.diff(optimizer.sol.ship_pos, axis=0), axis=1)))
+        summarize_and_plot_solutions_overlay(optimizer.sol, fixed_path_sol,"Convex solution", "Non-convex solution", show=True)
     else:
         print("Optimization failed.")
+
     
-    '''
     optimizer = MICPOptimizer_Fixed_Path(
         wave_model          = wave_model,
         wind_model          = wind_model,
@@ -455,29 +469,12 @@ if __name__ == "__main__":
     print("Greedy max speed |ship_speed|:", np.max(np.linalg.norm(greedy.sol.ship_speed, axis=1)))
     print("Greedy total distance traveled (km):", np.sum(np.linalg.norm(np.diff(greedy.sol.ship_pos, axis=0), axis=1)))
     
-    #summarize_and_plot_solutions_overlay(non_conv_sol, non_conv_sol_greedy,"Optimal", "Greedy")
+    summarize_and_plot_solutions_overlay(non_conv_sol, non_conv_sol_greedy,"Optimal", "Greedy")
 
 
-    greedy = MinDist_ConstSpeed_FixedStep(map, itinerary, states, weather, ship)
-    greedy.compute(debug=False)
-    plot_zones_and_points(greedy.sol.ship_pos, greedy.map.zone_ineq)
-
-    # Make sure greedy has these attached (same as optimizer)
-    greedy.wind_model = wind_model
-    greedy.wave_model = wave_model
-    greedy.propulsion_model = propulsion_model
-    greedy.generator_models = generatorModels
-
-    n_all, non_conv_sol_greedy, dt_h = compute_non_convex_cost_all_timesteps(greedy)
-    print("dt_h", dt_h)
-    print("Greedy nonconv cost:", np.sum(non_conv_sol_greedy.estimated_cost))
-    print("Greedy max speed |ship_speed|:", np.max(np.linalg.norm(greedy.sol.ship_speed, axis=1)))
-    print("Greedy total distance traveled (km):",
-        np.sum(np.linalg.norm(np.diff(greedy.sol.ship_pos, axis=0), axis=1)))
-    
-    summarize_and_plot_solutions_overlay(non_conv_sol_greedy, non_conv_sol_greedy,"Optimal", "Greedy")
     
     
+    '''
     # Optimize and Simulate
     total_cost_simul = 0
     total_cost_conv  = 0
