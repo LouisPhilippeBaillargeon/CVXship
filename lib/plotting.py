@@ -149,45 +149,6 @@ def _plot_2d_time_series(
     _save_and_maybe_show(fig, name, show)
 
 
-def _plot_2d_time_series_overlay(
-    arr_a,
-    arr_b,
-    x,
-    name: str,
-    label_a: str,
-    label_b: str,
-    labels=("x", "y"),
-    ylabel: str = "",
-    show: bool = False,
-    save_prefix: str = "cmp_",
-):
-    a_ok = arr_a is not None and np.asarray(arr_a).ndim == 2 and np.asarray(arr_a).shape == (len(x), 2)
-    b_ok = arr_b is not None and np.asarray(arr_b).ndim == 2 and np.asarray(arr_b).shape == (len(x), 2)
-
-    if not a_ok and not b_ok:
-        return
-
-    fig, ax = plt.subplots()
-
-    if a_ok:
-        arr_a = np.asarray(arr_a)
-        ax.plot(x, arr_a[:, 0], label=f"{label_a} {labels[0]}")
-        ax.plot(x, arr_a[:, 1], label=f"{label_a} {labels[1]}")
-    else:
-        print(f"[WARN] {name}: {label_a} missing/incompatible shape; plotting only {label_b}.")
-
-    if b_ok:
-        arr_b = np.asarray(arr_b)
-        ax.plot(x, arr_b[:, 0], label=f"{label_b} {labels[0]}")
-        ax.plot(x, arr_b[:, 1], label=f"{label_b} {labels[1]}")
-    else:
-        print(f"[WARN] {name}: {label_b} missing/incompatible shape; plotting only {label_a}.")
-
-    ax.legend(loc="best", frameon=False, ncols=2)
-    _finalize_axis(ax, xlabel="Timestep", ylabel=ylabel, title=name)
-    _save_and_maybe_show(fig, f"{save_prefix}{name}", show)
-
-
 def _plot_xy(
     x,
     y,
@@ -232,141 +193,39 @@ def _plot_xy(
 
 # ====================== MAIN SUMMARY / PLOTTING FUNCTIONS ======================
 
-def summarize_and_plot_solution(sol, show: bool = False):
-    """
-    Print scalar info and plot all arrays contained in `sol`.
-    All figures are saved in PLOTS.
-    """
-    set_ieee_plot_style()
-
-    print("===== Solution summary =====")
-    print(f"Estimated cost        : {sol.estimated_cost:.6g}")
-    print(f"T_future              : {sol.T_future}")
-    print(f"ship_pos shape        : {sol.ship_pos.shape}")
-    print(f"ship_speed shape      : {sol.ship_speed.shape}")
-    print(f"speed_rel_water shape : {sol.speed_rel_water.shape}")
-    print(f"generation_power shape: {sol.generation_power.shape}")
-    print()
-
-    t = np.arange(sol.T_future)
-    t_plus_1 = np.arange(sol.T_future + 1)
-
-    def plot_t(values, name: str, ylabel: str):
-        if values is None:
-            return
-        values = _as_1d(values)
-        if values.shape[0] != sol.T_future:
-            print(f"[WARN] {name}: expected length {sol.T_future}, got {values.shape}")
-            return
-        _plot_1d(values, t, name=name, ylabel=ylabel, show=show)
-
-    def plot_t_plus_1(values, name: str, ylabel: str):
-        if values is None:
-            return
-        values = _as_1d(values)
-        if values.shape[0] != sol.T_future + 1:
-            print(f"[WARN] {name}: expected length {sol.T_future + 1}, got {values.shape}")
-            return
-        _plot_1d(values, t_plus_1, name=name, ylabel=ylabel, show=show)
-
-    plot_t_plus_1(sol.instant_sail, "instant_sail", "instant_sail [-]")
-    plot_t_plus_1(sol.port_idx, "port_idx", "Port index [-]")
-    plot_t(sol.interval_sail_fraction, "interval_sail_fraction", "Sail fraction [-]")
-
-    plot_t(sol.speed_rel_water_mag, "speed_rel_water_mag", "Speed rel. water [m/s]")
-
-    plot_t(sol.prop_power, "prop_power", "Propulsion power [MW]")
-    plot_t(sol.wave_resistance, "wave_resistance", "Wave resistance [MN]")
-    plot_t(sol.wind_resistance, "wind_resistance", "Wind resistance [MN]")
-    plot_t(sol.current_resistance, "current_resistance", "Current resistance [MN]")
-    plot_t(sol.total_resistance, "total_resistance", "Total resistance [MN]")
-
-    plot_t(np.sum(sol.gen_costs, axis=0), "gen_costs", "Generation cost [currency]")
-    plot_t(sol.solar_power, "solar_power", "Solar power [MW]")
-    plot_t(sol.shore_power, "shore_power", "Shore power [MW]")
-    plot_t(sol.battery_charge, "battery_charge", "Battery charge power [MW]")
-    plot_t(sol.battery_discharge, "battery_discharge", "Battery discharge power [MW]")
-    plot_t_plus_1(sol.SOC, "SOC", "State of charge [-]")
-
-    if sol.ship_pos is not None and sol.ship_pos.shape == (sol.T_future + 1, 2):
-        _plot_xy(
-            sol.ship_pos[:, 0],
-            sol.ship_pos[:, 1],
-            name="ship_pos_xy",
-            xlabel="x position [km]",
-            ylabel="y position [km]",
-            show=show,
-            marker="o",
-        )
-    else:
-        print("[WARN] ship_pos has unexpected shape; skipping XY plot.")
-
-    _plot_2d_time_series(
-        sol.ship_speed,
-        t,
-        name="ship_speed",
-        labels=("u_east", "v_north"),
-        ylabel="Speed [m/s]",
-        show=show,
-    )
-    _plot_2d_time_series(
-        sol.speed_rel_water,
-        t,
-        name="speed_rel_water",
-        labels=("u_rw", "v_rw"),
-        ylabel="Speed rel. water [m/s]",
-        show=show,
-    )
-
-    if sol.generation_power is not None:
-        gp = np.asarray(sol.generation_power)
-        if gp.ndim == 2 and gp.shape[1] == sol.T_future:
-            fig, ax = plt.subplots()
-            for g in range(gp.shape[0]):
-                ax.plot(t, gp[g, :], label=f"Gen {g}")
-            ax.legend(loc="best", frameon=False)
-            _finalize_axis(ax, xlabel="Timestep", ylabel="Power [MW]", title="generation_power")
-            _save_and_maybe_show(fig, "generation_power", show)
-        else:
-            print(f"[WARN] generation_power: expected shape (nb_gen, T_future), got {gp.shape}")
-
-
-def summarize_and_plot_solutions_overlay(
-    sol_a,
-    sol_b,
-    label_a: str = "Solution A",
-    label_b: str = "Solution B",
+def plot_solutions(
+    solutions,
+    labels=None,
     show: bool = False,
 ):
     """
-    Compare two solutions by printing summaries and overlaying their
+    Compare multiple solutions by printing summaries and overlaying their
     signals on the same IEEE-style plots.
     All figures are saved in PLOTS.
     """
     set_ieee_plot_style()
 
-    Ta = int(sol_a.T_future)
-    Tb = int(sol_b.T_future)
-    T = min(Ta, Tb)
+    if labels is None:
+        labels = [f"Solution {i}" for i in range(len(solutions))]
+
+    assert len(solutions) == len(labels), "solutions and labels must have same length"
+
+    # ===================== COMMON HORIZON =====================
+    Ts = [int(sol.T_future) for sol in solutions]
+    T = min(Ts)
 
     t = np.arange(T)
     t_plus_1 = np.arange(T + 1)
 
+    # ===================== SUMMARY =====================
     print("===== Solution comparison summary =====")
-    print(f"{label_a} estimated cost : {getattr(sol_a, 'estimated_cost', np.nan):.6g}")
-    print(f"{label_b} estimated cost : {getattr(sol_b, 'estimated_cost', np.nan):.6g}")
-    if hasattr(sol_a, "estimated_cost") and hasattr(sol_b, "estimated_cost"):
-        try:
-            delta = float(sol_b.estimated_cost) - float(sol_a.estimated_cost)
-            rel = (delta / float(sol_a.estimated_cost)) * 100 if float(sol_a.estimated_cost) != 0 else np.nan
-            print(f"Cost delta (B - A)   : {delta:.6g} ({rel:.3g}%)")
-        except Exception:
-            pass
-    print(f"{label_a} T_future       : {Ta}")
-    print(f"{label_b} T_future       : {Tb}")
+    for sol, label, Ti in zip(solutions, labels, Ts):
+        print(f"{label} estimated cost : {getattr(sol, 'estimated_cost', np.nan):.6g}")
+        print(f"{label} T_future       : {Ti}")
     print(f"Common horizon used  : {T}")
     print()
 
+    # ===================== HELPERS =====================
     def slice_1d(arr, n):
         arr = _as_1d(arr)
         return arr[:n] if (arr is not None and arr.shape[0] >= n) else None
@@ -388,230 +247,87 @@ def summarize_and_plot_solutions_overlay(
             return np.sum(gc[:, :T], axis=0)
         return None
 
-    _plot_1d_overlay(
-        slice_1d(getattr(sol_a, "instant_sail", None), T + 1),
-        slice_1d(getattr(sol_b, "instant_sail", None), T + 1),
-        t_plus_1,
-        name="instant_sail",
-        ylabel="instant_sail [-]",
-        label_a=label_a,
-        label_b=label_b,
-        show=show,
-    )
-    _plot_1d_overlay(
-        slice_1d(getattr(sol_a, "port_idx", None), T + 1),
-        slice_1d(getattr(sol_b, "port_idx", None), T + 1),
-        t_plus_1,
-        name="port_idx",
-        ylabel="Port index [-]",
-        label_a=label_a,
-        label_b=label_b,
-        show=show,
-    )
-    _plot_1d_overlay(
-        slice_1d(getattr(sol_a, "interval_sail_fraction", None), T),
-        slice_1d(getattr(sol_b, "interval_sail_fraction", None), T),
-        t,
-        name="interval_sail_fraction",
-        ylabel="Sail fraction [-]",
-        label_a=label_a,
-        label_b=label_b,
-        show=show,
-    )
-    _plot_1d_overlay(
-        slice_1d(getattr(sol_a, "speed_rel_water_mag", None), T),
-        slice_1d(getattr(sol_b, "speed_rel_water_mag", None), T),
-        t,
-        name="speed_rel_water_mag",
-        ylabel="Speed rel. water [m/s]",
-        label_a=label_a,
-        label_b=label_b,
-        show=show,
-    )
-    _plot_1d_overlay(
-        slice_1d(getattr(sol_a, "prop_power", None), T),
-        slice_1d(getattr(sol_b, "prop_power", None), T),
-        t,
-        name="prop_power",
-        ylabel="Propulsion power [MW]",
-        label_a=label_a,
-        label_b=label_b,
-        show=show,
-    )
-    _plot_1d_overlay(
-        slice_1d(getattr(sol_a, "wave_resistance", None), T),
-        slice_1d(getattr(sol_b, "wave_resistance", None), T),
-        t,
-        name="wave_resistance",
-        ylabel="Wave resistance [MN]",
-        label_a=label_a,
-        label_b=label_b,
-        show=show,
-    )
-    _plot_1d_overlay(
-        slice_1d(getattr(sol_a, "wind_resistance", None), T),
-        slice_1d(getattr(sol_b, "wind_resistance", None), T),
-        t,
-        name="wind_resistance",
-        ylabel="Wind resistance [MN]",
-        label_a=label_a,
-        label_b=label_b,
-        show=show,
-    )
-    _plot_1d_overlay(
-        slice_1d(getattr(sol_a, "current_resistance", None), T),
-        slice_1d(getattr(sol_b, "current_resistance", None), T),
-        t,
-        name="current_resistance",
-        ylabel="Current resistance [MN]",
-        label_a=label_a,
-        label_b=label_b,
-        show=show,
-    )
-    _plot_1d_overlay(
-        slice_1d(getattr(sol_a, "total_resistance", None), T),
-        slice_1d(getattr(sol_b, "total_resistance", None), T),
-        t,
-        name="total_resistance",
-        ylabel="Total resistance [MN]",
-        label_a=label_a,
-        label_b=label_b,
-        show=show,
-    )
-    _plot_1d_overlay(
-        total_gen_cost(sol_a),
-        total_gen_cost(sol_b),
-        t,
-        name="gen_costs_total",
-        ylabel="Generation cost [currency]",
-        label_a=label_a,
-        label_b=label_b,
-        show=show,
-    )
-    _plot_1d_overlay(
-        slice_1d(getattr(sol_a, "solar_power", None), T),
-        slice_1d(getattr(sol_b, "solar_power", None), T),
-        t,
-        name="solar_power",
-        ylabel="Solar power [MW]",
-        label_a=label_a,
-        label_b=label_b,
-        show=show,
-    )
-    _plot_1d_overlay(
-        slice_1d(getattr(sol_a, "shore_power", None), T),
-        slice_1d(getattr(sol_b, "shore_power", None), T),
-        t,
-        name="shore_power",
-        ylabel="Shore power [MW]",
-        label_a=label_a,
-        label_b=label_b,
-        show=show,
-    )
-    _plot_1d_overlay(
-        slice_1d(getattr(sol_a, "battery_charge", None), T),
-        slice_1d(getattr(sol_b, "battery_charge", None), T),
-        t,
-        name="battery_charge",
-        ylabel="Battery charge power [MW]",
-        label_a=label_a,
-        label_b=label_b,
-        show=show,
-    )
-    _plot_1d_overlay(
-        slice_1d(getattr(sol_a, "battery_discharge", None), T),
-        slice_1d(getattr(sol_b, "battery_discharge", None), T),
-        t,
-        name="battery_discharge",
-        ylabel="Battery discharge power [MW]",
-        label_a=label_a,
-        label_b=label_b,
-        show=show,
-    )
-    _plot_1d_overlay(
-        slice_1d(getattr(sol_a, "SOC", None), T + 1),
-        slice_1d(getattr(sol_b, "SOC", None), T + 1),
-        t_plus_1,
-        name="SOC",
-        ylabel="State of charge [-]",
-        label_a=label_a,
-        label_b=label_b,
-        show=show,
-    )
-
-    pos_a = slice_2d(getattr(sol_a, "ship_pos", None), T + 1)
-    pos_b = slice_2d(getattr(sol_b, "ship_pos", None), T + 1)
-
-    if pos_a is not None or pos_b is not None:
+    # ===================== GENERIC OVERLAY =====================
+    def _plot_1d_overlay_multi(arrs, t_axis, name, ylabel):
         fig, ax = plt.subplots()
-        if pos_a is not None:
-            ax.plot(pos_a[:, 0], pos_a[:, 1], marker="o", markersize=2, label=label_a)
-        else:
-            print(f"[WARN] ship_pos_xy: {label_a} missing/incompatible shape; plotting only {label_b}.")
-        if pos_b is not None:
-            ax.plot(pos_b[:, 0], pos_b[:, 1], marker="o", markersize=2, label=label_b)
-        else:
-            print(f"[WARN] ship_pos_xy: {label_b} missing/incompatible shape; plotting only {label_a}.")
+        for arr, label in zip(arrs, labels):
+            if arr is not None:
+                ax.plot(t_axis, arr, label=label)
+        ax.legend(loc="best", frameon=False)
+        _finalize_axis(ax, xlabel="Timestep", ylabel=ylabel, title=name)
+        _save_and_maybe_show(fig, f"cmp_{name}", show)
 
+    def _plot_2d_overlay_multi(arrs, t_axis, name, labels_comp, ylabel):
+        fig, ax = plt.subplots()
+        for arr, label in zip(arrs, labels):
+            if arr is not None:
+                ax.plot(t_axis, arr[:, 0], label=f"{label} {labels_comp[0]}")
+                ax.plot(t_axis, arr[:, 1], linestyle="--", label=f"{label} {labels_comp[1]}")
+        ax.legend(loc="best", frameon=False)
+        _finalize_axis(ax, xlabel="Timestep", ylabel=ylabel, title=name)
+        _save_and_maybe_show(fig, f"cmp_{name}", show)
+
+    # ===================== 1D SIGNALS =====================
+    def collect(attr, n):
+        return [slice_1d(getattr(sol, attr, None), n) for sol in solutions]
+
+    _plot_1d_overlay_multi(collect("instant_sail", T + 1), t_plus_1, "instant_sail", "instant_sail [-]")
+    _plot_1d_overlay_multi(collect("port_idx", T + 1), t_plus_1, "port_idx", "Port index [-]")
+    _plot_1d_overlay_multi(collect("interval_sail_fraction", T), t, "interval_sail_fraction", "Sail fraction [-]")
+    _plot_1d_overlay_multi(collect("speed_rel_water_mag", T), t, "speed_rel_water_mag", "Speed rel. water [m/s]")
+    _plot_1d_overlay_multi(collect("prop_power", T), t, "prop_power", "Propulsion power [MW]")
+    _plot_1d_overlay_multi(collect("wave_resistance", T), t, "wave_resistance", "Wave resistance [MN]")
+    _plot_1d_overlay_multi(collect("wind_resistance", T), t, "wind_resistance", "Wind resistance [MN]")
+    _plot_1d_overlay_multi(collect("current_resistance", T), t, "current_resistance", "Current resistance [MN]")
+    _plot_1d_overlay_multi(collect("total_resistance", T), t, "total_resistance", "Total resistance [MN]")
+    _plot_1d_overlay_multi([total_gen_cost(sol) for sol in solutions], t, "gen_costs_total", "Generation cost [currency]")
+    _plot_1d_overlay_multi(collect("solar_power", T), t, "solar_power", "Solar power [MW]")
+    _plot_1d_overlay_multi(collect("shore_power", T), t, "shore_power", "Shore power [MW]")
+    _plot_1d_overlay_multi(collect("battery_charge", T), t, "battery_charge", "Battery charge power [MW]")
+    _plot_1d_overlay_multi(collect("battery_discharge", T), t, "battery_discharge", "Battery discharge power [MW]")
+    _plot_1d_overlay_multi(collect("SOC", T + 1), t_plus_1, "SOC", "State of charge [-]")
+
+    # ===================== TRAJECTORY =====================
+    positions = [slice_2d(getattr(sol, "ship_pos", None), T + 1) for sol in solutions]
+
+    if any(p is not None for p in positions):
+        fig, ax = plt.subplots()
+        for pos, label in zip(positions, labels):
+            if pos is not None:
+                ax.plot(pos[:, 0], pos[:, 1], marker="o", markersize=2, label=label)
         ax.set_aspect("equal", adjustable="box")
         ax.legend(loc="best", frameon=False)
         _finalize_axis(ax, xlabel="x position [km]", ylabel="y position [km]", title="Ship trajectory")
         _save_and_maybe_show(fig, "cmp_ship_pos_xy", show)
     else:
-        print("[WARN] ship_pos has unexpected shape in both solutions; skipping XY plot.")
+        print("[WARN] ship_pos has unexpected shape in all solutions; skipping XY plot.")
 
-    _plot_2d_time_series_overlay(
-        slice_2d(getattr(sol_a, "ship_speed", None), T),
-        slice_2d(getattr(sol_b, "ship_speed", None), T),
-        t,
-        name="ship_speed",
-        label_a=label_a,
-        label_b=label_b,
-        labels=("u_east", "v_north"),
-        ylabel="Speed [m/s]",
-        show=show,
-    )
-    _plot_2d_time_series_overlay(
-        slice_2d(getattr(sol_a, "speed_rel_water", None), T),
-        slice_2d(getattr(sol_b, "speed_rel_water", None), T),
-        t,
-        name="speed_rel_water",
-        label_a=label_a,
-        label_b=label_b,
-        labels=("u_rw", "v_rw"),
-        ylabel="Speed rel. water [m/s]",
-        show=show,
-    )
+    # ===================== 2D TIME SERIES =====================
+    def collect_2d(attr, n):
+        return [slice_2d(getattr(sol, attr, None), n) for sol in solutions]
 
-    gp_a = getattr(sol_a, "generation_power", None)
-    gp_b = getattr(sol_b, "generation_power", None)
+    _plot_2d_overlay_multi(collect_2d("ship_speed", T), t, "ship_speed", ("u_east", "v_north"), "Speed [m/s]")
+    _plot_2d_overlay_multi(collect_2d("speed_rel_water", T), t, "speed_rel_water", ("u_rw", "v_rw"), "Speed rel. water [m/s]")
 
-    def ok_gp(gp):
-        return gp is not None and np.asarray(gp).ndim == 2 and np.asarray(gp).shape[1] >= T
+    # ===================== GENERATORS =====================
+    fig, ax = plt.subplots()
+    any_gp = False
 
-    if ok_gp(gp_a) or ok_gp(gp_b):
-        fig, ax = plt.subplots()
+    for sol, label in zip(solutions, labels):
+        gp = getattr(sol, "generation_power", None)
+        if gp is not None:
+            gp = np.asarray(gp)
+            if gp.ndim == 2 and gp.shape[1] >= T:
+                any_gp = True
+                for g in range(gp.shape[0]):
+                    ax.plot(t, gp[g, :T], label=f"{label} Gen {g}")
 
-        if ok_gp(gp_a):
-            gp_a = np.asarray(gp_a)
-            for g in range(gp_a.shape[0]):
-                ax.plot(t, gp_a[g, :T], label=f"{label_a} Gen {g}")
-        else:
-            print(f"[WARN] generation_power: {label_a} missing/incompatible shape; plotting only {label_b}.")
-
-        if ok_gp(gp_b):
-            gp_b = np.asarray(gp_b)
-            for g in range(gp_b.shape[0]):
-                ax.plot(t, gp_b[g, :T], label=f"{label_b} Gen {g}")
-        else:
-            print(f"[WARN] generation_power: {label_b} missing/incompatible shape; plotting only {label_a}.")
-
+    if any_gp:
         ax.legend(loc="best", frameon=False, ncols=2)
         _finalize_axis(ax, xlabel="Timestep", ylabel="Power [MW]", title="generation_power")
         _save_and_maybe_show(fig, "cmp_generation_power", show)
     else:
-        if gp_a is not None or gp_b is not None:
-            print("[WARN] generation_power present but unexpected shape in both solutions; skipping plot.")
+        print("[WARN] generation_power missing or invalid in all solutions.")
 
 
 def plot_weather_snapshot(map, weather, variable="current_x", t_index=0, show: bool = False):

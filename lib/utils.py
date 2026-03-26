@@ -12,6 +12,278 @@ from lib.paths import ADJ, ZONES
 import numpy as np
 import matplotlib.pyplot as plt
 
+def _compute_tight_big_M_zone(map_obj, zone_ineq, safety_margin=1.0):
+    """
+    Compute a tight disabling Big-M for zone inequalities:
+        Ay*y + Ax*x + Ac >= M[z] * (1 - zone[t,z])
+
+    Parameters
+    ----------
+    map_obj : Map
+        Map object with span_km_east, span_km_north, nb_zones.
+    zone_ineq : np.ndarray
+        Shape (3, n_ineq, nb_zones)
+        zone_ineq[0, j, z] = Ay
+        zone_ineq[1, j, z] = Ax
+        zone_ineq[2, j, z] = Ac
+    safety_margin : float
+        Extra negative slack added to guarantee deactivation.
+
+    Returns
+    -------
+    np.ndarray
+        Shape (nb_zones,)
+    """
+    nb_zones = map_obj.nb_zones
+    x_max = map_obj.info.span_km_east
+    y_max = map_obj.info.span_km_north
+
+    corners = np.array([
+        [0.0,   0.0],    # bottom-left
+        [x_max, 0.0],    # bottom-right
+        [0.0,   y_max],  # top-left
+        [x_max, y_max],  # top-right
+    ])
+
+    big_M = np.zeros(nb_zones)
+
+    for z in range(nb_zones):
+        Ay = zone_ineq[0, :, z]
+        Ax = zone_ineq[1, :, z]
+        Ac = zone_ineq[2, :, z]
+
+        min_val = np.inf
+        for x, y in corners:
+            vals = Ay * y + Ax * x + Ac
+            min_val = min(min_val, np.min(vals))
+
+        big_M[z] = min_val - safety_margin
+
+    return big_M
+
+def _compute_tight_big_M_transition(map_obj, trans_ineq, safety_margin=1.0):
+    """
+    Compute tight Big-M values for transition inequalities:
+        a_y*y + a_x*x + a_c >= M[z, iz] * (2 - zone[t,z] - zone[t+1,iz])
+
+    Parameters
+    ----------
+    map_obj : Map
+        Map object with span_km_east, span_km_north, nb_zones.
+    trans_ineq : np.ndarray
+        Shape (n_ineq, 3, nb_zones, nb_zones)
+        trans_ineq[k,0,z,iz] = Ay
+        trans_ineq[k,1,z,iz] = Ax
+        trans_ineq[k,2,z,iz] = Ac
+    safety_margin : float
+        Extra negative slack added to guarantee deactivation.
+
+    Returns
+    -------
+    np.ndarray
+        Shape (nb_zones, nb_zones)
+        Entry [z, iz] is the tightest valid disabling Big-M for all inequalities
+        associated with transition z -> iz.
+        If there are no inequalities for a pair, returns 0 for that pair.
+    """
+    nb_zones = map_obj.nb_zones
+    x_max = map_obj.info.span_km_east
+    y_max = map_obj.info.span_km_north
+
+    corners = np.array([
+        [0.0,   0.0],    # bottom-left
+        [x_max, 0.0],    # bottom-right
+        [0.0,   y_max],  # top-left
+        [x_max, y_max],  # top-right
+    ])
+
+    n_ineq = trans_ineq.shape[0]
+    big_M = np.zeros((nb_zones, nb_zones))
+
+    for z in range(nb_zones):
+        for iz in range(nb_zones):
+            coeffs = trans_ineq[:, :, z, iz]   # shape (n_ineq, 3)
+
+            # Skip empty transition blocks
+            if not np.any(coeffs):
+                big_M[z, iz] = 0.0
+                continue
+
+            min_val = np.inf
+            for x, y in corners:
+                vals = coeffs[:, 0] * y + coeffs[:, 1] * x + coeffs[:, 2]
+                min_val = min(min_val, np.min(vals))
+
+            big_M[z, iz] = min_val - safety_margin
+
+    return big_M
+
+
+
+def _ordered_zone_corner_ids(zone_corners_df: pd.DataFrame) -> dict[int, list[int]]:
+    """
+    Returns {zone_id: [corner_id_1, corner_id_2, ...]} ordered by the 'order' column.
+    """
+    out = {}
+    for zone_id, g in zone_corners_df.groupby("zone_id"):
+        g = g.sort_values("order")
+        out[int(zone_id)] = g["corner_id"].astype(int).tolist()
+    return out
+
+
+def _zone_edges_from_corner_ids(zone_corner_ids: dict[int, list[int]]) -> dict[int, set[frozenset[int]]]:
+    """
+    Returns unordered polygon edges for each zone.
+    Each edge is represented as frozenset({corner_i, corner_j}).
+    """
+    zone_edges = {}
+    for zone_id, corners in zone_corner_ids.items():
+        edges = set()
+        n = len(corners)
+        for i in range(n):
+            c1 = int(corners[i])
+            c2 = int(corners[(i + 1) % n])
+            edges.add(frozenset((c1, c2)))
+        zone_edges[zone_id] = edges
+    return zone_edges
+
+
+def _compute_min_crossing_distance_per_zone(corners_path, zone_corners_path) -> dict[int, float]:
+    """
+    Re-factor needed : Corners should be stored in the map object and this function should use it.
+    For each zone, compute the shortest valid segment that represents a minimum
+    crossing distance through that zone.
+
+    Rules used:
+      1) Candidate endpoints must be zone corners.
+      2) Ignore segments that are themselves a shared frontier edge with another zone.
+      3) For interior zones (2+ distinct neighboring zones):
+         require the two endpoints to connect the zone to two different neighbors.
+      4) For terminal zones (only 1 distinct neighboring zone):
+         allow one endpoint on the shared frontier side and the other on a non-shared
+         corner of the zone.
+
+    Returns:
+        {zone_id: min_crossing_distance_km}
+    """
+    corners_df = pd.read_csv(corners_path)
+    zone_corners_df = pd.read_csv(zone_corners_path)
+
+    # corner_id -> (x, y)
+    corner_xy = {
+        int(r.corner_id): (float(r.x), float(r.y))
+        for r in corners_df.itertuples(index=False)
+    }
+
+    # ordered corners per zone
+    zone_corner_ids = _ordered_zone_corner_ids(zone_corners_df)
+
+    # which zones use each corner
+    corner_to_zones: dict[int, set[int]] = {}
+    for r in zone_corners_df.itertuples(index=False):
+        cid = int(r.corner_id)
+        zid = int(r.zone_id)
+        corner_to_zones.setdefault(cid, set()).add(zid)
+
+    # polygon edges for each zone
+    zone_edges = _zone_edges_from_corner_ids(zone_corner_ids)
+
+    # which zones share each edge
+    edge_to_zones: dict[frozenset[int], set[int]] = {}
+    for zid, edges in zone_edges.items():
+        for e in edges:
+            edge_to_zones.setdefault(e, set()).add(zid)
+
+    min_dist = {}
+
+    for z, corner_ids in zone_corner_ids.items():
+        # For each corner of zone z, what other zones also use it?
+        corner_other_zones = {
+            cid: (corner_to_zones[cid] - {z})
+            for cid in corner_ids
+        }
+
+        # All distinct neighboring zones of zone z
+        distinct_neighbors = set()
+        for s in corner_other_zones.values():
+            distinct_neighbors |= s
+
+        best = np.inf
+
+        for i in range(len(corner_ids)):
+            c1 = int(corner_ids[i])
+            oz1 = corner_other_zones[c1]
+
+            for j in range(i + 1, len(corner_ids)):
+                c2 = int(corner_ids[j])
+                oz2 = corner_other_zones[c2]
+
+                # Exclude the pair if it is a frontier edge shared with another zone
+                edge = frozenset((c1, c2))
+                shared_by = edge_to_zones.get(edge, {z})
+                if len(shared_by - {z}) > 0:
+                    continue
+
+                valid_pair = False
+
+                if len(distinct_neighbors) >= 2:
+                    # Interior zone: endpoints must connect to two different neighbors
+                    valid_pair = any(a != b for a in oz1 for b in oz2)
+
+                elif len(distinct_neighbors) == 1:
+                    # Terminal zone: allow one endpoint on the shared side and one
+                    # endpoint on a non-shared corner
+                    valid_pair = (
+                        (len(oz1) > 0 and len(oz2) == 0) or
+                        (len(oz2) > 0 and len(oz1) == 0)
+                    )
+
+                else:
+                    # Isolated zone: no neighboring zone found in the CSV structure
+                    valid_pair = False
+
+                if not valid_pair:
+                    continue
+
+                x1, y1 = corner_xy[c1]
+                x2, y2 = corner_xy[c2]
+                d = float(np.hypot(x2 - x1, y2 - y1))
+                if d < best:
+                    best = d
+
+        if not np.isfinite(best):
+            raise ValueError(
+                f"Could not determine a valid minimum crossing distance for zone {z}. "
+                f"Neighbors found: {sorted(distinct_neighbors)}. "
+                f"Check corners.csv / zones.csv consistency or crossing rules."
+            )
+
+        min_dist[z] = best
+
+    return min_dist
+
+
+def _compute_min_zone_timesteps(corners_path, zone_corners_path, ship_max_speed_mps: float, timestep_h: float) -> dict[int, int]:
+    """
+    Convert min crossing distance [km] into minimum required number of timesteps. 
+    Re-factor needed : Corners should be stored in the map object and this function should use it.
+    """
+    if ship_max_speed_mps <= 0:
+        raise ValueError("ship_max_speed_mps must be > 0.")
+    if timestep_h <= 0:
+        raise ValueError("timestep_h must be > 0.")
+
+    min_dist_km = _compute_min_crossing_distance_per_zone(corners_path, zone_corners_path)
+
+    max_dist_per_timestep_km = ship_max_speed_mps * timestep_h * 3600.0 / 1000.0
+
+    min_steps = {}
+    for z, d_km in min_dist_km.items():
+        min_steps[z] = max(1, int(np.ceil(d_km / max_dist_per_timestep_km)))
+
+    return min_steps
+
+
 def point_in_zones(ship_pos: np.ndarray, zone_ineq: np.ndarray, eps: float = 0.0) -> np.ndarray:
     """
     Point is in zone z if for all j=0..3:
