@@ -40,6 +40,7 @@ vessel_no       = 4
 # CDlAF_stern   : Coefficient for Blenderman wind computation, see https://github.com/cybergalactic/FossenHandbook chap 10
 # delta         : Coefficient for Blenderman wind computation, see https://github.com/cybergalactic/FossenHandbook chap 10
 # kappa         : Coefficient for Blenderman wind computation, see https://github.com/cybergalactic/FossenHandbook chap 10
+# CD_water_curve and CD_water_breakpoints : F_calm = 0.5*rho*A_front*CD(v)v^2
 # ============================
 [hull]
 B               = 25.4
@@ -56,6 +57,7 @@ AL_air          = 3700
 AF_air          = 750
 AF_water        = 217.17
 AL_water        = 1496.3
+total_wet_area  = 4927.6
 sL              = 1
 sH              = 12
 CDt             = 0.9
@@ -63,6 +65,18 @@ CDlAF_bow       = 0.55
 CDlAF_stern     = 0.55
 delta           = 0.4
 kappa           = 1.4
+CT_water_breakpoints = [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
+CT_water_curve = [
+    0.0025,  # Fn = 0.10
+    0.0027,  # 0.15
+    0.0032,  # 0.20
+    0.0042,  # 0.25
+    0.0058,  # 0.30
+    0.0078,  # 0.35
+    0.0105,  # 0.40
+    0.0135,  # 0.45
+    0.0170   # 0.50
+]
 
 # ============================
 # PROPULSION
