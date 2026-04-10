@@ -1,9 +1,8 @@
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List
 import tomllib
-from datetime import datetime
 import math
 
 from lib.utils import build_or_load_adjacency_matrix, dx_dy_km, point_in_zones

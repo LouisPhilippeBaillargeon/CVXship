@@ -1,11 +1,8 @@
 from dataclasses import dataclass
 import numpy as np
-import os
 import xarray as xr
 import pandas as pd
 import math
-import matplotlib.pyplot as plt
-from typing import Optional, Tuple
 
 from lib.paths import CURRENTS, WAVES, ATMO, SUN
 from lib.utils import dx_dy_km

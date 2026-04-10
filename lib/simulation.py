@@ -4,14 +4,10 @@ from dataclasses import dataclass
 from dataclasses import asdict
 import matlab
 from pathlib import Path
-import matplotlib.pyplot as plt
 import time
-import math
 
 from lib.paths import SIMULATION, SHIP_MAT, SHIP_ABC_MAT
-from lib.load_params import States
-from lib.models import compute_rel_wind_speed_and_rel_attack_angle
-from lib.plotting import _ieee_axes, _plot_series, _plot_xy
+from lib.plotting import _plot_series, _plot_xy
 
 
 @dataclass

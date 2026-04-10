@@ -1,14 +1,11 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from matplotlib.patches import Patch
-from typing import Optional, Dict, Any
+from typing import Optional
 import numpy as np
 import pandas as pd
 import cvxpy as cp
-import warnings
-import math
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 import pickle
 
 
@@ -902,8 +899,6 @@ class PropulsionModel:
 
     #=======================================Plots===================================================
     from matplotlib.patches import Patch
-    from mpl_toolkits.mplot3d import Axes3D
-    import matplotlib.pyplot as plt
 
     def plot_power_surface_speed_resistance(self):
         """

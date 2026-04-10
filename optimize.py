@@ -7,7 +7,7 @@ from lib.models import PropulsionModel, WaveModel, WindModel, GeneratorModel, sa
 from lib.paths import WIND_MODEL, WAVE_MODEL, PROPULSION_MODEL, GENERATOR_MODEL
 from lib.plotting import plot_solutions, plot_zones_and_points
 from lib.optimizers import GlobalOptimizer, NaiveController, Solution, Fixed_Path_Optimizer, ShortestPath
-from lib.utils import point_in_zones, dx_dy_km, classify_timesteps, compute_port_zone_indices
+from lib.utils import point_in_zones, dx_dy_km, classify_timesteps
 from lib.evaluation import compute_non_convex_cost_all_timesteps
 
 
