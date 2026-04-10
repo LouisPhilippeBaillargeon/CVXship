@@ -203,6 +203,7 @@ def compute_non_convex_cost_all_timesteps(runner, eps=1e-9, debug=False):
             instant_sail            = sol.instant_sail,
             port_idx                = sol.port_idx,
             interval_sail_fraction  = sol.interval_sail_fraction,
+            total_distance          = np.sum(dist_km),
 
             zone                    = sol.zone,
             ship_pos                = sol.ship_pos,

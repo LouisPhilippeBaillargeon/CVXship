@@ -13,7 +13,6 @@ from lib.evaluation import compute_non_convex_cost_all_timesteps
 
 new_weather = False
 new_ship = False
-eps = 0.0001
 
 if __name__ == "__main__":
     
@@ -29,8 +28,8 @@ if __name__ == "__main__":
 
         propulsion_model = PropulsionModel(
             ship = ship,
-            grid_granularity = 50,
-            pitch_granularity = 20,
+            grid_granularity = 40,
+            pitch_granularity = 10,
         )
 
         fit_error_P_max, fit_error_P_mean= propulsion_model.fit_convex_model(debug=True)
@@ -102,6 +101,7 @@ if __name__ == "__main__":
     path.states.current_y_pos = 400
     path.states.current_heading = -2
     path.compute([x,y])
+    print(path.sol.zone_sequence)
 
     if path.sol is None:
         raise RuntimeError("ShortestPath did not produce a solution.")
@@ -184,7 +184,7 @@ if __name__ == "__main__":
     print("non-convex cost : ", np.sum(global_sol.estimated_cost))
     print("Optimal total distance traveled (km):",
         np.sum(np.linalg.norm(np.diff(optimizer.sol.ship_pos, axis=0), axis=1)))
-    plot_solutions([optimizer.sol, global_sol],["Convex Gloabl solution", "Non-convex Global solution"])
+    plot_solutions([optimizer.sol, global_sol],["Convex Gloabal solution", "Non-convex Global solution"], show=True)
 
   
     naive = NaiveController(map, itinerary, states, weather, ship)

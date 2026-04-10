@@ -25,6 +25,7 @@ class Solution:
     instant_sail            : np.ndarray #[T_future+1]
     port_idx                : np.ndarray #[T_future+1]
     interval_sail_fraction  : np.ndarray #[T_future]
+    total_distance          : float
 
     zone                    : np.ndarray #[T_future+1,nb_zone]
     ship_pos                : np.ndarray #[T_future+1,2]
@@ -328,7 +329,7 @@ class GlobalOptimizer:
 
         #==================================================PROPULSION=======================================================
         res_per_prop = cp.Variable(T_future)
-        prop_power = cp.Variable(T_future)
+        prop_power = cp.Variable(T_future, nonneg = True)
         advance_speed = cp.Variable(T_future)
         norm_adv_speed = cp.Variable(T_future)
         
@@ -453,6 +454,7 @@ class GlobalOptimizer:
                 instant_sail            = instant_sail,
                 port_idx                = port_idx,
                 interval_sail_fraction  = interval_sail_fraction,
+                total_distance          = np.sum(speed_mag.value),
 
                 zone                    = np.array(zone.value),
                 ship_pos                = np.array(ship_pos.value),
@@ -550,7 +552,7 @@ class Fixed_Path_Optimizer:
         total_path_length = float(D_breaks[-1])
 
         #==================================================ITTINERARY==================================================
-        d = cp.Variable(T_future+1)
+        d = cp.Variable(T_future+1, nonneg=True)
         #initial position
         constraints += [d[0] == 0]
 
@@ -584,7 +586,7 @@ class Fixed_Path_Optimizer:
 
 
         #=================================================EARTH-FIXED SPEED=================================================
-        speed_mag = cp.Variable(T_future)
+        speed_mag = cp.Variable(T_future, nonneg = True)
         constraints += [speed_mag == (cp.diff(d) / self.itinerary.timestep)*1000/3600] #m/s from km/h
 
         #=================================================ACCELERATION=================================================
@@ -596,7 +598,7 @@ class Fixed_Path_Optimizer:
         constraints += [acc_force >= acc * self.ship.info.weight / 1_000_000]
 
         #=================================================WEATHER=================================================
-        irr = cp.Variable(T_future)
+        irr = cp.Variable(T_future, nonneg = True)
         current_x = cp.Variable(T_future)
         current_y = cp.Variable(T_future)
         wind_x = cp.Variable(T_future)
@@ -633,7 +635,7 @@ class Fixed_Path_Optimizer:
         theta_seg = np.arctan2(segment_vecs[:, 1], segment_vecs[:, 0])  # radians
         cos_seg = np.cos(theta_seg)
         sin_seg = np.sin(theta_seg)
-        speed_seg = cp.Variable((T_future,nb_path_zones), nonneg=True)
+        speed_seg = cp.Variable((T_future,nb_path_zones))
         ship_speed = cp.Variable((T_future,2))
 
         constraints += [speed_mag == cp.sum(speed_seg, axis=1)]
@@ -646,18 +648,18 @@ class Fixed_Path_Optimizer:
         
 
         speed_rel_water = cp.Variable((T_future,2))
-        speed_rel_water_mag = cp.Variable(T_future)
+        speed_rel_water_mag = cp.Variable(T_future, nonneg = True)
         constraints += [speed_rel_water[:,0]  == ship_speed[:,0] - current_x]
         constraints += [speed_rel_water[:,1]  == ship_speed[:,1] - current_y]
         constraints += [speed_rel_water_mag >= cp.norm(speed_rel_water,axis=1)]
             
         #==================================================RESISTANCE=======================================================
-        wave_resistance = cp.Variable(T_future)
+        wave_resistance = cp.Variable(T_future, nonneg=True)
         wind_resistance = cp.Variable(T_future)
-        current_resistance = cp.Variable(T_future)
-        total_resistance = cp.Variable(T_future)
-        normalized_rel_speed = cp.Variable(T_future)
-        normalized_speed = cp.Variable(T_future)
+        current_resistance = cp.Variable(T_future, nonneg=True)
+        total_resistance = cp.Variable(T_future, nonneg=True)
+        normalized_rel_speed = cp.Variable(T_future, nonneg=True)
+        normalized_speed = cp.Variable(T_future, nonneg=True)
         constraints += [normalized_rel_speed == speed_rel_water_mag/self.ship.info.max_speed]
         constraints += [normalized_speed == speed_mag/self.ship.info.max_speed]
 
@@ -690,6 +692,7 @@ class Fixed_Path_Optimizer:
                                     wind_model_future[z,t,8]*ship_speed[t,1]/self.ship.info.max_speed + wind_model_future[z,t,9]*cp.power(ship_speed[t,1]/self.ship.info.max_speed,2) + 
                                     wind_model_future[z,t,10]*cp.power(ship_speed[t,1]/self.ship.info.max_speed,4) - (wind_max_res_future[z,t]+1)*(1 - seg[t, z])
                     ]
+                    min_val = min(wind_model_future[z,t,2],wind_model_future[z,t,3],wind_model_future[z,t,4],wind_model_future[z,t,6],wind_model_future[z,t,7],wind_model_future[z,t,9],wind_model_future[z,t,10])
                     constraints += [wave_resistance[t] >= wave_model_future[z,t,0] + wave_model_future[z,t,1]*normalized_rel_speed[t] + 
                                     wave_model_future[z,t,2]*cp.square(normalized_rel_speed[t]) + wave_model_future[z,t,3]*cp.power(normalized_rel_speed[t],3) + 
                                     wave_model_future[z,t,4]*cp.power(normalized_rel_speed[t],4) + wave_model_future[z,t,5]*speed_rel_water[t,0]/self.ship.info.max_speed +
@@ -697,6 +700,7 @@ class Fixed_Path_Optimizer:
                                     wave_model_future[z,t,8]*speed_rel_water[t,1]/self.ship.info.max_speed + wave_model_future[z,t,9]*cp.power(speed_rel_water[t,1]/self.ship.info.max_speed,2) + 
                                     wave_model_future[z,t,10]*cp.power(speed_rel_water[t,1]/self.ship.info.max_speed,4) - (wave_max_res_future[z,t]+1)*(1 - seg[t, z])
                     ]
+                    min_val = min(wave_model_future[z,t,2],wave_model_future[z,t,3],wave_model_future[z,t,4],wave_model_future[z,t,6],wave_model_future[z,t,7],wave_model_future[z,t,9],wave_model_future[z,t,10])
                 constraints += [current_resistance[t] >= 0.5*CD*cp.power(speed_rel_water_mag[t],2)*self.ship.hull.total_wet_area*self.ship.info.rho_water/1000000]
                 
             else: # if at a port
@@ -711,10 +715,10 @@ class Fixed_Path_Optimizer:
         #constraints += [total_resistance <= self.propulsion_model.max_thrust*self.ship.propulsion.nb_propellers]
 
         #==================================================PROPULSION=======================================================
-        res_per_prop = cp.Variable(T_future)
+        res_per_prop = cp.Variable(T_future, nonneg = True)
         prop_power = cp.Variable(T_future, nonneg = True)
-        advance_speed = cp.Variable(T_future)
-        norm_adv_speed = cp.Variable(T_future)
+        advance_speed = cp.Variable(T_future, nonneg = True)
+        norm_adv_speed = cp.Variable(T_future, nonneg = True)
         
         constraints += [advance_speed == speed_rel_water_mag*(1 - self.ship.propulsion.wake_fraction)]
         constraints += [norm_adv_speed == advance_speed/self.propulsion_model.max_ua]
@@ -723,6 +727,7 @@ class Fixed_Path_Optimizer:
         # Constraint to remove unfeasible rotational speeds without adding it as a decision variable
         A = self.propulsion_model.constraint_params
 
+        constraints += [prop_power >= 0]
         for t in range(T_future):
             if(instant_sail[t]): #if sailing
                 #constraints += [prop_power[t] >= self.ship.propulsion.min_pow*self.ship.propulsion.nb_propellers]
@@ -737,7 +742,7 @@ class Fixed_Path_Optimizer:
 
         
         #=================================================SOLAR POWER==================================================
-        solar_power = cp.Variable(T_future)
+        solar_power = cp.Variable(T_future, nonneg = True)
         irr_future = self.weather.irradiance[:, self.states.timesteps_completed : self.states.timesteps_completed + T_future]  # shape [nb_zones, T_future]
         irr_future = self.weather.irradiance[path_zone_ids, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
         constraints += [solar_power>=0]
@@ -746,7 +751,7 @@ class Fixed_Path_Optimizer:
             constraints += [solar_power[t] <= self.ship.solarPannels.area * self.ship.solarPannels.efficiency * (zone_avg_t@irr_future[:,t])]
 
         #=================================================SHORE POWER==================================================
-        shore_power = cp.Variable(T_future)
+        shore_power = cp.Variable(T_future, nonneg = True)
         shore_cost = np.zeros(T_future)
         for t in range(T_future):
             if instant_sail[t]:
@@ -758,9 +763,9 @@ class Fixed_Path_Optimizer:
                 constraints += [shore_power[t] <= self.itinerary.transits[p].max_charge_power]
 
         #===================================================BATTERY====================================================
-        battery_charge = cp.Variable(T_future)
-        battery_discharge = cp.Variable(T_future)
-        SOC = cp.Variable(T_future+1)
+        battery_charge = cp.Variable(T_future, nonneg = True)
+        battery_discharge = cp.Variable(T_future, nonneg = True)
+        SOC = cp.Variable(T_future+1, nonneg = True)
     
         constraints += [SOC>=0]
         constraints += [battery_charge>=0]
@@ -776,8 +781,8 @@ class Fixed_Path_Optimizer:
         constraints += [SOC[-1]>=self.itinerary.soc_f]
 
         #=====================================================GENERATORS======================================================
-        generation_power = cp.Variable((len(self.generator_models),T_future)) #[nb_gen, nb_timsetep]
-        gen_costs = cp.Variable((len(self.generator_models),T_future)) #[nb_gen, nb_timesteps]
+        generation_power = cp.Variable((len(self.generator_models),T_future), nonneg = True) #[nb_gen, nb_timsetep]
+        gen_costs = cp.Variable((len(self.generator_models),T_future), nonneg = True) #[nb_gen, nb_timesteps]
 
         max_p = np.array([g.max_power for g in self.ship.generators])[:, None]  # [nb_gen, 1]
         max_p = np.repeat(max_p, T_future, axis=1)  # [nb_gen, T_future]
@@ -868,6 +873,8 @@ class Fixed_Path_Optimizer:
             else:
                 gen_on_out = np.ones((len(self.generator_models),T_future))
 
+            print("prop_power",np.array(prop_power.value))
+
             self.sol = Solution(
                 estimated_cost           = problem.value,
                 T_future                = T_future,
@@ -875,6 +882,7 @@ class Fixed_Path_Optimizer:
                 port_idx                = port_idx,
                 interval_sail_fraction  = interval_sail_fraction,
                 zone                    = np.array(seg.value),
+                total_distance          = total_path_length,
 
                 ship_pos                = ship_pos_2d,
                 ship_speed              = ship_speed_2d,
@@ -1126,6 +1134,7 @@ class NaiveController:
             instant_sail=instant_sail,
             port_idx=port_idx,
             interval_sail_fraction=interval_sail_fraction,
+            total_distance = total_distance,
 
             zone=zone.value,
             ship_pos=ship_pos_out,
@@ -1311,10 +1320,12 @@ class ShortestPath:
             print(f"transition_points =\n{transition_points}")
             print(f"total_distance = {total_distance}")
 
+        zone_seq_idx = [z - 1 for z in zone_seq]  # 0-based indices
+           
         self.sol = ShortestPathSolution(
             waypoints=waypoints,
             transition_points=transition_points,
-            zone_sequence=zone_seq,
+            zone_sequence=zone_seq_idx,
             portal_endpoints=portals,
             total_distance=float(total_distance),
             status=problem.status,

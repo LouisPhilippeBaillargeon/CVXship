@@ -7,8 +7,8 @@
 #Note : if there is not an integer amount of timesteps in the total duration of your trip (eg : trip duration = 4h37, timestep = 1h), then trip will be constrained to be done in 4h.
 # ============================
 [params]
-soc_i               = 10
-soc_f               = 20
+soc_i               = 4
+soc_f               = 4
 timestep            = 0.25
 fuel_price          = 1.396
 

@@ -3,6 +3,9 @@ from typing import Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
+import os
+import re
+import pickle
 
 from lib.paths import PLOTS
 from lib.utils import _halfspace_polygon_4ineq
@@ -197,6 +200,7 @@ def plot_solutions(
     solutions,
     labels=None,
     show: bool = False,
+    subfolder: str | None = None,
 ):
     """
     Compare multiple solutions by printing summaries and overlaying their
@@ -210,6 +214,26 @@ def plot_solutions(
 
     assert len(solutions) == len(labels), "solutions and labels must have same length"
 
+    # ===================== SAVE SOLUTIONS AS PKL =====================
+    # Try to reuse the same plot directory used elsewhere in the module
+    plot_dir = os.path.join(PLOTS, subfolder) if subfolder else PLOTS
+    os.makedirs(plot_dir, exist_ok=True)
+
+    def _safe_filename(name: str) -> str:
+        name = str(name).strip()
+        name = re.sub(r"[^\w\-\. ]", "_", name)   # replace unsafe chars
+        name = re.sub(r"\s+", "_", name)          # spaces -> underscores
+        return name
+
+    for i, (sol, label) in enumerate(zip(solutions, labels)):
+        fname = f"solution_{i:02d}_{_safe_filename(label)}.pkl"
+        fpath = os.path.join(plot_dir, fname)
+        with open(fpath, "wb") as f:
+            pickle.dump(sol, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    print(f"Saved {len(solutions)} solution object(s) to: {plot_dir}")
+
+
     # ===================== COMMON HORIZON =====================
     Ts = [int(sol.T_future) for sol in solutions]
     T = min(Ts)
@@ -222,6 +246,7 @@ def plot_solutions(
     for sol, label, Ti in zip(solutions, labels, Ts):
         print(f"{label} estimated cost : {getattr(sol, 'estimated_cost', np.nan):.6g}")
         print(f"{label} T_future       : {Ti}")
+        print(f"{label} Total Distance       : {getattr(sol, 'total_distance', np.nan):.6g}")
     print(f"Common horizon used  : {T}")
     print()
 
