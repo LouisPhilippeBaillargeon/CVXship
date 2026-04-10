@@ -16,7 +16,7 @@ from lib.load_params import Ship, Generator
 from lib.paths import B_SERIES_CQ, B_SERIES_CT
 from lib.utils import bisection
 
-eps = 0.001
+eps = 1e-6
 
 
 def save_obj(path, obj):
@@ -119,13 +119,13 @@ class WindModel:
         intercept = cp.Variable()
 
         constraints = []
-        constraints += [param_vx_2>=0]
-        constraints += [param_vy_2>=0]
-        constraints += [param_vx_4>=0]
-        constraints += [param_vy_4>=0]
-        constraints += [param_vs_2>=0]
-        constraints += [param_vs_3>=0]
-        constraints += [param_vs_4>=0]
+        constraints += [param_vx_2>=eps]
+        constraints += [param_vy_2>=eps]
+        constraints += [param_vx_4>=eps]
+        constraints += [param_vy_4>=eps]
+        constraints += [param_vs_2>=eps]
+        constraints += [param_vs_3>=eps]
+        constraints += [param_vs_4>=eps]
 
         for i_y in range(len(vy_vals)):
             for i_x in range(len(vx_vals)):
@@ -134,7 +134,7 @@ class WindModel:
                                     param_vx_4*vx_vals_norm_4[i_x]+param_vx_2*vx_vals_norm_2[i_x]+param_vx*vx_vals_norm[i_x]+
                                     param_vy_4*vy_vals_norm_4[i_y]+param_vy_2*vy_vals_norm_2[i_y]+param_vy*vy_vals_norm[i_y]+
                                     param_vs_4*vs_vals_norm_4[i_y,i_x]+param_vs_3*vs_vals_norm_3[i_y,i_x]+param_vs_2*vs_vals_norm_2[i_y,i_x]+param_vs*vs_vals_norm[i_y,i_x]]
-                    #constraints+=[R_fit[i_y,i_x] >= Resistance[i_y,i_x]]
+                    constraints+=[R_fit[i_y,i_x] >= Resistance[i_y,i_x]]
         
         objective = cp.Minimize(cp.sum_squares(cp.multiply(R_fit-Resistance,mask)))
         problem = cp.Problem(objective, constraints)
@@ -213,9 +213,6 @@ class WindModel:
             param_vy_2.value,
             param_vy_4.value,
         ])
-
-        convex_idx = [2, 3, 4, 6, 7, 9, 10]
-        coeffs[convex_idx] = np.maximum(coeffs[convex_idx], 0.0)
         return np.nanmax(abs_err),coeffs, max(R_fit.value[mask])
 
     def fit_convex_models(
@@ -435,13 +432,13 @@ class WaveModel:
         intercept = cp.Variable()
 
         constraints = []
-        constraints += [param_vx_2>=0]
-        constraints += [param_vy_2>=0]
-        constraints += [param_vx_4>=0]
-        constraints += [param_vy_4>=0]
-        constraints += [param_vs_2>=0]
-        constraints += [param_vs_3>=0]
-        constraints += [param_vs_4>=0]
+        constraints += [param_vx_2>=eps]
+        constraints += [param_vy_2>=eps]
+        constraints += [param_vx_4>=eps]
+        constraints += [param_vy_4>=eps]
+        constraints += [param_vs_2>=eps]
+        constraints += [param_vs_3>=eps]
+        constraints += [param_vs_4>=eps]
 
         for i_y in range(len(vy_vals)):
             for i_x in range(len(vx_vals)):
@@ -504,9 +501,6 @@ class WaveModel:
             param_vy_2.value,
             param_vy_4.value,
         ])
-
-        convex_idx = [2, 3, 4, 6, 7, 9, 10]
-        coeffs[convex_idx] = np.maximum(coeffs[convex_idx], 0.0)
 
         return np.nanmax(abs_err),coeffs, max(R_fit.value[mask])
 
@@ -829,10 +823,10 @@ class PropulsionModel:
         param_s_3 = cp.Variable()
         
         constraints = []
-        constraints += [param_r_2>=0]
-        constraints += [param_r_3>=0]
-        constraints += [param_s_2>=0]
-        constraints += [param_s_3>=0]
+        constraints += [param_r_2>=eps]
+        constraints += [param_r_3>=eps]
+        constraints += [param_s_2>=eps]
+        constraints += [param_s_3>=eps]
 
         for i_s in range(len(self.ua_vals)):
             for i_r in range(len(r_vals_norm)):
@@ -1127,7 +1121,7 @@ class GeneratorModel:
         intercept = cp.Variable()
 
         constraints = []
-        constraints += [param_2>=0]
+        constraints += [param_2>=eps]
         constraints += [fuel_fit[0]==intercept]
         for ip in range(nb_breakpoints):
             power_i = self.generator.power[ip]

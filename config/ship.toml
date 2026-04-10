@@ -9,7 +9,7 @@
 # vessel_no     : Only for MSS simulation, vessel type map in MSS doc
 # ============================
 [info]
-max_speed       = 20
+max_speed       = 12
 weight          = 24609620
 rho_water       = 1025
 displacement    = 24009.38537
@@ -98,8 +98,8 @@ AE_AO           = 0.59
 nb_blades       = 6
 nb_propellers   = 2
 max_n           = 3.0
-min_pow         = 10.0
-max_pow         = 40.0
+min_pow         = 0.1
+max_pow         = 10.0
 wake_fraction   = 0.3
 
 # ============================
@@ -112,9 +112,9 @@ wake_fraction   = 0.3
 # leak          : (/1)
 # ============================
 [battery]
-capacity        = 20
-max_charge_pow  = 5
-max_discharge_pow= 5
+capacity        = 4
+max_charge_pow  = 1
+max_discharge_pow= 1
 discharge_eff   = 0.95
 charge_eff      = 0.95
 leak            = 1.0

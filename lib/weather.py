@@ -333,6 +333,14 @@ def weather_from_nc_file(map, itinerary):
     times_wav  = pd.to_datetime(waves["valid_time"].values)
     times_sun  = pd.to_datetime(sun["valid_time"].values)
 
+    def print_time_range(name, times):
+        print(f"{name}: {times.min()}  →  {times.max()}  (n={len(times)})")
+
+    print_time_range("currents", times_curr)
+    print_time_range("atmo",     times_atmo)
+    print_time_range("waves",    times_wav)
+    print_time_range("sun",      times_sun)
+
 
     # Extract weather variables
     mwp = latlon_to_zone(waves, "mwp", "valid_time", map)
