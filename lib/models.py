@@ -134,7 +134,7 @@ class WindModel:
                                     param_vx_4*vx_vals_norm_4[i_x]+param_vx_2*vx_vals_norm_2[i_x]+param_vx*vx_vals_norm[i_x]+
                                     param_vy_4*vy_vals_norm_4[i_y]+param_vy_2*vy_vals_norm_2[i_y]+param_vy*vy_vals_norm[i_y]+
                                     param_vs_4*vs_vals_norm_4[i_y,i_x]+param_vs_3*vs_vals_norm_3[i_y,i_x]+param_vs_2*vs_vals_norm_2[i_y,i_x]+param_vs*vs_vals_norm[i_y,i_x]]
-                    constraints+=[R_fit[i_y,i_x] >= Resistance[i_y,i_x]]
+                    #constraints+=[R_fit[i_y,i_x] >= Resistance[i_y,i_x]]
         
         objective = cp.Minimize(cp.sum_squares(cp.multiply(R_fit-Resistance,mask)))
         problem = cp.Problem(objective, constraints)
@@ -245,6 +245,42 @@ class WaveModel:
     thrust_coeffs: Optional[np.ndarray] = field(default=None, init=False)
     relative_errors: Optional[np.ndarray] = field(default=None, init=False)
     max_convex_resistance : Optional[np.ndarray] = field(default=None, init=False)
+
+    @staticmethod
+    def compute_wave_relative_angle_encounter(
+        ship_speed_vector,      # [vx, vy] m/s, speed through water
+        mean_wave_direction,    # ERA5 convention, degrees, "from" direction
+        eps: float = 1e-12,
+    ):
+        """
+        Compute wave encounter angle in radians in [0, pi].
+
+        Convention used here:
+        - mean_wave_direction follows ERA5 "from" convention:
+            0 deg = from north, 90 deg = from east
+        - ship_speed_vector is [vx, vy] in east/north coordinates
+        - returned angle is:
+            0   -> waves coming straight against ship motion (head seas)
+            pi/2 -> beam seas
+            pi   -> following seas
+        """
+        mwd_rad = np.deg2rad(mean_wave_direction)
+
+        # Unit vector pointing FROM where waves come
+        wx_from = np.sin(mwd_rad)   # east component
+        wy_from = np.cos(mwd_rad)   # north component
+
+        Vs = float(np.hypot(ship_speed_vector[0], ship_speed_vector[1]))
+
+        # Undefined heading at zero speed. Keep a deterministic fallback.
+        if Vs < eps:
+            sx, sy = 1.0, 0.0
+        else:
+            sx = float(ship_speed_vector[0]) / Vs
+            sy = float(ship_speed_vector[1]) / Vs
+
+        dot = np.clip(wx_from * sx + wy_from * sy, -1.0, 1.0)
+        return float(np.arccos(dot))
 
     def compute_resistance(self,
                     mean_wave_amplitude,            # m
@@ -378,12 +414,6 @@ class WaveModel:
         nb_steps : int = 40,                # amount of points used in the fit in both axis
         debug: bool = False
     ):
-        
-        mwd_deg = mean_wave_direction      # ERA5 value
-        mwd_rad = np.deg2rad(mwd_deg)
-        wx_from = np.sin(mwd_rad)          # east component
-        wy_from = np.cos(mwd_rad)          # north component
-
         vx_vals = np.arange(-self.ship.info.max_speed, self.ship.info.max_speed + 1e-12, 2*(self.ship.info.max_speed)/nb_steps)
         vy_vals = np.arange(-self.ship.info.max_speed, self.ship.info.max_speed + 1e-12, 2*(self.ship.info.max_speed)/nb_steps)
         VX, VY = np.meshgrid(vx_vals, vy_vals)
@@ -395,16 +425,21 @@ class WaveModel:
         for i in range(VX.shape[0]):
             for j in range(VX.shape[1]):
                 if(mask[i,j]):
-                    #Compute relative angle and speed
-                    Vs = np.hypot(VX[i, j], VY[i, j])   # speed through water
-                    ship_heading = np.arctan2(VY[i, j], VX[i, j])   # 0 = +x (east), CCW positive
-                    sx = VX[i, j] / Vs
-                    sy = VY[i, j] / Vs
-                    dot = wx_from * sx + wy_from * sy
-                    dot = np.clip(dot, -1.0, 1.0)              # numerical safety
-                    wave_relative_angle_encounter = np.arccos(dot)
-                    Resistance[i,j] = self.compute_resistance(mean_wave_amplitude,mean_wave_frequency,mean_wave_length,Vs,wave_relative_angle_encounter)
+                    ship_speed_vector = np.array([VX[i, j], VY[i, j]], dtype=float)
+                    Vs = float(np.hypot(ship_speed_vector[0], ship_speed_vector[1]))
 
+                    wave_relative_angle_encounter = self.compute_wave_relative_angle_encounter(
+                        ship_speed_vector=ship_speed_vector,
+                        mean_wave_direction=mean_wave_direction,
+                    )
+
+                    Resistance[i, j] = self.compute_resistance(
+                        mean_wave_amplitude,
+                        mean_wave_frequency,
+                        mean_wave_length,
+                        Vs,
+                        wave_relative_angle_encounter,
+                    )
         #Fit a convex power model
         vx_vals_norm = vx_vals/self.ship.info.max_speed
         vy_vals_norm = vy_vals/self.ship.info.max_speed
@@ -447,7 +482,7 @@ class WaveModel:
                                     param_vx_4*vx_vals_norm_4[i_x]+param_vx_2*vx_vals_norm_2[i_x]+param_vx*vx_vals_norm[i_x]+
                                     param_vy_4*vy_vals_norm_4[i_y]+param_vy_2*vy_vals_norm_2[i_y]+param_vy*vy_vals_norm[i_y]+
                                     param_vs_4*vs_vals_norm_4[i_y,i_x]+param_vs_3*vs_vals_norm_3[i_y,i_x]+param_vs_2*vs_vals_norm_2[i_y,i_x]+param_vs*vs_vals_norm[i_y,i_x]]
-                    constraints+=[R_fit[i_y,i_x] >= Resistance[i_y,i_x]]
+                    #constraints+=[R_fit[i_y,i_x] >= Resistance[i_y,i_x]]
         
         objective = cp.Minimize(cp.sum_squares(cp.multiply(R_fit-Resistance,mask)))
         problem = cp.Problem(objective, constraints)
@@ -827,6 +862,8 @@ class PropulsionModel:
         constraints += [param_r_3>=eps]
         constraints += [param_s_2>=eps]
         constraints += [param_s_3>=eps]
+
+        constraints += [Pow_fit>=0]
 
         for i_s in range(len(self.ua_vals)):
             for i_r in range(len(r_vals_norm)):

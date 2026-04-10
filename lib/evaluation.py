@@ -119,21 +119,13 @@ def compute_non_convex_cost_all_timesteps(runner, eps=1e-9, debug=False):
             freq = float(_interp_time(weather.mean_wave_frequency, z, idx_float))
             wl = float(_interp_time(weather.mean_wave_length, z, idx_float))
 
-            mwd_rad = np.deg2rad(mwd_deg)
-            wx_from = np.sin(mwd_rad)
-            wy_from = np.cos(mwd_rad)
+            ship_speed_rel_water = np.array(sol.speed_rel_water[t, :], dtype=float)
+            Vs = float(np.hypot(ship_speed_rel_water[0], ship_speed_rel_water[1]))
 
-            vx_rel_water = float(sol.speed_rel_water[t, 0])
-            vy_rel_water = float(sol.speed_rel_water[t, 1])
-            Vs = float(np.hypot(vx_rel_water, vy_rel_water))
-
-            if Vs < 1e-12:
-                sx, sy = 1.0, 0.0
-            else:
-                sx, sy = vx_rel_water / Vs, vy_rel_water / Vs
-
-            dot = np.clip(wx_from * sx + wy_from * sy, -1.0, 1.0)
-            wave_relative_angle_encounter = np.arccos(dot)
+            wave_relative_angle_encounter = wave_model.compute_wave_relative_angle_encounter(
+                ship_speed_vector=ship_speed_rel_water,
+                mean_wave_direction=mwd_deg,
+            )
 
             wave_resistance[t] = float(
                 wave_model.compute_resistance(

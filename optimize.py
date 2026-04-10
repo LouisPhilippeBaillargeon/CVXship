@@ -86,7 +86,6 @@ if __name__ == "__main__":
     _assert_finite("map.trans_ineq_to", map.trans_ineq_to)
     _assert_finite("map.trans_ineq_from", map.trans_ineq_from)
 
-
     x, y, _ = dx_dy_km(map, itinerary.transits[-1].lat, itinerary.transits[-1].lon)
     
 
@@ -96,7 +95,7 @@ if __name__ == "__main__":
         states              = states,
         weather             = weather,
         ship                = ship,)
-    path.states.timesteps_completed = 40
+    path.states.timesteps_completed = 60
     path.states.current_x_pos = 200
     path.states.current_y_pos = 400
     path.states.current_heading = -2
@@ -128,7 +127,7 @@ if __name__ == "__main__":
         ref_speed = ref_speed
     )
 
-    optimizer.states.timesteps_completed = 40
+    optimizer.states.timesteps_completed = 60
     optimizer.states.current_x_pos = 200
     optimizer.states.current_y_pos = 400
     optimizer.states.current_heading = -2
@@ -140,16 +139,8 @@ if __name__ == "__main__":
 
     if ok:
         print("Optimization succeeded.")
-        print("Waypoints:")
-        print(path.sol.waypoints)
-        print("Estimated cost:", optimizer.sol.estimated_cost)
         n_all, fixed_path_sol, dt_h = compute_non_convex_cost_all_timesteps(optimizer, debug=False)
-        print("dt_h", dt_h)
-        print("convex cost : ", np.sum(optimizer.sol.estimated_cost))
-        print("non-convex cost : ", np.sum(fixed_path_sol.estimated_cost))
-        print("Optimal total distance traveled (km):",
-        np.sum(np.linalg.norm(np.diff(optimizer.sol.ship_pos, axis=0), axis=1)))
-        plot_solutions([optimizer.sol, fixed_path_sol],["Convex Fixed Path solution", "Non-convex Fixed Path solution"], show=True)
+        plot_solutions([optimizer.sol, fixed_path_sol],["Convex Fixed Path solution", "Non-convex Fixed Path solution"], show=True, subfolder="Fixed Path")
     else:
         print("Optimization failed.")
 
@@ -166,7 +157,7 @@ if __name__ == "__main__":
         ship                = ship,
         ref_speed           = ref_speed,)
 
-    optimizer.states.timesteps_completed = 40
+    optimizer.states.timesteps_completed = 60
     optimizer.states.current_x_pos = 200
     optimizer.states.current_y_pos = 400
     optimizer.states.current_heading = -2
@@ -179,12 +170,7 @@ if __name__ == "__main__":
     optimizer.optimize(debug=False)
     plot_zones_and_points(optimizer.sol.ship_pos, optimizer.map.zone_ineq)
     n_all, global_sol, dt_h = compute_non_convex_cost_all_timesteps(optimizer, debug=False)
-    print("dt_h", dt_h)
-    print("convex cost : ", np.sum(optimizer.sol.estimated_cost))
-    print("non-convex cost : ", np.sum(global_sol.estimated_cost))
-    print("Optimal total distance traveled (km):",
-        np.sum(np.linalg.norm(np.diff(optimizer.sol.ship_pos, axis=0), axis=1)))
-    plot_solutions([optimizer.sol, global_sol],["Convex Gloabal solution", "Non-convex Global solution"], show=True)
+    plot_solutions([optimizer.sol, global_sol],["Convex Gloabal solution", "Non-convex Global solution"], show=True, subfolder="Global Path")
 
   
     naive = NaiveController(map, itinerary, states, weather, ship)
@@ -199,12 +185,7 @@ if __name__ == "__main__":
 
 
     n_all, naive_solution, dt_h = compute_non_convex_cost_all_timesteps(naive)
-    print("dt_h", dt_h)
-    print("naive nonconv cost:", np.sum(naive_solution.estimated_cost))
-    print("naive max speed |ship_speed|:", np.max(np.linalg.norm(naive.sol.ship_speed, axis=1)))
-    print("naive total distance traveled (km):", np.sum(np.linalg.norm(np.diff(naive.sol.ship_pos, axis=0), axis=1)))
-    
-    plot_solutions([fixed_path_sol, global_sol, naive_solution],["Fixed Path Optimizer", "Global Path Optimizer", "Naive Controller"], show = True)
+    plot_solutions([fixed_path_sol, global_sol, naive_solution],["Fixed Path Optimizer", "Global Path Optimizer", "Naive Controller"], show = True, subfolder="All sol compared")
 
 
     
