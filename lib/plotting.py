@@ -309,6 +309,7 @@ def plot_solutions(
     _plot_1d_overlay_multi(collect("wind_resistance", T), t, "wind_resistance", "Wind resistance [MN]", directory = plot_dir)
     _plot_1d_overlay_multi(collect("current_resistance", T), t, "current_resistance", "Current resistance [MN]", directory = plot_dir)
     _plot_1d_overlay_multi(collect("total_resistance", T), t, "total_resistance", "Total resistance [MN]", directory = plot_dir)
+    _plot_1d_overlay_multi(collect("acc_force", T), t, "acc_force", "Force to accelerate [MN]", directory = plot_dir)
     _plot_1d_overlay_multi([total_gen_cost(sol) for sol in solutions], t, "gen_costs_total", "Generation cost [currency]", directory = plot_dir)
     _plot_1d_overlay_multi(collect("solar_power", T), t, "solar_power", "Solar power [MW]", directory = plot_dir)
     _plot_1d_overlay_multi(collect("shore_power", T), t, "shore_power", "Shore power [MW]", directory = plot_dir)

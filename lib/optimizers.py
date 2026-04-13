@@ -35,6 +35,7 @@ class Solution:
     wave_resistance         : np.ndarray #[T_future]
     wind_resistance         : np.ndarray #[T_future]
     current_resistance      : np.ndarray #[T_future]
+    acc_force               : np.ndarray #[T_future]
     total_resistance        : np.ndarray #[T_future]
 
     generation_power        : np.ndarray #[nb_gen,T_future]
@@ -248,11 +249,11 @@ class GlobalOptimizer:
         #=================================================ACCELERATION=================================================
         acc = cp.Variable(T_future)
         acc_force = cp.Variable(T_future)
-        constraints += [acc[:-1] == cp.diff(speed_mag) / (self.itinerary.timestep*3600)]
-        constraints += [acc[-1] == 0]
+
+        constraints += [acc[0] == (speed_mag[0] - self.itinerary.init_speed) / (self.itinerary.timestep * 3600)]
+        constraints += [acc[1:] == cp.diff(speed_mag) / (self.itinerary.timestep * 3600)]
         constraints += [acc_force >= 0]
         constraints += [acc_force >= acc * self.ship.info.weight / 1_000_000]
-
 
         #=================================================RELATIVE SPEEDS=================================================
         speed_rel_water = cp.Variable((T_future,2))
@@ -262,8 +263,9 @@ class GlobalOptimizer:
         current_y_future = self.weather.current_y[:,self.states.timesteps_completed : self.states.timesteps_completed + T_future]
         wind_x_future = self.weather.wind_x[:,self.states.timesteps_completed : self.states.timesteps_completed + T_future]
         wind_y_future = self.weather.wind_y[:,self.states.timesteps_completed : self.states.timesteps_completed + T_future]
-
+        
         constraints += [speed_rel_water_mag >= cp.norm(speed_rel_water,axis=1)]
+
         for t in range(T_future):
             zone_avg_t = (zone[t, :] + zone[t+1, :]) / 2.0
             constraints += [speed_rel_water[t,0]==ship_speed[t,0]-(zone_avg_t@current_x_future[:,t])]
@@ -463,6 +465,7 @@ class GlobalOptimizer:
                 prop_power              = np.array(prop_power.value),
                 wave_resistance         = np.array(wave_resistance.value),
                 wind_resistance         = np.array(wind_resistance.value),
+                acc_force               = np.array(acc_force.value),
                 current_resistance      = np.array(current_resistance.value),
                 total_resistance        = np.array(total_resistance.value),
 
@@ -590,8 +593,8 @@ class Fixed_Path_Optimizer:
         #=================================================ACCELERATION=================================================
         acc = cp.Variable(T_future)
         acc_force = cp.Variable(T_future)
-        constraints += [acc[:-1] == cp.diff(speed_mag) / (self.itinerary.timestep*3600)]
-        constraints += [acc[-1] == 0]
+        constraints += [acc[0] == (speed_mag[0] - self.itinerary.init_speed) / (self.itinerary.timestep * 3600)]
+        constraints += [acc[1:] == cp.diff(speed_mag) / (self.itinerary.timestep * 3600)]
         constraints += [acc_force >= 0]
         constraints += [acc_force >= acc * self.ship.info.weight / 1_000_000]
 
@@ -891,6 +894,7 @@ class Fixed_Path_Optimizer:
                 wave_resistance         = np.array(wave_resistance.value),
                 wind_resistance         = np.array(wind_resistance.value),
                 current_resistance      = np.array(current_resistance.value),
+                acc_force               = np.array(acc_force.value),
                 total_resistance        = np.array(total_resistance.value),
 
                 generation_power        = np.array(generation_power.value),
@@ -1125,6 +1129,7 @@ class NaiveController:
         wind_resistance = np.zeros(T_future, dtype=float)
         current_resistance = np.zeros(T_future, dtype=float)
         total_resistance = np.zeros(T_future, dtype=float)
+        acc_force = np.zeros(T_future, dtype=float)
 
         self.sol = Solution(
             estimated_cost=0.0,
@@ -1143,6 +1148,7 @@ class NaiveController:
             wave_resistance=wave_resistance,
             wind_resistance=wind_resistance,
             current_resistance=current_resistance,
+            acc_force=acc_force,
             total_resistance=total_resistance,
 
             generation_power=gen_power,
