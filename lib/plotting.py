@@ -57,13 +57,13 @@ def _ensure_plots_dir():
     os.makedirs(PLOTS, exist_ok=True)
 
 
-def _save_and_maybe_show(fig, name: str, show: bool = False):
+def _save_and_maybe_show(fig, name: str, show: bool = False, directory=PLOTS):
     """
     Always save to PLOTS/<name>.png.
     Show only if requested, otherwise close the figure.
     """
     _ensure_plots_dir()
-    path = os.path.join(PLOTS, f"{name}.png")
+    path = os.path.join(directory, f"{name}.png")
     fig.savefig(path, bbox_inches="tight")
     if show:
         plt.show()
@@ -84,6 +84,7 @@ def _plot_1d(
     ylabel: str,
     xlabel: str = "Timestep",
     show: bool = False,
+    directory=PLOTS,
 ):
     values = _as_1d(values)
     if values is None:
@@ -92,7 +93,7 @@ def _plot_1d(
     fig, ax = plt.subplots()
     ax.plot(x, values)
     _finalize_axis(ax, xlabel=xlabel, ylabel=ylabel, title=name)
-    _save_and_maybe_show(fig, name, show)
+    _save_and_maybe_show(fig, name, show, directory=directory)
 
 
 def _plot_1d_overlay(
@@ -106,6 +107,7 @@ def _plot_1d_overlay(
     xlabel: str = "Timestep",
     show: bool = False,
     save_prefix: str = "cmp_",
+    directory = PLOTS,
 ):
     a = _as_1d(values_a)
     b = _as_1d(values_b)
@@ -125,7 +127,7 @@ def _plot_1d_overlay(
 
     ax.legend(loc="best", frameon=False)
     _finalize_axis(ax, xlabel=xlabel, ylabel=ylabel, title=name)
-    _save_and_maybe_show(fig, f"{save_prefix}{name}", show)
+    _save_and_maybe_show(fig, f"{save_prefix}{name}", show, directory=directory)
 
 
 def _plot_2d_time_series(
@@ -135,6 +137,7 @@ def _plot_2d_time_series(
     labels=("x", "y"),
     ylabel: str = "",
     show: bool = False,
+    directory = PLOTS,
 ):
     if arr is None:
         return
@@ -149,7 +152,7 @@ def _plot_2d_time_series(
     ax.plot(x, arr[:, 1], label=labels[1])
     ax.legend(loc="best", frameon=False)
     _finalize_axis(ax, xlabel="Timestep", ylabel=ylabel, title=name)
-    _save_and_maybe_show(fig, name, show)
+    _save_and_maybe_show(fig, name, show, directory=directory)
 
 
 def _plot_xy(
@@ -161,6 +164,7 @@ def _plot_xy(
     show: bool = False,
     marker: Optional[str] = None,
     label: Optional[str] = None,
+    directory = PLOTS,
 ):
     x = _as_1d(x)
     y = _as_1d(y)
@@ -191,7 +195,7 @@ def _plot_xy(
         ax.legend(loc="best", frameon=False)
 
     _finalize_axis(ax, xlabel=xlabel, ylabel=ylabel, title=name)
-    _save_and_maybe_show(fig, name, show)
+    _save_and_maybe_show(fig, name, show, directory=directory)
 
 
 # ====================== MAIN SUMMARY / PLOTTING FUNCTIONS ======================
@@ -273,16 +277,16 @@ def plot_solutions(
         return None
 
     # ===================== GENERIC OVERLAY =====================
-    def _plot_1d_overlay_multi(arrs, t_axis, name, ylabel):
+    def _plot_1d_overlay_multi(arrs, t_axis, name, ylabel, directory = PLOTS):
         fig, ax = plt.subplots()
         for arr, label in zip(arrs, labels):
             if arr is not None:
                 ax.plot(t_axis, arr, label=label)
         ax.legend(loc="best", frameon=False)
         _finalize_axis(ax, xlabel="Timestep", ylabel=ylabel, title=name)
-        _save_and_maybe_show(fig, f"cmp_{name}", show)
+        _save_and_maybe_show(fig, f"cmp_{name}", show, directory=directory)
 
-    def _plot_2d_overlay_multi(arrs, t_axis, name, labels_comp, ylabel):
+    def _plot_2d_overlay_multi(arrs, t_axis, name, labels_comp, ylabel, directory = PLOTS):
         fig, ax = plt.subplots()
         for arr, label in zip(arrs, labels):
             if arr is not None:
@@ -290,27 +294,27 @@ def plot_solutions(
                 ax.plot(t_axis, arr[:, 1], linestyle="--", label=f"{label} {labels_comp[1]}")
         ax.legend(loc="best", frameon=False)
         _finalize_axis(ax, xlabel="Timestep", ylabel=ylabel, title=name)
-        _save_and_maybe_show(fig, f"cmp_{name}", show)
+        _save_and_maybe_show(fig, f"cmp_{name}", show, directory=directory)
 
     # ===================== 1D SIGNALS =====================
     def collect(attr, n):
         return [slice_1d(getattr(sol, attr, None), n) for sol in solutions]
 
-    _plot_1d_overlay_multi(collect("instant_sail", T + 1), t_plus_1, "instant_sail", "instant_sail [-]")
-    _plot_1d_overlay_multi(collect("port_idx", T + 1), t_plus_1, "port_idx", "Port index [-]")
-    _plot_1d_overlay_multi(collect("interval_sail_fraction", T), t, "interval_sail_fraction", "Sail fraction [-]")
-    _plot_1d_overlay_multi(collect("speed_rel_water_mag", T), t, "speed_rel_water_mag", "Speed rel. water [m/s]")
-    _plot_1d_overlay_multi(collect("prop_power", T), t, "prop_power", "Propulsion power [MW]")
-    _plot_1d_overlay_multi(collect("wave_resistance", T), t, "wave_resistance", "Wave resistance [MN]")
-    _plot_1d_overlay_multi(collect("wind_resistance", T), t, "wind_resistance", "Wind resistance [MN]")
-    _plot_1d_overlay_multi(collect("current_resistance", T), t, "current_resistance", "Current resistance [MN]")
-    _plot_1d_overlay_multi(collect("total_resistance", T), t, "total_resistance", "Total resistance [MN]")
-    _plot_1d_overlay_multi([total_gen_cost(sol) for sol in solutions], t, "gen_costs_total", "Generation cost [currency]")
-    _plot_1d_overlay_multi(collect("solar_power", T), t, "solar_power", "Solar power [MW]")
-    _plot_1d_overlay_multi(collect("shore_power", T), t, "shore_power", "Shore power [MW]")
-    _plot_1d_overlay_multi(collect("battery_charge", T), t, "battery_charge", "Battery charge power [MW]")
-    _plot_1d_overlay_multi(collect("battery_discharge", T), t, "battery_discharge", "Battery discharge power [MW]")
-    _plot_1d_overlay_multi(collect("SOC", T + 1), t_plus_1, "SOC", "State of charge [-]")
+    _plot_1d_overlay_multi(collect("instant_sail", T + 1), t_plus_1, "instant_sail", "instant_sail [-]", directory = plot_dir)
+    _plot_1d_overlay_multi(collect("port_idx", T + 1), t_plus_1, "port_idx", "Port index [-]", directory = plot_dir)
+    _plot_1d_overlay_multi(collect("interval_sail_fraction", T), t, "interval_sail_fraction", "Sail fraction [-]", directory = plot_dir)
+    _plot_1d_overlay_multi(collect("speed_rel_water_mag", T), t, "speed_rel_water_mag", "Speed rel. water [m/s]", directory = plot_dir)
+    _plot_1d_overlay_multi(collect("prop_power", T), t, "prop_power", "Propulsion power [MW]", directory = plot_dir)
+    _plot_1d_overlay_multi(collect("wave_resistance", T), t, "wave_resistance", "Wave resistance [MN]", directory = plot_dir)
+    _plot_1d_overlay_multi(collect("wind_resistance", T), t, "wind_resistance", "Wind resistance [MN]", directory = plot_dir)
+    _plot_1d_overlay_multi(collect("current_resistance", T), t, "current_resistance", "Current resistance [MN]", directory = plot_dir)
+    _plot_1d_overlay_multi(collect("total_resistance", T), t, "total_resistance", "Total resistance [MN]", directory = plot_dir)
+    _plot_1d_overlay_multi([total_gen_cost(sol) for sol in solutions], t, "gen_costs_total", "Generation cost [currency]", directory = plot_dir)
+    _plot_1d_overlay_multi(collect("solar_power", T), t, "solar_power", "Solar power [MW]", directory = plot_dir)
+    _plot_1d_overlay_multi(collect("shore_power", T), t, "shore_power", "Shore power [MW]", directory = plot_dir)
+    _plot_1d_overlay_multi(collect("battery_charge", T), t, "battery_charge", "Battery charge power [MW]", directory = plot_dir)
+    _plot_1d_overlay_multi(collect("battery_discharge", T), t, "battery_discharge", "Battery discharge power [MW]", directory = plot_dir)
+    _plot_1d_overlay_multi(collect("SOC", T + 1), t_plus_1, "SOC", "State of charge [-]", directory = plot_dir)
 
     # ===================== TRAJECTORY =====================
     positions = [slice_2d(getattr(sol, "ship_pos", None), T + 1) for sol in solutions]
@@ -323,7 +327,7 @@ def plot_solutions(
         ax.set_aspect("equal", adjustable="box")
         ax.legend(loc="best", frameon=False)
         _finalize_axis(ax, xlabel="x position [km]", ylabel="y position [km]", title="Ship trajectory")
-        _save_and_maybe_show(fig, "cmp_ship_pos_xy", show)
+        _save_and_maybe_show(fig, "cmp_ship_pos_xy", show, directory = plot_dir)
     else:
         print("[WARN] ship_pos has unexpected shape in all solutions; skipping XY plot.")
 
@@ -350,7 +354,7 @@ def plot_solutions(
     if any_gp:
         ax.legend(loc="best", frameon=False, ncols=2)
         _finalize_axis(ax, xlabel="Timestep", ylabel="Power [MW]", title="generation_power")
-        _save_and_maybe_show(fig, "cmp_generation_power", show)
+        _save_and_maybe_show(fig, "cmp_generation_power", show, directory = plot_dir)
     else:
         print("[WARN] generation_power missing or invalid in all solutions.")
 
