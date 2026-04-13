@@ -5,8 +5,8 @@ from lib.optimizers import Solution
 def compute_non_convex_cost_all_timesteps(runner, eps=1e-9, debug=False):
     """
     Strategy-agnostic evaluator:
-    - Works for MICP (fixed dt = itinerary.timestep)
-    - Works for Greedy (variable dt computed from segment length and ship_speed)
+    - Works for Optimizers (fixed dt = itinerary.timestep)
+    - Works for Naive (variable dt computed from segment length and ship_speed)
     - Weather is sampled at the correct (possibly fractional) global time via interpolation.
     """
     sol = runner.sol
@@ -20,7 +20,6 @@ def compute_non_convex_cost_all_timesteps(runner, eps=1e-9, debug=False):
     wave_model = runner.wave_model
     propulsion_model = runner.propulsion_model
     generator_models = runner.generator_models
-
     base_dt_h = float(itinerary.timestep)
 
     # global start index for weather
