@@ -87,9 +87,11 @@ def compute_non_convex_cost_all_timesteps(runner, eps=1e-9, debug=False):
     mask_sail = sol.instant_sail[:-1].astype(bool)
 
     speed_mag_arr = np.linalg.norm(np.asarray(sol.ship_speed, dtype=float), axis=1)
-    acc = np.zeros(T)
-    acc[:-1] = np.diff(speed_mag_arr) / (dt_h[:-1]*3600)
-    acc[-1] = 0.0
+    speed_before_opt = float(runner.states.current_speed)
+
+    acc = np.zeros(T, dtype=float)
+    acc[0] = (speed_mag_arr[0] - speed_before_opt) / (dt_h[0] * 3600.0)
+    acc[1:] = (speed_mag_arr[1:] - speed_mag_arr[:-1]) / (dt_h[1:] * 3600.0)
     acc_force_arr = acc * ship.info.weight / 1_000_000
 
     for t in range(T):
@@ -100,7 +102,6 @@ def compute_non_convex_cost_all_timesteps(runner, eps=1e-9, debug=False):
             z = int(np.argmax(sol.zone[t, :]))
             z_plus_1 = np.argmax(sol.zone[t+1, :])
 
-            
             # wind at time
             wind_x = float(_interp_time(weather.wind_x, z, idx_float))
             wind_y = float(_interp_time(weather.wind_y, z, idx_float))
@@ -206,6 +207,7 @@ def compute_non_convex_cost_all_timesteps(runner, eps=1e-9, debug=False):
             wave_resistance         = wave_resistance,
             wind_resistance         = wind_resistance,
             current_resistance      = current_resistance,
+            acc_force               = acc_force_arr,
             total_resistance        = total_resistance,
 
             generation_power        = gen_power_all,

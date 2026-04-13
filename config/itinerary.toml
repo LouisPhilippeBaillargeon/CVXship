@@ -4,6 +4,7 @@
 # soc_f              : Desired final state of charge (MWh)
 # timestep           : Duration of one timestep (h). 
 # fuel_price         : ($/kg)
+# init_speed         : (m/s)
 #Note : if there is not an integer amount of timesteps in the total duration of your trip (eg : trip duration = 4h37, timestep = 1h), then trip will be constrained to be done in 4h.
 # ============================
 [params]
@@ -11,6 +12,7 @@ soc_i               = 4
 soc_f               = 4
 timestep            = 0.25
 fuel_price          = 1.396
+init_speed          = 0
 
 # ============================
 # List of transit cities considered in the problem

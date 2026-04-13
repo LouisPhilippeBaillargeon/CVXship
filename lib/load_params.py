@@ -257,6 +257,7 @@ class Itinerary:
     soc_i              : float
     soc_f              : float
     timestep           : float
+    init_speed         : float
     nb_timesteps       : int
     target_x_pos       : float
     target_y_pos       : float
@@ -270,6 +271,7 @@ def load_itinerary(map) -> Itinerary:
     soc_i=params["soc_i"]
     soc_f=params["soc_f"]
     timestep = params["timestep"]
+    init_speed = params["init_speed"]
     fuel_price = params["fuel_price"]
 
     transit_list = []
@@ -301,6 +303,7 @@ def load_itinerary(map) -> Itinerary:
         soc_i=soc_i,
         soc_f=soc_f,
         timestep = timestep,
+        init_speed = init_speed,
         nb_timesteps = nb_timesteps,
         target_x_pos = target_x_pos,
         target_y_pos = target_y_pos,
@@ -314,8 +317,7 @@ class States:
     timesteps_completed: int
     current_x_pos      : float
     current_y_pos      : float
-    current_x_speed    : float
-    current_y_speed    : float
+    current_speed      : float
     soc                : float
     zone               : float
     current_heading    : float
@@ -327,8 +329,7 @@ def load_states(map, itinerary) -> States:
         timesteps_completed = 0,
         current_x_pos = current_x_pos,
         current_y_pos = current_y_pos,
-        current_x_speed = 0,
-        current_y_speed = 0,
+        current_speed = itinerary.init_speed,
         soc = itinerary.soc_i,
         zone = zone,
         current_heading = 0,
