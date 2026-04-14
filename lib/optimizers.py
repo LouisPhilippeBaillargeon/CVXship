@@ -123,13 +123,13 @@ class GlobalOptimizer:
                 assert p >= 0        
                 constraints += [ship_pos[t,0] == port_x[p]]
                 constraints += [ship_pos[t,1] == port_y[p]]
-                print("ship is in port", p, " at instant ", t)
+                if debug:
+                    print("ship is in port", p, " at instant ", t)
         
         #======================================================ZONES===================================================
         zone = cp.Variable((T_future + 1, self.map.nb_zones), boolean=True)
 
         big_M = _compute_tight_big_M_zone(self.map, self.map.zone_ineq)
-        print("big_M",big_M)
         
         #position must be in the chosen zone
         for t in range(T_future+1):
@@ -164,9 +164,6 @@ class GlobalOptimizer:
 
         big_M_to = _compute_tight_big_M_transition(self.map, self.map.trans_ineq_to)
         big_M_from = _compute_tight_big_M_transition(self.map, self.map.trans_ineq_from)
-
-        print("big_M_to",big_M_to)
-        print("big_M_from",big_M_from)
         
         #During transitions certain inequalities from both zones must be respected so that the full line is in one of the convex zones at all times
         for t in range(T_future):
@@ -176,9 +173,13 @@ class GlobalOptimizer:
                 for iz in range(self.map.nb_zones):
                     if (self.map.zone_adj[z,iz]==1):
                         if(np.sum(trans_to[:,:,z,iz])):
+                            if(big_M_to[z, iz]==0):
+                                print("Error: tight big-M thougth transition from ", z, "to ", iz, "was impossible, but it is." )
                             constraints += [trans_to[0,0,z,iz]*ship_pos[t,1] + trans_to[0,1,z,iz]*ship_pos[t,0] + trans_to[0,2,z,iz]>=big_M_to[z, iz]*(2-zone[t,z]-zone[t+1,iz])]
                             constraints += [trans_to[1,0,z,iz]*ship_pos[t,1] + trans_to[1,1,z,iz]*ship_pos[t,0] + trans_to[1,2,z,iz]>=big_M_to[z, iz]*(2-zone[t,z]-zone[t+1,iz])]
                         if(np.sum(trans_from[:,:,z,iz])):
+                            if(big_M_from[iz, z]==0):
+                                print("Error: tight big-M thougth transition from ", z, "to ", iz, "was impossible, but it is." )
                             constraints += [trans_from[0,0,z,iz]*ship_pos[t+1,1] + trans_from[0,1,z,iz]*ship_pos[t+1,0] + trans_from[0,2,z,iz]>=big_M_from[z, iz]*(2-zone[t,z]-zone[t+1,iz])]
                             constraints += [trans_from[1,0,z,iz]*ship_pos[t+1,1] + trans_from[1,1,z,iz]*ship_pos[t+1,0] + trans_from[1,2,z,iz]>=big_M_from[z, iz]*(2-zone[t,z]-zone[t+1,iz])]
 
@@ -283,10 +284,11 @@ class GlobalOptimizer:
         constraints += [normalized_rel_speed == speed_rel_water_mag/self.ship.info.max_speed]
         constraints += [normalized_speed == speed_mag/self.ship.info.max_speed]
 
-        #Get CD calm water coefficient based on ref speed
-        print("self.ref_speed", self.ref_speed)
+        #Get CT calm water coefficient based on ref speed
+        if debug:
+            print("self.ref_speed", self.ref_speed)
         Fr = self.ref_speed/np.sqrt(self.ship.info.g*self.ship.hull.LPP)
-        CD = np.interp(
+        CT = np.interp(
             Fr,
             self.ship.hull.CT_water_breakpoints,
             self.ship.hull.CT_water_curve
@@ -314,7 +316,7 @@ class GlobalOptimizer:
                                     wave_model_future[z,t,8]*speed_rel_water[t,1]/self.ship.info.max_speed + wave_model_future[z,t,9]*cp.power(speed_rel_water[t,1]/self.ship.info.max_speed,2) + 
                                     wave_model_future[z,t,10]*cp.power(speed_rel_water[t,1]/self.ship.info.max_speed,4) - (wave_max_res_future[z,t]+1)*(1 - zone[t, z])
                     ]
-                constraints += [current_resistance[t] >= 0.5*CD*cp.power(speed_rel_water_mag[t],2)*self.ship.hull.total_wet_area*self.ship.info.rho_water/1000000]
+                constraints += [current_resistance[t] >= 0.5*CT*cp.power(speed_rel_water_mag[t],2)*self.ship.hull.total_wet_area*self.ship.info.rho_water/1000000]
                 
             else: # if at a port
                 constraints += [wave_resistance[t] == 0]
@@ -611,12 +613,6 @@ class Fixed_Path_Optimizer:
         wind_y_seg = self.weather.wind_y[:,self.states.timesteps_completed : self.states.timesteps_completed + T_future]
         irr_seg = self.weather.irradiance[:, self.states.timesteps_completed : self.states.timesteps_completed + T_future]  # shape [nb_zones, T_future]
 
-        print("current_x_seg", np.min(current_x_seg), np.max(current_x_seg))
-        print("current_y_seg", np.min(current_y_seg), np.max(current_y_seg))
-        print("wind_x_seg", np.min(wind_x_seg), np.max(wind_x_seg))
-        print("wind_y_seg", np.min(wind_y_seg), np.max(wind_y_seg))
-        print("irr_seg", np.min(irr_seg), np.max(irr_seg))
-
         current_x_seg = self.weather.current_x[path_zone_ids, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
         current_y_seg = self.weather.current_y[path_zone_ids, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
         wind_x_seg    = self.weather.wind_x[path_zone_ids, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
@@ -664,10 +660,11 @@ class Fixed_Path_Optimizer:
         constraints += [normalized_rel_speed == speed_rel_water_mag/self.ship.info.max_speed]
         constraints += [normalized_speed == speed_mag/self.ship.info.max_speed]
 
-        #Get CD calm water coefficient based on ref speed
-        print("self.ref_speed", self.ref_speed)
+        #Get CT calm water coefficient based on ref speed
+        if debug:
+            print("self.ref_speed", self.ref_speed)
         Fr = self.ref_speed/np.sqrt(self.ship.info.g*self.ship.hull.LPP)
-        CD = np.interp(
+        CT = np.interp(
             Fr,
             self.ship.hull.CT_water_breakpoints,
             self.ship.hull.CT_water_curve
@@ -702,7 +699,7 @@ class Fixed_Path_Optimizer:
                                     wave_model_future[z,t,10]*cp.power(speed_rel_water[t,1]/self.ship.info.max_speed,4) - (wave_max_res_future[z,t]+1)*(1 - seg[t, z])
                     ]
                     min_val = min(wave_model_future[z,t,2],wave_model_future[z,t,3],wave_model_future[z,t,4],wave_model_future[z,t,6],wave_model_future[z,t,7],wave_model_future[z,t,9],wave_model_future[z,t,10])
-                constraints += [current_resistance[t] >= 0.5*CD*cp.power(speed_rel_water_mag[t],2)*self.ship.hull.total_wet_area*self.ship.info.rho_water/1000000]
+                constraints += [current_resistance[t] >= 0.5*CT*cp.power(speed_rel_water_mag[t],2)*self.ship.hull.total_wet_area*self.ship.info.rho_water/1000000]
                 
             else: # if at a port
                 constraints += [wave_resistance[t] == 0]
@@ -822,9 +819,6 @@ class Fixed_Path_Optimizer:
         problem.solve(solver="MOSEK", verbose=debug,)
         print("AFTER SOLVE: status =", problem.status, "value =", problem.value)
 
-        print("T_future : ",T_future)
-        print("weather : ",self.weather.current_x.shape[1])
-
         # ============================== RECONSTRUCT 2D POSITIONS / SPEEDS ===============================
         d_opt = np.asarray(d.value, dtype=float).reshape(-1)   # shape (T_future+1,)
 
@@ -873,8 +867,6 @@ class Fixed_Path_Optimizer:
                 gen_on_out = np.array(gen_on.value)
             else:
                 gen_on_out = np.ones((len(self.generator_models),T_future))
-
-            print("prop_power",np.array(prop_power.value))
 
             self.sol = Solution(
                 estimated_cost           = problem.value,
@@ -1031,11 +1023,8 @@ class NaiveController:
         ship_pos_out = np.array(ship_pos.value, dtype=float)  # km, [T_future+1,2]
         distance = np.linalg.norm(ship_pos_out[1:] - ship_pos_out[:-1], axis=1)
         total_distance = np.sum(distance)
-        print("total_distance : ", total_distance)
         time = sum(instant_sail)*float(self.itinerary.timestep)
-        print("time : ", time)
         speed = (np.sum(total_distance)/time)/3.6 #kmh to ms
-        print("speed : ",speed)
 
         speed_vect = np.diff(ship_pos_out, axis=0)                 # (T,2)
         speed_vect_mag = np.linalg.norm(speed_vect, axis=1)        # (T,)
@@ -1046,10 +1035,8 @@ class NaiveController:
         unit_dir[nonzero] = speed_vect[nonzero] / speed_vect_mag[nonzero, None]
 
         ship_speed_out = unit_dir * speed                          # (T,2)
-        print("ship_speed_out:", ship_speed_out)
 
         dt_h = distance/speed
-        print(dt_h)
 
 
         # ---------------- Fill other fields required by Solution ----------------
@@ -1078,7 +1065,6 @@ class NaiveController:
 
 
         at_port = interval_sail_fraction < 0.01
-        print("at_port", at_port)
         irr_future = self.weather.irradiance[:, self.states.timesteps_completed : self.states.timesteps_completed + T_future]  # shape [nb_zones, T_future]
 
         adjusted_leak = self.ship.battery.leak ** self.itinerary.timestep
@@ -1106,10 +1092,6 @@ class NaiveController:
 
         cx = self.weather.current_x[:, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
         cy = self.weather.current_y[:, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
-
-        print(battery_charge)
-        print(battery_discharge)
-        print(SOC)
 
 
         speed_rel_water = np.zeros((T_future, 2), dtype=float)

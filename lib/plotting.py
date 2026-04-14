@@ -70,90 +70,10 @@ def _save_and_maybe_show(fig, name: str, show: bool = False, directory=PLOTS):
     else:
         plt.close(fig)
 
-
 def _as_1d(arr):
     if arr is None:
         return None
     return np.asarray(arr).ravel()
-
-
-def _plot_1d(
-    values,
-    x,
-    name: str,
-    ylabel: str,
-    xlabel: str = "Timestep",
-    show: bool = False,
-    directory=PLOTS,
-):
-    values = _as_1d(values)
-    if values is None:
-        return
-
-    fig, ax = plt.subplots()
-    ax.plot(x, values)
-    _finalize_axis(ax, xlabel=xlabel, ylabel=ylabel, title=name)
-    _save_and_maybe_show(fig, name, show, directory=directory)
-
-
-def _plot_1d_overlay(
-    values_a,
-    values_b,
-    x,
-    name: str,
-    ylabel: str,
-    label_a: str,
-    label_b: str,
-    xlabel: str = "Timestep",
-    show: bool = False,
-    save_prefix: str = "cmp_",
-    directory = PLOTS,
-):
-    a = _as_1d(values_a)
-    b = _as_1d(values_b)
-
-    if a is None and b is None:
-        return
-
-    fig, ax = plt.subplots()
-    if a is not None:
-        ax.plot(x, a, label=label_a)
-    else:
-        print(f"[WARN] {name}: {label_a} missing/incompatible shape; plotting only {label_b}.")
-    if b is not None:
-        ax.plot(x, b, label=label_b)
-    else:
-        print(f"[WARN] {name}: {label_b} missing/incompatible shape; plotting only {label_a}.")
-
-    ax.legend(loc="best", frameon=False)
-    _finalize_axis(ax, xlabel=xlabel, ylabel=ylabel, title=name)
-    _save_and_maybe_show(fig, f"{save_prefix}{name}", show, directory=directory)
-
-
-def _plot_2d_time_series(
-    arr,
-    x,
-    name: str,
-    labels=("x", "y"),
-    ylabel: str = "",
-    show: bool = False,
-    directory = PLOTS,
-):
-    if arr is None:
-        return
-
-    arr = np.asarray(arr)
-    if arr.ndim != 2 or arr.shape[1] != 2 or arr.shape[0] != len(x):
-        print(f"[WARN] {name}: expected shape ({len(x)}, 2), got {arr.shape}")
-        return
-
-    fig, ax = plt.subplots()
-    ax.plot(x, arr[:, 0], label=labels[0])
-    ax.plot(x, arr[:, 1], label=labels[1])
-    ax.legend(loc="best", frameon=False)
-    _finalize_axis(ax, xlabel="Timestep", ylabel=ylabel, title=name)
-    _save_and_maybe_show(fig, name, show, directory=directory)
-
 
 def _plot_xy(
     x,
@@ -199,7 +119,6 @@ def _plot_xy(
 
 
 # ====================== MAIN SUMMARY / PLOTTING FUNCTIONS ======================
-
 def plot_solutions(
     solutions,
     labels=None,
@@ -427,11 +346,6 @@ def plot_zones_and_points(
     )
     in_zone = np.all(vals_all >= -eps_in, axis=1).astype(int)
 
-    print("in_zone[t, z] = 1 means inside zone z at timestep t")
-    for t in range(T):
-        zones_t = np.where(in_zone[t])[0].tolist()
-        print(f"t={t}: zones = {zones_t}")
-
     fig, ax = plt.subplots(figsize=(7.2, 6.0), dpi=140)
     cmap = plt.get_cmap("tab20")
     any_poly = False
@@ -495,3 +409,24 @@ def plot_zones_and_points(
 
     _save_and_maybe_show(fig, name, show)
     return in_zone
+
+def _plot_series(y, title, ylabel, xlabel="Time (s)", x=None, cmd=None, cmd_label="Command"): 
+    y = np.asarray(y).ravel() 
+    if x is None: 
+        x = np.arange(y.size) 
+        xlabel = "Sample index" 
+
+    fig, ax = plt.subplots(figsize=(6.0, 3.2), dpi=150) 
+    ax.plot(x, y, linewidth=1.2, label="Sim") 
+
+    if cmd is not None: 
+        ax.plot( x, np.full_like(x, cmd, dtype=float), linewidth=1.2, linestyle="--", label=cmd_label, ) 
+
+    ax.set_title(title, fontsize=10) 
+    ax.set_xlabel(xlabel, fontsize=9) 
+    ax.set_ylabel(ylabel, fontsize=9) 
+    _ieee_axes(ax) 
+    if cmd is not None: 
+        ax.legend(frameon=False, fontsize=8, loc="best") 
+    fig.tight_layout() 
+    plt.show()

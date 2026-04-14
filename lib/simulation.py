@@ -5,9 +5,10 @@ from dataclasses import asdict
 import matlab
 from pathlib import Path
 import time
+import matplotlib as plt
 
 from lib.paths import SIMULATION, SHIP_MAT, SHIP_ABC_MAT
-from lib.plotting import _plot_series, _plot_xy
+from lib.plotting import _plot_series, _plot_xy, _ieee_axes
 
 
 @dataclass
@@ -50,7 +51,7 @@ def to_matlab_struct(py_obj):
 
 eps = 0.001
 
-def run_simulink_model(optimizer, n_estimated, debug = False):
+def run_simulink_model(optimizer, n_estimated, pitch, debug = False):
     print("Starting MATLAB engine...")
     eng = matlab.engine.start_matlab()
     eng.addpath(str(SIMULATION), nargout=0)
@@ -72,7 +73,7 @@ def run_simulink_model(optimizer, n_estimated, debug = False):
     eng.workspace['KTp'] = KTp_mat
     prop = optimizer.ship.propulsion
     eng.workspace['prop_D']         = float(prop.D)
-    eng.workspace['prop_pitch']     = float(prop.pitch)
+    eng.workspace['prop_pitch']     = float(pitch)
     eng.workspace['prop_AE_AO']     = float(prop.AE_AO)
     eng.workspace['prop_nb_blades'] = float(prop.nb_blades)
     eng.workspace['max_n']          = float(prop.max_n)
@@ -99,7 +100,7 @@ def run_simulink_model(optimizer, n_estimated, debug = False):
     print(optimizer.states.current_y_pos*1000)
 
     # Commands
-    eng.workspace['init_speed']             = matlab.double([float(optimizer.sol.speed_rel_water_mag[0])]) #verify the order. maybe I need the index before that. 
+    eng.workspace['init_speed']             = matlab.double([float(optimizer.itinerary.init_speed)])
     eng.workspace['desired_speed']          = float(optimizer.sol.speed_rel_water_mag[0])
     eng.workspace['battery_power']          = float(optimizer.sol.battery_discharge[0]-optimizer.sol.battery_charge[0])
     eng.workspace['n_estimated']            = matlab.double([float(n_estimated)])
@@ -139,7 +140,15 @@ def run_simulink_model(optimizer, n_estimated, debug = False):
     eng.workspace['Loa']                    = float(optimizer.ship.hull.L)
     eng.workspace['vessel_no']              = float(optimizer.ship.info.vessel_no)
     eng.workspace['rho_air']                = float(optimizer.ship.info.rho_air)
-    eng.workspace['rho_water']              = float(optimizer.ship.info.rho_water)
+
+    Fr = optimizer.sol.speed_rel_water_mag[0]/np.sqrt(optimizer.ship.info.g*optimizer.ship.hull.LPP)
+    CT = np.interp(
+            Fr,
+            optimizer.ship.hull.CT_water_breakpoints,
+            optimizer.ship.hull.CT_water_curve
+    )
+    CX = CT*optimizer.ship.hull.total_wet_area/optimizer.ship.hull.AF_water
+    eng.workspace['CX']                     = float(CX)
 
 
     # Generators
@@ -186,7 +195,7 @@ def run_simulink_model(optimizer, n_estimated, debug = False):
     ws_vars = [
         # Propulsion
         "KQp", "KTp", "prop_D", "prop_pitch", "prop_AE_AO", "prop_nb_blades", "max_n",
-        "wake_fraction", "nb_propellers", "rho_water",
+        "wake_fraction", "nb_propellers", "rho_water", 
 
         # Waypoints / init
         "ship_x", "ship_y", "init_pos_x", "init_pos_y",'init_heading',
@@ -206,7 +215,7 @@ def run_simulink_model(optimizer, n_estimated, debug = False):
 
         # Hull / air-water
         "wind_x", "wind_y", "AFw", "ALw", "sH", "sL", "Loa", "vessel_no",
-        "rho_air", "rho_water",
+        "rho_air", "CX",
 
         # Generators
         "gen_percent_power",
@@ -326,14 +335,12 @@ def run_simulink_model(optimizer, n_estimated, debug = False):
             # special overlays
             if k == "speed_mag":
                 x = t_s if np.asarray(v).ravel().size == t_s.size else None
-                _plot_series(v, "speed_mag", units[k], xlabel="Time (s)" if x is not None else "Sample index",
-                            x=x, cmd=cmd_speed, cmd_label="Optimizer command")
+                _plot_series(v, "speed_mag", units[k], xlabel="Time (s)" if x is not None else "Sample index", x=x, cmd=cmd_speed, cmd_label="Optimizer command")
                 continue
 
             if k == "prop_power":
                 x = t_s if np.asarray(v).ravel().size == t_s.size else None
-                _plot_series(v, "prop_power", units[k], xlabel="Time (s)" if x is not None else "Sample index",
-                            x=x, cmd=cmd_power, cmd_label="Optimizer command")
+                _plot_series(v, "prop_power", units[k], xlabel="Time (s)" if x is not None else "Sample index", x=x, cmd=cmd_power, cmd_label="Optimizer command")
                 continue
 
             # generic plots
@@ -349,9 +356,6 @@ def run_simulink_model(optimizer, n_estimated, debug = False):
 
 
     return optimizer, results
-
-
-
 
 
     

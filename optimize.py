@@ -7,8 +7,9 @@ from lib.models import PropulsionModel, WaveModel, WindModel, GeneratorModel, sa
 from lib.paths import WIND_MODEL, WAVE_MODEL, PROPULSION_MODEL, GENERATOR_MODEL
 from lib.plotting import plot_solutions, plot_zones_and_points
 from lib.optimizers import GlobalOptimizer, NaiveController, Fixed_Path_Optimizer, ShortestPath
-from lib.utils import point_in_zones, dx_dy_km, classify_timesteps
+from lib.utils import dx_dy_km, classify_timesteps
 from lib.evaluation import compute_non_convex_cost_all_timesteps
+from lib.simulation import run_simulink_model
 
 
 new_weather = False
@@ -112,6 +113,7 @@ if __name__ == "__main__":
 
     ref_speed = (path.sol.total_distance/sail_time)*1000/3600
 
+    '''
     optimizer = Fixed_Path_Optimizer(
         wave_model=wave_model,
         wind_model=wind_model,
@@ -139,12 +141,12 @@ if __name__ == "__main__":
 
     if ok:
         print("Optimization succeeded.")
-        n_all, fixed_path_sol, dt_h = compute_non_convex_cost_all_timesteps(optimizer, debug=False)
-        plot_solutions([optimizer.sol, fixed_path_sol],["Convex Fixed Path solution", "Non-convex Fixed Path solution"], show=True, subfolder="Fixed Path")
+        n_all, fixed_path_sol, dt_h, best_pitch = compute_non_convex_cost_all_timesteps(optimizer, debug=False)
+        plot_solutions([optimizer.sol, fixed_path_sol],["Convex Fixed Path solution", "Non-convex Fixed Path solution"], show=False, subfolder="Fixed Path")
     else:
         print("Optimization failed.")
 
-    
+    '''
     optimizer = GlobalOptimizer(
         wave_model          = wave_model,
         wind_model          = wind_model,
@@ -169,10 +171,10 @@ if __name__ == "__main__":
 
     optimizer.optimize(debug=False)
     plot_zones_and_points(optimizer.sol.ship_pos, optimizer.map.zone_ineq)
-    n_all, global_sol, dt_h = compute_non_convex_cost_all_timesteps(optimizer, debug=False)
-    plot_solutions([optimizer.sol, global_sol],["Convex Gloabal solution", "Non-convex Global solution"], show=True, subfolder="Global Path")
+    n_all, global_sol, dt_h, best_pitch = compute_non_convex_cost_all_timesteps(optimizer, debug=False)
+    plot_solutions([optimizer.sol, global_sol],["Convex Gloabal solution", "Non-convex Global solution"], show=False, subfolder="Global Path")
 
-  
+    '''
     naive = NaiveController(map, itinerary, states, weather, ship)
     naive.compute()
     plot_zones_and_points(naive.sol.ship_pos, naive.map.zone_ineq)
@@ -184,30 +186,23 @@ if __name__ == "__main__":
     naive.generator_models = generatorModels
 
 
-    n_all, naive_solution, dt_h = compute_non_convex_cost_all_timesteps(naive)
-    plot_solutions([fixed_path_sol, global_sol, naive_solution],["Fixed Path Optimizer", "Global Path Optimizer", "Naive Controller"], show = True, subfolder="All sol compared")
-
-
-    
-    
+    n_all, naive_solution, dt_h, best_pitch = compute_non_convex_cost_all_timesteps(naive)
+    plot_solutions([fixed_path_sol, global_sol, naive_solution],["Fixed Path Optimizer", "Global Path Optimizer", "Naive Controller"], show = False, subfolder="All sol compared")
     '''
+
+    
     # Optimize and Simulate
     total_cost_simul = 0
     total_cost_conv  = 0
     total_cost_nonconv = 0
     while(optimizer.states.timesteps_completed<optimizer.itinerary.nb_timesteps):
-        if(optimizer.optimize(debug = True)):
-            total_cost_conv += optimizer.sol.estimated_cost
+        if(optimizer.optimize()):
             print("Optimizer ran successfully for timsetep", optimizer.states.timesteps_completed)
-            plot_zones_and_points(optimizer.sol.ship_pos, optimizer.map.zone_ineq)
-            plot_solutions([optimizer.sol], show = True)
-            n_all, total_cost_all, gen_power_all, gen_costs_all = compute_non_convex_cost_all_timesteps(optimizer)
-            print("non-convex cost : ", total_cost_all)
-            optimizer, results = run_simulink_model(optimizer, n_all[0], debug = True)
+            n_all, naive_solution, dt_h, best_pitch = compute_non_convex_cost_all_timesteps(optimizer)
+            optimizer, results = run_simulink_model(optimizer, n_all[0], best_pitch[0], debug = True)
             total_cost_simul += results.estimated_cost
         else:
             break
-    '''
     
 
 

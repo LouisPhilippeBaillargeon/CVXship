@@ -2,6 +2,7 @@ import numpy as np
 
 from lib.optimizers import Solution
 
+
 def compute_non_convex_cost_all_timesteps(runner, eps=1e-9, debug=False):
     """
     Strategy-agnostic evaluator:
@@ -73,6 +74,7 @@ def compute_non_convex_cost_all_timesteps(runner, eps=1e-9, debug=False):
 
     # outputs
     n_all = np.zeros(T)
+    best_pitch = np.zeros(T)
     total_cost_all = np.zeros(T)
     gen_power_all = np.zeros((nb_gen, T))
     gen_costs_all = np.zeros((nb_gen, T))
@@ -146,7 +148,7 @@ def compute_non_convex_cost_all_timesteps(runner, eps=1e-9, debug=False):
             total_resistance[t] = max(0.0, wind_resistance[t] + wave_resistance[t] + current_resistance[t]+acc_force_arr[t])
 
             ua = (1.0 - ship.propulsion.wake_fraction) * Vs
-            prop_power[t], n, feasible, best_pitch = propulsion_model.compute_power_from_ua_res(
+            prop_power[t], n, feasible, best_pitch[t] = propulsion_model.compute_power_from_ua_res(
                 ua, total_resistance[t], eval_infeasible=True, debug=debug
             )
             n_all[t] = float(n)
@@ -221,4 +223,4 @@ def compute_non_convex_cost_all_timesteps(runner, eps=1e-9, debug=False):
             SOC                     = sol.SOC,
             )
 
-    return n_all, non_conv_sol, dt_h
+    return n_all, non_conv_sol, dt_h, best_pitch
