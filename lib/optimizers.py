@@ -72,10 +72,10 @@ class GlobalOptimizer:
     def optimize(self,
         unit_commitment = False,
         debug = False,
-        max_transitions = True, #if true the problem can only make up to nb_zone transitions. Makes computation faster.
-        ordered_zones = True, #if true, the ship can only go from zone z+1 to zone z.
+        max_transitions = False, #if true the problem can only make up to nb_zone transitions. Makes computation faster.
+        ordered_zones = False, #if true, the ship can only go from zone z+1 to zone z.
         warm_start = False,
-        min_timestep = True,
+        min_timestep = False,
     ):
         
         constraints = []
@@ -244,7 +244,7 @@ class GlobalOptimizer:
         constraints += [ship_speed == (cp.diff(ship_pos,axis=0) / self.itinerary.timestep)*1000/3600] #m/s from km/h
         constraints += [speed_mag >= cp.norm(ship_speed,axis=1)]
         
-        constraints += [speed_mag<=self.ship.info.max_speed]
+        #constraints += [speed_mag<=self.ship.info.max_speed]
 
         #=================================================ACCELERATION=================================================
         acc = cp.Variable(T_future)
@@ -1015,10 +1015,15 @@ class NaiveController:
         constraints += [dist >= cp.norm(delta, axis=1)]
         objective = cp.Minimize(cp.sum(dist))
 
+        import mosek
         problem = cp.Problem(objective, constraints)
         problem.solve(
-            solver="MOSEK",
+            solver=cp.MOSEK,
             verbose=debug,
+            mosek_params={
+                mosek.iparam.num_threads: 1,
+                mosek.iparam.presolve_use: mosek.presolvemode.off,
+            },
         )
         print("AFTER SOLVE: status =", problem.status, "value =", problem.value)
 

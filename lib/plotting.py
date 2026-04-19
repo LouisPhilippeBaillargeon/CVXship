@@ -359,6 +359,45 @@ def plot_solutions(
     else:
         print("[WARN] generation_power missing or invalid in all solutions.")
 
+from typing import List, Any
+def load_solutions_from_pkl(
+    filenames: List[str],
+    subfolder: str | None = None,
+) -> List[Any]:
+    """
+    Load a list of solution objects from pickle files.
+
+    Parameters
+    ----------
+    filenames : list of str
+        List of .pkl filenames (not full paths).
+    subfolder : str | None
+        Optional subfolder inside PLOTS where files are stored.
+
+    Returns
+    -------
+    solutions : list
+        List of loaded solution objects.
+    """
+
+    # Resolve directory (same logic as in plot_solutions)
+    base_dir = os.path.join(PLOTS, subfolder) if subfolder else PLOTS
+
+    solutions = []
+
+    for fname in filenames:
+        fpath = os.path.join(base_dir, fname)
+
+        if not os.path.exists(fpath):
+            raise FileNotFoundError(f"File not found: {fpath}")
+
+        with open(fpath, "rb") as f:
+            sol = pickle.load(f)
+
+        solutions.append(sol)
+
+    print(f"Loaded {len(solutions)} solution(s) from: {base_dir}")
+    return solutions
 
 def plot_weather_snapshot(map, weather, variable="current_x", t_index=0, show: bool = False):
     """

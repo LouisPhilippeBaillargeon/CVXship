@@ -9,7 +9,7 @@
 # vessel_no     : Only for MSS simulation, vessel type map in MSS doc
 # ============================
 [info]
-max_speed       = 12
+max_speed       = 14
 weight          = 24609620
 rho_water       = 1025
 displacement    = 24009.38537
@@ -87,7 +87,7 @@ CT_water_curve = [
 # nb_propellers : Propellers per ship
 # max_n         : Maximum rotational speed (turns/sec)
 # min_pow       : Minimum propulsion power (MW)
-# max_pow       : Maximum propulsion power (MW)
+# max_pow       : Maximum propulsion power per propeller (MW)
 # wake_fraction : Water relative speed is slower on the stern than on the bow, because ships accelerate water. This is the fraction of relative speed reduced due to this effect, assumed constant.
 # ============================
 [propulsion]
@@ -96,10 +96,10 @@ min_pitch       = 0
 max_pitch       = 10
 AE_AO           = 0.59
 nb_blades       = 6
-nb_propellers   = 1
+nb_propellers   = 2
 max_n           = 3.0
-min_pow         = 0.1
-max_pow         = 10.0
+min_pow         = 4.0
+max_pow         = 20.0
 wake_fraction   = 0.3
 
 # ============================

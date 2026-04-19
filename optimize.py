@@ -5,7 +5,7 @@ import time
 from lib.load_params import load_config
 from lib.models import PropulsionModel, WaveModel, WindModel, GeneratorModel, save_obj, load_obj
 from lib.paths import WIND_MODEL, WAVE_MODEL, PROPULSION_MODEL, GENERATOR_MODEL
-from lib.plotting import plot_solutions, plot_zones_and_points
+from lib.plotting import plot_solutions, plot_zones_and_points, load_solutions_from_pkl
 from lib.optimizers import GlobalOptimizer, NaiveController, Fixed_Path_Optimizer, ShortestPath
 from lib.utils import point_in_zones, dx_dy_km, classify_timesteps
 from lib.evaluation import compute_non_convex_cost_all_timesteps
@@ -13,6 +13,7 @@ from lib.evaluation import compute_non_convex_cost_all_timesteps
 
 new_weather = False
 new_ship = False
+see_previous_sol = False
 
 if __name__ == "__main__":
     
@@ -88,104 +89,115 @@ if __name__ == "__main__":
 
     x, y, _ = dx_dy_km(map, itinerary.transits[-1].lat, itinerary.transits[-1].lon)
     
-
-    path = ShortestPath(
-        map                 = map,
-        itinerary           = itinerary,
-        states              = states,
-        weather             = weather,
-        ship                = ship,)
-    path.states.timesteps_completed = 60
-    path.states.current_x_pos = 200
-    path.states.current_y_pos = 400
-    path.states.current_heading = -2
-    path.compute([x,y])
-    print(path.sol.zone_sequence)
-
-    if path.sol is None:
-        raise RuntimeError("ShortestPath did not produce a solution.")
-    
-    T_future = itinerary.nb_timesteps - states.timesteps_completed
-    instant_sail, port_idx, interval_sail_fraction = classify_timesteps(itinerary)
-    instant_sail = instant_sail[states.timesteps_completed:]
-    sail_time = np.sum(instant_sail)*itinerary.timestep
-
-    ref_speed = (path.sol.total_distance/sail_time)*1000/3600
-
-    optimizer = Fixed_Path_Optimizer(
-        wave_model=wave_model,
-        wind_model=wind_model,
-        propulsion_model=propulsion_model,
-        generator_models=generatorModels,
-        map=map,
-        itinerary=itinerary,
-        states=states,
-        weather=weather,
-        ship=ship,
-        waypoints=path.sol.waypoints,
-        path_zone_ids=path.sol.zone_sequence,
-        ref_speed = ref_speed
-    )
-
-    optimizer.states.timesteps_completed = 60
-    optimizer.states.current_x_pos = 200
-    optimizer.states.current_y_pos = 400
-    optimizer.states.current_heading = -2
-
-    ok = optimizer.optimize(
-        unit_commitment=False,
-        debug=False,
-    )
-
-    if ok:
-        print("Optimization succeeded.")
-        n_all, fixed_path_sol, dt_h = compute_non_convex_cost_all_timesteps(optimizer, debug=False)
-        plot_solutions([optimizer.sol, fixed_path_sol],["Convex Fixed Path solution", "Non-convex Fixed Path solution"], show=True, subfolder="Fixed Path")
+    if see_previous_sol:
+        files = [
+            "solution_00_Naive.pkl",
+            "solution_01_Fixed_Path.pkl",
+            "solution_02_Global.pkl",
+        ]
+        solutions = load_solutions_from_pkl(files, subfolder="my_experiment")
+        plot_solutions(solutions)
     else:
-        print("Optimization failed.")
+        path = ShortestPath(
+            map                 = map,
+            itinerary           = itinerary,
+            states              = states,
+            weather             = weather,
+            ship                = ship,)
+        path.states.timesteps_completed = 15
+        path.states.current_x_pos = 200
+        path.states.current_y_pos = 400
+        path.states.current_heading = -2
+        path.compute([x,y])
+        print(path.sol.zone_sequence)
 
-    
-    optimizer = GlobalOptimizer(
-        wave_model          = wave_model,
-        wind_model          = wind_model,
-        propulsion_model    = propulsion_model,
-        generator_models    = generatorModels,
-        map                 = map,
-        itinerary           = itinerary,
-        states              = states,
-        weather             = weather,
-        ship                = ship,
-        ref_speed           = ref_speed,)
+        if path.sol is None:
+            raise RuntimeError("ShortestPath did not produce a solution.")
+        
+        T_future = itinerary.nb_timesteps - states.timesteps_completed
+        instant_sail, port_idx, interval_sail_fraction = classify_timesteps(itinerary)
+        instant_sail = instant_sail[states.timesteps_completed:]
+        sail_time = np.sum(instant_sail)*itinerary.timestep
 
-    optimizer.states.timesteps_completed = 60
-    optimizer.states.current_x_pos = 200
-    optimizer.states.current_y_pos = 400
-    optimizer.states.current_heading = -2
+        ref_speed = (path.sol.total_distance/sail_time)*1000/3600
 
-    # Plot current position and destination
-    init_pos = np.array([optimizer.states.current_x_pos, optimizer.states.current_y_pos])
-    #optimizer.states.zone = point_in_zones(init_pos, optimizer.map.zone_ineq)
-    #x, y, _ = dx_dy_km(optimizer.map, optimizer.itinerary.transits[-1].lat, optimizer.itinerary.transits[-1].lon)
+ 
+        optimizer = Fixed_Path_Optimizer(
+            wave_model=wave_model,
+            wind_model=wind_model,
+            propulsion_model=propulsion_model,
+            generator_models=generatorModels,
+            map=map,
+            itinerary=itinerary,
+            states=states,
+            weather=weather,
+            ship=ship,
+            waypoints=path.sol.waypoints,
+            path_zone_ids=path.sol.zone_sequence,
+            ref_speed = ref_speed
+        )
 
-    optimizer.optimize(debug=False)
-    plot_zones_and_points(optimizer.sol.ship_pos, optimizer.map.zone_ineq)
-    n_all, global_sol, dt_h = compute_non_convex_cost_all_timesteps(optimizer, debug=False)
-    plot_solutions([optimizer.sol, global_sol],["Convex Gloabal solution", "Non-convex Global solution"], show=True, subfolder="Global Path")
+        optimizer.states.timesteps_completed = 15
+        optimizer.states.current_x_pos = 200
+        optimizer.states.current_y_pos = 400
+        optimizer.states.current_heading = -2
 
-  
-    naive = NaiveController(map, itinerary, states, weather, ship)
-    naive.compute()
-    plot_zones_and_points(naive.sol.ship_pos, naive.map.zone_ineq)
+        ok = optimizer.optimize(
+            unit_commitment=False,
+            debug=True,
+        )
 
-    # Make sure naive has these attached (same as optimizer)
-    naive.wind_model = wind_model
-    naive.wave_model = wave_model
-    naive.propulsion_model = propulsion_model
-    naive.generator_models = generatorModels
+        if ok:
+            print("Optimization succeeded.")
+            n_all, fixed_path_sol, dt_h = compute_non_convex_cost_all_timesteps(optimizer, debug=False)
+            plot_solutions([optimizer.sol, fixed_path_sol],["Convex Fixed Path solution", "Non-convex Fixed Path solution"], show=True, subfolder="Fixed Path")
+        else:
+            print("Optimization failed.")
+       
+        
+
+        
+        optimizer = GlobalOptimizer(
+            wave_model          = wave_model,
+            wind_model          = wind_model,
+            propulsion_model    = propulsion_model,
+            generator_models    = generatorModels,
+            map                 = map,
+            itinerary           = itinerary,
+            states              = states,
+            weather             = weather,
+            ship                = ship,
+            ref_speed           = ref_speed,)
+
+        optimizer.states.timesteps_completed = 15
+        optimizer.states.current_x_pos = 200
+        optimizer.states.current_y_pos = 400
+        optimizer.states.current_heading = -2
+
+        # Plot current position and destination
+        init_pos = np.array([optimizer.states.current_x_pos, optimizer.states.current_y_pos])
+        #optimizer.states.zone = point_in_zones(init_pos, optimizer.map.zone_ineq)
+        #x, y, _ = dx_dy_km(optimizer.map, optimizer.itinerary.transits[-1].lat, optimizer.itinerary.transits[-1].lon)
+
+        optimizer.optimize(debug=True)
+        plot_zones_and_points(optimizer.sol.ship_pos, optimizer.map.zone_ineq)
+        n_all, global_sol, dt_h = compute_non_convex_cost_all_timesteps(optimizer, debug=False)
+        plot_solutions([optimizer.sol, global_sol],["Convex Gloabal solution", "Non-convex Global solution"], show=True, subfolder="Global Path")
+
+        
+        naive = NaiveController(map, itinerary, states, weather, ship)
+        naive.compute(debug=False)
+        plot_zones_and_points(naive.sol.ship_pos, naive.map.zone_ineq)
+
+        # Make sure naive has these attached (same as optimizer)
+        naive.wind_model = wind_model
+        naive.wave_model = wave_model
+        naive.propulsion_model = propulsion_model
+        naive.generator_models = generatorModels
 
 
-    n_all, naive_solution, dt_h = compute_non_convex_cost_all_timesteps(naive)
-    plot_solutions([fixed_path_sol, global_sol, naive_solution],["Fixed Path Optimizer", "Global Path Optimizer", "Naive Controller"], show = True, subfolder="All sol compared")
+        n_all, naive_solution, dt_h = compute_non_convex_cost_all_timesteps(naive)
+    plot_solutions([fixed_path_sol, global_sol, naive_solution],["Fixed Path Optimizer","Global Optimizer", "Naive Controller"], show = True, subfolder="All sol compared")
 
 
     

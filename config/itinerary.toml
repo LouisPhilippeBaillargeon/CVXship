@@ -10,7 +10,7 @@
 [params]
 soc_i               = 4
 soc_f               = 4
-timestep            = 0.25
+timestep            = 1.0
 fuel_price          = 1.396
 init_speed          = 0
 
