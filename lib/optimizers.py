@@ -9,7 +9,7 @@ import faulthandler
 faulthandler.enable()
 
 from lib.load_params import Ship, Map, Itinerary, States
-from lib.models import WaveModel, WindModel, PropulsionModel, GeneratorModel
+from lib.models import BaseWaveModel, WaveModel1D, WaveModel2D, BaseWindModel, WindModel1D, WindModel2D, PropulsionModel, GeneratorModel
 from lib.weather import Weather
 from lib.utils import classify_timesteps, dx_dy_km, compute_port_zone_indices, point_in_zones, _compute_tight_big_M_zone, _compute_tight_big_M_transition, _compute_min_zone_timesteps, _compute_min_crossing_distance_per_zone
 from lib.paths import CORNERS, ZONES
@@ -53,8 +53,8 @@ class Solution:
 class GlobalOptimizer:
     # Left point indexing
     # Convex non-linear least-squares models
-    wave_model          : WaveModel
-    wind_model          : WindModel
+    wave_model          : WaveModel2D
+    wind_model          : WindModel2D
     propulsion_model    : PropulsionModel
     generator_models    : List[GeneratorModel]
 
@@ -490,8 +490,8 @@ class GlobalOptimizer:
 class Fixed_Path_Optimizer:
     # Left point indexing
     # Convex non-linear least-squares models
-    wave_model          : WaveModel
-    wind_model          : WindModel
+    wave_model          : WaveModel1D
+    wind_model          : WindModel1D
     propulsion_model    : PropulsionModel
     generator_models    : List[GeneratorModel]
 
@@ -688,20 +688,12 @@ class Fixed_Path_Optimizer:
                 for z in range(nb_path_zones):
                     constraints += [wind_resistance[t] >= wind_model_future[z,t,0] + wind_model_future[z,t,1]*normalized_speed[t] + 
                                     wind_model_future[z,t,2]*cp.square(normalized_speed[t]) + wind_model_future[z,t,3]*cp.power(normalized_speed[t],3) + 
-                                    wind_model_future[z,t,4]*cp.power(normalized_speed[t],4) + wind_model_future[z,t,5]*ship_speed[t,0]/self.ship.info.max_speed +
-                                    wind_model_future[z,t,6]*cp.power(ship_speed[t,0]/self.ship.info.max_speed,2) + wind_model_future[z,t,7]*cp.power(ship_speed[t,0]/self.ship.info.max_speed,4) +
-                                    wind_model_future[z,t,8]*ship_speed[t,1]/self.ship.info.max_speed + wind_model_future[z,t,9]*cp.power(ship_speed[t,1]/self.ship.info.max_speed,2) + 
-                                    wind_model_future[z,t,10]*cp.power(ship_speed[t,1]/self.ship.info.max_speed,4) - (wind_max_res_future[z,t]+1)*(1 - seg[t, z])
+                                    wind_model_future[z,t,4]*cp.power(normalized_speed[t],4) - (wind_max_res_future[z,t]+1)*(1 - seg[t, z])
                     ]
-                    min_val = min(wind_model_future[z,t,2],wind_model_future[z,t,3],wind_model_future[z,t,4],wind_model_future[z,t,6],wind_model_future[z,t,7],wind_model_future[z,t,9],wind_model_future[z,t,10])
                     constraints += [wave_resistance[t] >= wave_model_future[z,t,0] + wave_model_future[z,t,1]*normalized_rel_speed[t] + 
                                     wave_model_future[z,t,2]*cp.square(normalized_rel_speed[t]) + wave_model_future[z,t,3]*cp.power(normalized_rel_speed[t],3) + 
-                                    wave_model_future[z,t,4]*cp.power(normalized_rel_speed[t],4) + wave_model_future[z,t,5]*speed_rel_water[t,0]/self.ship.info.max_speed +
-                                    wave_model_future[z,t,6]*cp.power(speed_rel_water[t,0]/self.ship.info.max_speed,2) + wave_model_future[z,t,7]*cp.power(speed_rel_water[t,0]/self.ship.info.max_speed,4) +
-                                    wave_model_future[z,t,8]*speed_rel_water[t,1]/self.ship.info.max_speed + wave_model_future[z,t,9]*cp.power(speed_rel_water[t,1]/self.ship.info.max_speed,2) + 
-                                    wave_model_future[z,t,10]*cp.power(speed_rel_water[t,1]/self.ship.info.max_speed,4) - (wave_max_res_future[z,t]+1)*(1 - seg[t, z])
+                                    wave_model_future[z,t,4]*cp.power(normalized_rel_speed[t],4) - (wave_max_res_future[z,t]+1)*(1 - seg[t, z])
                     ]
-                    min_val = min(wave_model_future[z,t,2],wave_model_future[z,t,3],wave_model_future[z,t,4],wave_model_future[z,t,6],wave_model_future[z,t,7],wave_model_future[z,t,9],wave_model_future[z,t,10])
                 constraints += [current_resistance[t] >= 0.5*CD*cp.power(speed_rel_water_mag[t],2)*self.ship.hull.total_wet_area*self.ship.info.rho_water/1000000]
                 
             else: # if at a port
@@ -923,6 +915,8 @@ class NaiveController:
     ship      : Ship
 
     sol: Optional["Solution"] = field(default=None, init=False)
+    wave_model: Optional["BaseWaveModel"] = field(default=None, init=False)
+    wind_model: Optional["BaseWindModel"] = field(default=None, init=False)
 
     def compute(
         self,
@@ -1229,6 +1223,27 @@ class ShortestPath:
     ship: "Ship"
 
     sol: Optional[ShortestPathSolution] = field(default=None, init=False)
+
+    def compute_course_angles(self) -> np.ndarray:
+        """
+        Compute course angle (rad) for each segment of the path.
+
+        Returns:
+            angles: array of size (n_segments,)
+                    angle of each segment in radians (atan2(dy, dx))
+        """
+        if self.sol is None:
+            raise RuntimeError("Call compute() before computing course angles.")
+
+        waypoints = self.sol.waypoints  # shape (N, 2)
+
+        # segment vectors
+        diffs = waypoints[1:] - waypoints[:-1]  # shape (N-1, 2)
+
+        # angles in radians
+        angles = np.arctan2(diffs[:, 1], diffs[:, 0])
+
+        return angles
 
     def compute(
         self,

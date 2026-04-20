@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import pickle
 
 
-from lib.load_params import Ship, Generator
+from lib.load_params import Ship, Generator, FitRange
 from lib.paths import B_SERIES_CQ, B_SERIES_CT
 from lib.utils import bisection
 
@@ -43,11 +43,11 @@ def compute_rel_wind_speed_and_rel_attack_angle(wind_speed_vector,ship_speed_vec
     return V_rw, gamma_rw
 
 
-    
 @dataclass
-class WindModel:
+class BaseWindModel:
     "Blendermann (1986, 1994), MSS notes chap 10"
     ship: Ship
+    fit_range : FitRange
     thrust_coeffs: Optional[np.ndarray] = field(default=None, init=False)
     relative_errors: Optional[np.ndarray] = field(default=None, init=False)
     max_convex_resistance: Optional[np.ndarray] = field(default=None, init=False)
@@ -68,6 +68,10 @@ class WindModel:
         CX = -CDlAF * np.cos(gamma_rw) / den
         tauX = 0.5 * CX * self.ship.info.rho_air * V_rw**2 * self.ship.hull.AF_air
         return -tauX/1000000
+
+    
+@dataclass
+class WindModel2D(BaseWindModel):
     
     def fit_convex_model(
         #fit a convex model for a specific weather, based on directional vx, vy speed
@@ -229,16 +233,95 @@ class WindModel:
             for it in range(nb_timesteps):
                 self.relative_errors[iz,it], self.thrust_coeffs[iz,it,:],self.max_convex_resistance[iz,it] = self.fit_convex_model(wind_speed_x[iz,it],wind_speed_y[iz,it],debug=False)
             print("zone", iz, "fitted")
+
+@dataclass
+class WindModel1D(BaseWindModel):
+    
+    def fit_convex_model(
+        #fit a convex model for a specific weather, based on directional vx, vy speed
+        self,
+        wind_speed_x, #eastward wind speed m/s
+        wind_speed_y, #northward wind speed m/s
+        course_angle, #angle of the ship
+        nb_steps : float = 40,
+        debug: bool = False
+    ):
+        vs_vals = np.arange(self.fit_range.min_speed, self.fit_range.max_speed + 1e-12, (self.fit_range.max_speed-self.fit_range.min_speed)/nb_steps)
+
+        Resistance = np.zeros_like(vs_vals, dtype=float)
+        for i in range(Resistance.shape[0]):
+            vx = vs_vals[i]*np.cos(course_angle)
+            vy = vs_vals[i]*np.sin(course_angle)
+            Resistance[i] = self.compute_resistance(np.array([wind_speed_x,wind_speed_y]),np.array([vx,vy]))
+
+        #Fit a convex power model
+        vs_vals_norm = vs_vals/self.ship.info.max_speed
+        vs_vals_norm_2 = vs_vals_norm**2
+        vs_vals_norm_3 = vs_vals_norm**3
+        vs_vals_norm_4 = vs_vals_norm**4
+
+        R_fit = cp.Variable(Resistance.shape)
+        param_vs = cp.Variable()
+        param_vs_2 = cp.Variable()
+        param_vs_3 = cp.Variable()
+        param_vs_4 = cp.Variable()
+        intercept = cp.Variable()
+
+        constraints = []
+        constraints += [param_vs_2>=eps]
+        constraints += [param_vs_3>=eps]
+        constraints += [param_vs_4>=eps]
+
+        for i in range(len(vs_vals)):
+            constraints += [R_fit[i] == intercept + param_vs_4*vs_vals_norm_4[i] + param_vs_3*vs_vals_norm_3[i] + param_vs_2*vs_vals_norm_2[i] + param_vs*vs_vals_norm[i]]
         
+        objective = cp.Minimize(cp.sum_squares(R_fit-Resistance))
+        problem = cp.Problem(objective, constraints)
+        problem.solve(solver="MOSEK", verbose=debug)
+
+        # Check solve status
+        if problem.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
+            raise RuntimeError(f"Power fit problem not solved optimally: {problem.status}")
+
+        abs_err = np.abs(R_fit.value - Resistance)
+
+        coeffs = np.array([
+            intercept.value,
+            param_vs.value,
+            param_vs_2.value,
+            param_vs_3.value,
+            param_vs_4.value,
+        ])
+        return np.nanmax(abs_err),coeffs, max(R_fit.value)
+
+    def fit_convex_models(
+        #fit convex wind models for every zone and timestep combination based on weather
+        self,
+        wind_speed_x, #wind speed m/s [nb_zones, nb_timestep]
+        wind_speed_y, #wind speed m/s [nb_zones, nb_timestep]
+        course_angles, #angle of the ship [nb_zones, nb_timestep]
+        nb_steps : float = 40,
+        debug = False,
+    ):
+        nb_zones                = wind_speed_x.shape[0]
+        nb_timesteps            = wind_speed_x.shape[1]
+        self.thrust_coeffs      = np.zeros((nb_zones,nb_timesteps,5))
+        self.relative_errors    = np.zeros((nb_zones,nb_timesteps))
+        self.max_convex_resistance    = np.zeros((nb_zones,nb_timesteps))
+
+        for iz in range(nb_zones):
+            for it in range(nb_timesteps):
+                self.relative_errors[iz,it], self.thrust_coeffs[iz,it,:],self.max_convex_resistance[iz,it] = self.fit_convex_model(wind_speed_x[iz,it],wind_speed_y[iz,it], course_angles[iz,it], nb_steps=nb_steps, debug=debug)
+            print("zone", iz, "fitted")
 
 
 @dataclass
-class WaveModel:
+class BaseWaveModel:
     """
     ITTC recommanded approach to compute wave loads https://www.sciencedirect.com/science/article/pii/S0029801821013020, returns MN
     """
-
     ship: Ship
+    fit_range : FitRange
     thrust_coeffs: Optional[np.ndarray] = field(default=None, init=False)
     relative_errors: Optional[np.ndarray] = field(default=None, init=False)
     max_convex_resistance : Optional[np.ndarray] = field(default=None, init=False)
@@ -401,6 +484,103 @@ class WaveModel:
         R_WAVE = R_AWM + R_AWR
         return R_WAVE/1000000
 
+
+@dataclass
+class WaveModel1D(BaseWaveModel):
+    def fit_convex_model(
+        #fit a convex model for a specific weather, based on directional vx, vy speed
+        self,
+        mean_wave_amplitude : float,        # m
+        mean_wave_frequency : float,        # rad/s
+        mean_wave_length    : float,        # m
+        mean_wave_direction : float,        # ERA5 convention, 0 deg = from north, 90deg = from est
+        course_angle        : float, 
+        nb_steps : int = 40,                # amount of points used in the fit in both axis
+        debug: bool = False
+    ):
+        vs_vals = np.arange(self.fit_range.min_speed, self.fit_range.max_speed + 1e-12, (self.fit_range.max_speed-self.fit_range.min_speed)/nb_steps)
+
+        Resistance = np.zeros_like(vs_vals, dtype=float)
+        for i in range(vs_vals.shape[0]):
+            vx = vs_vals[i]*np.cos(course_angle)
+            vy = vs_vals[i]*np.sin(course_angle)
+            ship_speed_vector = np.array([vx, vy], dtype=float)
+
+            wave_relative_angle_encounter = self.compute_wave_relative_angle_encounter(
+                ship_speed_vector=ship_speed_vector,
+                mean_wave_direction=mean_wave_direction,
+            )
+
+            Resistance[i] = self.compute_resistance(
+                mean_wave_amplitude,
+                mean_wave_frequency,
+                mean_wave_length,
+                vs_vals[i],
+                wave_relative_angle_encounter,
+            )
+        #Fit a convex power model
+        vs_vals_norm = vs_vals/self.ship.info.max_speed
+        vs_vals_norm_2 = vs_vals_norm**2
+        vs_vals_norm_3 = vs_vals_norm**3
+        vs_vals_norm_4 = vs_vals_norm**4
+
+        R_fit = cp.Variable(vs_vals_norm.shape)
+        param_vs = cp.Variable()
+        param_vs_2 = cp.Variable()
+        param_vs_3 = cp.Variable()
+        param_vs_4 = cp.Variable()
+        intercept = cp.Variable()
+
+        constraints = []
+        constraints += [param_vs_2>=eps]
+        constraints += [param_vs_3>=eps]
+        constraints += [param_vs_4>=eps]
+
+        for i in range(len(vs_vals)):
+            constraints += [R_fit[i]== intercept + param_vs_4*vs_vals_norm_4[i]+param_vs_3*vs_vals_norm_3[i]+param_vs_2*vs_vals_norm_2[i]+param_vs*vs_vals_norm[i]]
+        
+        objective = cp.Minimize(cp.sum_squares(R_fit-Resistance))
+        problem = cp.Problem(objective, constraints)
+        problem.solve(solver="MOSEK", verbose=debug)
+
+        # Check solve status
+        if problem.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
+            raise RuntimeError(f"Power fit problem not solved optimally: {problem.status}")
+
+        abs_err = np.abs(R_fit.value - Resistance)
+
+        coeffs = np.array([
+            intercept.value,
+            param_vs.value,
+            param_vs_2.value,
+            param_vs_3.value,
+            param_vs_4.value,
+        ])
+
+        return np.nanmax(abs_err),coeffs, max(R_fit.value)
+
+    def fit_convex_models(
+        #fit convex wave models for every zone and timestep combination based on weather
+        self,
+        mean_wave_amplitudes, # [nb_zones, nb_timestep]
+        mean_wave_frequency, # [nb_zones, nb_timestep]
+        mean_wave_length, # [nb_zones, nb_timestep]
+        mean_wave_direction, # [nb_zones, nb_timestep]
+        course_angles, #angle of the ship [nb_zones, nb_timestep]
+    ):
+        nb_zones                = mean_wave_amplitudes.shape[0]
+        nb_timesteps            = mean_wave_amplitudes.shape[1]
+        self.thrust_coeffs      = np.zeros((nb_zones,nb_timesteps,5))
+        self.relative_errors    = np.zeros((nb_zones,nb_timesteps))
+        self.max_convex_resistance = np.zeros((nb_zones,nb_timesteps))
+
+        for iz in range(nb_zones):
+            for it in range(nb_timesteps):
+                self.relative_errors[iz,it], self.thrust_coeffs[iz,it,:],self.max_convex_resistance[iz,it] = self.fit_convex_model(mean_wave_amplitudes[iz,it],mean_wave_frequency[iz,it],mean_wave_length[iz,it],mean_wave_direction[iz,it], course_angles[iz,it], debug=False)
+            print("zone", iz, "fitted")
+
+@dataclass
+class WaveModel2D(BaseWaveModel):
     def fit_convex_model(
         #fit a convex model for a specific weather, based on directional vx, vy speed
         self,
@@ -543,6 +723,7 @@ class WaveModel:
         mean_wave_frequency, # [nb_zones, nb_timestep]
         mean_wave_length, # [nb_zones, nb_timestep]
         mean_wave_direction, # [nb_zones, nb_timestep]
+        fit_range,
     ):
         nb_zones                = mean_wave_amplitudes.shape[0]
         nb_timesteps            = mean_wave_amplitudes.shape[1]
@@ -553,10 +734,7 @@ class WaveModel:
         for iz in range(nb_zones):
             for it in range(nb_timesteps):
                 self.relative_errors[iz,it], self.thrust_coeffs[iz,it,:],self.max_convex_resistance[iz,it] = self.fit_convex_model(mean_wave_amplitudes[iz,it],mean_wave_frequency[iz,it],mean_wave_length[iz,it],mean_wave_direction[iz,it],debug=False)
-            print("zone", iz, "fitted")
-
-        
-        
+            print("zone", iz, "fitted") 
 
 @dataclass
 class PropulsionModel:
@@ -566,6 +744,7 @@ class PropulsionModel:
     ship: Ship
     grid_granularity : np.int
     pitch_granularity : np.int
+    fit_range : FitRange
 
     # B-series coefficients
     KQ_coeff = pd.read_csv(B_SERIES_CQ)
@@ -596,9 +775,9 @@ class PropulsionModel:
 
     def __post_init__(self):
         #simple limits
-        self.min_ua = 0.1
-        self.max_ua = (1.0 - self.ship.propulsion.wake_fraction) * self.ship.info.max_speed
-        self.min_thrust = 0
+        self.min_ua = (1.0 - self.ship.propulsion.wake_fraction) * self.fit_range.min_speed
+        self.max_ua = (1.0 - self.ship.propulsion.wake_fraction) * self.fit_range.max_speed
+        self.min_thrust = self.fit_range.min_resistance/self.ship.propulsion.nb_propellers
         self.pitches = np.linspace(self.ship.propulsion.min_pitch,self.ship.propulsion.max_pitch,self.pitch_granularity)
         self.max_thrust = 0
         self.max_J = np.zeros(len(self.pitches))
@@ -606,6 +785,8 @@ class PropulsionModel:
             Thrust = self.compute_thrust(self.min_ua, self.ship.propulsion.max_n,self.pitches[p])
             if Thrust>self.max_thrust:
                 self.max_thrust = Thrust
+        if self.max_thrust>self.fit_range.max_resistance/self.ship.propulsion.nb_propellers:
+            self.max_thrust = self.fit_range.min_resistance/self.ship.propulsion.nb_propellers
 
         #study grid
         self.ua_vals = np.linspace(self.min_ua, self.max_ua, num=self.grid_granularity, endpoint=True, retstep=False, dtype=None)
@@ -823,6 +1004,7 @@ class PropulsionModel:
     
     def fit_convex_model(
         self,
+        fit_range,
         debug: bool = False
     ):
         #Compute feasibility constraints to exclude infeasible speed thrust combinations

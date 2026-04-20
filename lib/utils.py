@@ -12,6 +12,12 @@ from lib.paths import ADJ, ZONES
 import numpy as np
 import matplotlib.pyplot as plt
 
+def _assert_finite(name, arr):
+    arr = np.asarray(arr)
+    if not np.isfinite(arr).all():
+        bad = np.argwhere(~np.isfinite(arr))
+        raise ValueError(f"{name} has non-finite entries; first bad index: {bad[0]} value={arr[tuple(bad[0])]}")
+
 def _compute_tight_big_M_zone(map_obj, zone_ineq, safety_margin=1.0):
     """
     Compute a tight disabling Big-M for zone inequalities:
