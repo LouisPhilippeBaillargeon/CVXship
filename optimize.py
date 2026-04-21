@@ -25,15 +25,17 @@ if __name__ == "__main__":
     _assert_finite("map.trans_ineq_from", map.trans_ineq_from)
 
     x, y, _ = dx_dy_km(map, itinerary.transits[-1].lat, itinerary.transits[-1].lon)
+
+    states.timesteps_completed = 15
+    states.current_x_pos = 200
+    states.current_y_pos = 400
+
     path = ShortestPath(
         map                 = map,
         itinerary           = itinerary,
         states              = states,
         weather             = weather,
         ship                = ship,)
-    path.states.timesteps_completed = 15
-    path.states.current_x_pos = 200
-    path.states.current_y_pos = 400
     path.compute([x,y])
 
     base_wind_model = BaseWindModel(ship, fit_range)
@@ -101,8 +103,8 @@ if __name__ == "__main__":
             wave_model_2D.fit_convex_models(weather.mean_wave_amplitude,weather.mean_wave_frequency,weather.mean_wave_length,weather.mean_wave_direction)
             print("average max error wave 2D", np.mean(wave_model_2D.relative_errors) , "%")
 
-            save_obj(WAVE_MODEL_2D, wave_model_1D)
-            save_obj(WIND_MODEL_2D, wind_model_1D)
+            save_obj(WAVE_MODEL_2D, wave_model_2D)
+            save_obj(WIND_MODEL_2D, wind_model_2D)
 
         end = time.time()
         print("Weather model fit took :", end - start, "seconds")
@@ -163,7 +165,6 @@ if __name__ == "__main__":
                 ref_speed = ref_speed
             )
 
-            optimizer.states.timesteps_completed = 15
             ok = optimizer.optimize(
                 unit_commitment=False,
                 debug=True,
@@ -190,11 +191,6 @@ if __name__ == "__main__":
                 weather             = weather,
                 ship                = ship,
                 ref_speed           = ref_speed,)
-
-            optimizer.states.timesteps_completed = 15
-            optimizer.states.current_x_pos = 200
-            optimizer.states.current_y_pos = 400
-            optimizer.states.current_heading = -2
 
             # Plot current position and destination
             init_pos = np.array([optimizer.states.current_x_pos, optimizer.states.current_y_pos])

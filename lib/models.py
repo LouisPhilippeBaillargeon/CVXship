@@ -1,12 +1,13 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from matplotlib.patches import Patch
-from typing import Optional
+from typing import Optional, Dict, Any
 import numpy as np
 import pandas as pd
 import cvxpy as cp
 import matplotlib.pyplot as plt
 import pickle
+import math
 
 
 from lib.load_params import Ship, Generator, FitRange
@@ -42,6 +43,415 @@ def compute_rel_wind_speed_and_rel_attack_angle(wind_speed_vector,ship_speed_vec
 
     return V_rw, gamma_rw
 
+def holtrop_wave_resistance(
+    v_rel: float,
+    L_wl: float,
+    B: float,
+    T: float,
+    disp_volume: float,
+    Cp: float,
+    Cm: float,
+    Cwp: float,
+    rho: float = 1025.0,
+    g: float = 9.81,
+    At: float = 0.0,
+    Abt: float = 0.0,
+    h_B: float = 0.0,
+    T_f: Optional[float] = None,
+    i_E_deg: Optional[float] = None,
+    lcb_percent: float = 0.0,
+    return_debug: bool = False,
+) -> float | tuple[float, Dict[str, Any]]:
+    """
+    Compute Holtrop (1984) calm-water wave resistance R_w [N].
+
+    Parameters
+    ----------
+    v_rel : float
+        Ship speed relative to water [m/s].
+    L_wl : float
+        Waterline length L [m].
+    B : float
+        Beam [m].
+    T : float
+        Mean draft [m].
+    disp_volume : float
+        Displacement volume ∇ [m^3].
+    Cp : float
+        Prismatic coefficient [-].
+    Cm : float
+        Midship section coefficient [-].
+    Cwp : float
+        Waterplane area coefficient [-].
+    rho : float, default=1025.0
+        Water density [kg/m^3].
+    g : float, default=9.81
+        Gravitational acceleration [m/s^2].
+    At : float, default=0.0
+        Immersed transom area at zero speed A_T [m^2].
+    Abt : float, default=0.0
+        Transverse bulb area at still-water intersection A_BT [m^2].
+        Set to 0.0 if no bulbous bow.
+    h_B : float, default=0.0
+        Vertical position of the center of A_BT above keel [m].
+    T_f : float, optional
+        Forward draft [m]. If omitted, T_f = T.
+    i_E_deg : float, optional
+        Half entrance angle i_E [deg]. If omitted, Holtrop regression is used.
+    lcb_percent : float, default=0.0
+        Longitudinal center of buoyancy forward of 0.5L, as % of L.
+        Keep the sign convention consistent with your hydrostatics source.
+    return_debug : bool, default=False
+        If True, also return a dict of intermediate values.
+
+    Returns
+    -------
+    R_w : float
+        Wave resistance [N].
+
+    Notes
+    -----
+    - This implements the Holtrop 1984 wave-resistance formula visible in the source pages.
+    - It is the calm-water wave-making/wave-breaking term, not added resistance in real sea waves.
+    - For v_rel <= 0, returns 0.
+    """
+
+    # ----------------------------
+    # Basic validation
+    # ----------------------------
+    if v_rel <= 0.0:
+        if return_debug:
+            return 0.0, {"Fn": 0.0, "note": "v_rel <= 0 => R_w = 0"}
+        return 0.0
+
+    for name, val in {
+        "L_wl": L_wl,
+        "B": B,
+        "T": T,
+        "disp_volume": disp_volume,
+        "Cp": Cp,
+        "Cm": Cm,
+        "Cwp": Cwp,
+        "rho": rho,
+        "g": g,
+    }.items():
+        if val <= 0.0:
+            raise ValueError(f"{name} must be > 0. Got {val}.")
+
+    if T_f is None:
+        T_f = T
+
+    # ----------------------------
+    # Froude number based on L_wl
+    # ----------------------------
+    Fn = v_rel / math.sqrt(g * L_wl)
+
+    # ----------------------------
+    # L_R used in Holtrop entrance-angle regression
+    # OCR-cleaned from the source page:
+    # L_R / L = 1 - C_p + 0.06 * C_p * lcb / (4*C_p - 1)
+    # where lcb is forward of 0.5L as % of L
+    # ----------------------------
+    denom = 4.0 * Cp - 1.0
+    if abs(denom) < 1e-12:
+        raise ValueError("Invalid Cp too close to 0.25 for Holtrop L_R formula.")
+
+    L_R = L_wl * (1.0 - Cp + 0.06 * Cp * lcb_percent / denom)
+    if L_R <= 0.0:
+        raise ValueError(f"Computed L_R <= 0 ({L_R}). Check Cp and lcb_percent.")
+
+    # ----------------------------
+    # Entrance angle i_E [deg]
+    # If not supplied, use Holtrop regression.
+    # ----------------------------
+    if i_E_deg is None:
+        term = (
+            -(L_wl / B) ** 0.80856
+            * (1.0 - Cwp) ** 0.30484
+            * (1.0 - Cp - 0.0225 * lcb_percent) ** 0.6367
+            * (L_R / B) ** 0.34574
+            * (100.0 * disp_volume / (L_wl ** 3)) ** 0.16302
+        )
+        i_E_deg = 1.0 + 89.0 * math.exp(term)
+
+    # Guard against bad inputs / roundoff
+    i_E_deg = max(1e-6, min(i_E_deg, 89.999999))
+
+    # ----------------------------
+    # c7
+    # ----------------------------
+    B_over_L = B / L_wl
+    if B_over_L < 0.11:
+        c7 = 0.229577 * (B_over_L ** (1.0 / 3.0))
+    elif B_over_L <= 0.25:
+        c7 = B_over_L
+    else:
+        c7 = 0.5 - 0.0625 * (L_wl / B)
+
+    # ----------------------------
+    # c3, c2
+    # c3 accounts for bulbous bow effect.
+    # If no bulb, set c3 = 0 => c2 = 1
+    # ----------------------------
+    if Abt > 0.0:
+        denom_c3 = B * T * (0.31 * math.sqrt(Abt) + T_f - h_B)
+        if denom_c3 <= 0.0:
+            raise ValueError(
+                "Invalid bulb geometry: denominator of c3 <= 0. "
+                "Check Abt, T_f, h_B, B, T."
+            )
+        c3 = 0.56 * (Abt ** 1.5) / denom_c3
+    else:
+        c3 = 0.0
+
+    c2 = math.exp(-1.89 * math.sqrt(c3))
+
+    # ----------------------------
+    # c5 : transom effect on wave resistance
+    # ----------------------------
+    c5 = 1.0 - 0.8 * At / (B * T * Cm)
+
+    # ----------------------------
+    # lambda
+    # ----------------------------
+    if L_wl / B < 12.0:
+        lam = 1.446 * Cp - 0.03 * (L_wl / B)
+    else:
+        lam = 1.446 * Cp - 0.36
+
+    # ----------------------------
+    # c16
+    # ----------------------------
+    if Cp < 0.80:
+        c16 = 8.07981 * Cp - 13.8673 * (Cp ** 2) + 6.984388 * (Cp ** 3)
+    else:
+        c16 = 1.73014 - 0.7067 * Cp
+
+    # ----------------------------
+    # m1
+    # ----------------------------
+    m1 = (
+        0.0140407 * (L_wl / T)
+        - 1.75254 * (disp_volume ** (1.0 / 3.0) / L_wl)
+        - 4.79323 * (B / L_wl)
+        - c16
+    )
+
+    # ----------------------------
+    # c15
+    # ----------------------------
+    L3_over_disp = (L_wl ** 3) / disp_volume
+    if L3_over_disp < 512.0:
+        c15 = -1.69385
+    elif L3_over_disp > 1727.0:
+        c15 = 0.0
+    else:
+        c15 = -1.69385 + ((L3_over_disp ** (1.0 / 3.0)) - 8.0) / 2.36
+
+    # Source page uses m2 = c15 * Cp^2 * exp(-0.1 * Fn^-2)
+    m2 = c15 * (Cp ** 2) * math.exp(-0.1 * (Fn ** -2))
+
+    # ----------------------------
+    # c1
+    # ----------------------------
+    c1 = (
+        2223105.0
+        * (c7 ** 3.78613)
+        * ((T / B) ** 1.07961)
+        * ((90.0 - i_E_deg) ** -1.37565)
+    )
+
+    # ----------------------------
+    # d
+    # ----------------------------
+    d = -0.9
+
+    # ----------------------------
+    # Wave resistance
+    # R_w = c1 c2 c5 ∇ ρ g exp(m1 Fn^d + m2 cos(lambda Fn^-2))
+    # ----------------------------
+    exponent = m1 * (Fn ** d) + m2 * math.cos(lam * (Fn ** -2))
+    R_w = c1 * c2 * c5 * disp_volume * rho * g * math.exp(exponent)
+
+    # Numerical safety: wave resistance should not be negative here
+    R_w = max(0.0, R_w)
+
+    if return_debug:
+        debug = {
+            "Fn": Fn,
+            "L_R": L_R,
+            "i_E_deg": i_E_deg,
+            "c1": c1,
+            "c2": c2,
+            "c3": c3,
+            "c5": c5,
+            "c7": c7,
+            "lambda": lam,
+            "c15": c15,
+            "c16": c16,
+            "m1": m1,
+            "m2": m2,
+            "d": d,
+            "exponent": exponent,
+            "R_w": R_w,
+        }
+        return R_w, debug
+
+    return R_w
+
+@dataclass
+class CalmWaterModel:
+    "Uses Moland et al. 2017 model F = 0.5*rho*A_hull*C(v')v'^2. C(v') is evaluated at expected nominal speed in the convex optimizer and computed exactly in the evaluator."
+    "C = (1+k)C_F + delta C_F + C_W"
+    ship: Ship
+    fit_range : FitRange
+    fitted_Cx : Optional[float] = field(default=None, init=False)
+    thrust_coeffs: Optional[np.ndarray] = field(default=None, init=False)
+    
+    def compute_C(self, speed):
+        #speed = relative speed through water in m/s
+
+        if speed < 1e-6:
+            return 0.0
+        
+        Re = speed*self.ship.hull.LWL/(1.19e-6)
+        ks = 150*1e-6
+        LWL = self.ship.hull.LWL
+        CF = 0.075/np.square((np.log10(Re)-2))
+        delta_CF = 0.044*((ks/LWL)**(1/3)-10*Re**(-1/3)) + 0.000125
+
+        Rw, dbg = holtrop_wave_resistance(
+            v_rel=speed,
+            L_wl=self.ship.hull.LWL,
+            B=self.ship.hull.B,
+            T=self.ship.hull.T,
+            disp_volume=self.ship.info.displacement,
+            Cp=self.ship.hull.CB/self.ship.hull.CM,
+            Cm=self.ship.hull.CM,
+            Cwp=self.ship.hull.CWP,
+            rho=self.ship.info.rho_water,
+            g=self.ship.info.g,
+            At=self.ship.hull.AT,
+            Abt=self.ship.hull.ABT,
+            h_B=self.ship.hull.h_B,
+            T_f=self.ship.hull.TF,
+            i_E_deg=np.degrees(self.ship.hull.E1),
+            lcb_percent=self.ship.hull.LCB_percent,
+            return_debug=True,
+        )
+        CW = Rw / (0.5 * self.ship.info.rho_water * self.ship.hull.total_wet_area * np.square(speed))
+
+        k = 0.017 + 20.0 * self.ship.hull.CB / ((self.ship.hull.LWL / self.ship.hull.B) ** 2 * np.sqrt(self.ship.hull.B / self.ship.hull.T))
+        return (1+k)*CF+delta_CF+CW
+    
+    def compute_resistance(self, speed):
+        C = self.compute_C(speed)
+        Fcalm = 0.5*C*self.ship.hull.total_wet_area*self.ship.info.rho_water*np.square(speed)/1000000
+        return Fcalm
+    
+    def fit_constant_C(self, nb_points: int = 100) -> float:
+        """
+        Fit a constant calm-water resistance coefficient self.fitted_Cx over the
+        speed range [fit_range.min_speed, fit_range.max_speed] by least squares.
+
+        The fitted model is:
+            F_calm(v) ≈ 0.5 * rho_water * A_hull * fitted_Cx * v^2
+
+        The fit minimizes the squared error on resistance, not directly on C(v).
+
+        Parameters
+        ----------
+        nb_points : int
+            Number of speed samples used in the fit.
+
+        Returns
+        -------
+        float
+            The fitted constant coefficient self.fitted_Cx.
+        """
+        if nb_points < 2:
+            raise ValueError(f"nb_points must be >= 2, got {nb_points}.")
+
+        v_min = self.fit_range.min_speed
+        v_max = self.fit_range.max_speed
+
+        if v_min <= 1e-6:
+            raise ValueError(f"fit_range.min_speed must be > 1e-6, got {v_min}.")
+        if v_max <= v_min:
+            raise ValueError(
+                f"fit_range.max_speed must be > fit_range.min_speed, got "
+                f"{v_max} <= {v_min}."
+            )
+
+        rho = self.ship.info.rho_water
+        A_hull = self.ship.hull.total_wet_area
+
+        speeds = np.linspace(v_min, v_max, nb_points)
+
+        # Exact resistance values from the detailed model [MN]
+        y = np.array([self.compute_resistance(v) for v in speeds])
+
+        # Basis function for the constant-C approximation [MN per unit C]
+        # Keep the /1e6 because compute_resistance() returns MN.
+        phi = 0.5 * rho * A_hull * speeds**2 / 1_000_000
+
+        denom = np.dot(phi, phi)
+        if denom <= 0:
+            raise ValueError("Least-squares denominator is non-positive.")
+
+        # Closed-form least-squares solution for one scalar coefficient
+        self.fitted_Cx = float(np.dot(phi, y) / denom)
+
+        return self.fitted_Cx
+    def fit_convex_model(self, nb_points=100, debug=False):
+        speeds = np.linspace(self.fit_range.min_speed, self.fit_range.max_speed, nb_points)
+        rho = self.ship.info.rho_water
+        A_hull = self.ship.hull.total_wet_area
+        Resistance = np.array([self.compute_resistance(v) for v in speeds])
+
+        v_vals_norm = speeds/self.ship.info.max_speed
+        v_vals_norm_2 = v_vals_norm**2
+        v_vals_norm_3 = v_vals_norm**3
+        v_vals_norm_4 = v_vals_norm**4
+
+        #Fit a convex power model
+        R_fit = cp.Variable(Resistance.shape)
+        param_v = cp.Variable()
+        param_v_2 = cp.Variable()
+        param_v_3 = cp.Variable()
+        param_v_4 = cp.Variable()
+        intercept = cp.Variable()
+
+        constraints = []
+        constraints += [param_v_2>=eps]
+        constraints += [param_v_3>=eps]
+        constraints += [param_v_4>=eps]
+
+        for i in range(len(speeds)):
+            constraints += [R_fit[i] == intercept + param_v_4*v_vals_norm_4[i] + param_v_3*v_vals_norm_3[i] + param_v_2*v_vals_norm_2[i] + param_v*v_vals_norm[i]]
+        
+        objective = cp.Minimize(cp.sum_squares(R_fit-Resistance))
+        problem = cp.Problem(objective, constraints)
+        problem.solve(solver="MOSEK", verbose=debug)
+
+        # Check solve status
+        if problem.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
+            raise RuntimeError(f"Power fit problem not solved optimally: {problem.status}")
+
+        abs_err = np.abs(R_fit.value - Resistance)
+
+        coeffs = np.array([
+            intercept.value,
+            param_v.value,
+            param_v_2.value,
+            param_v_3.value,
+            param_v_4.value,
+        ])
+        self.thrust_coeffs = coeffs
+        return np.nanmax(abs_err),coeffs, max(R_fit.value)
+
+
+
 
 @dataclass
 class BaseWindModel:
@@ -68,7 +478,7 @@ class BaseWindModel:
         CX = -CDlAF * np.cos(gamma_rw) / den
         tauX = 0.5 * CX * self.ship.info.rho_air * V_rw**2 * self.ship.hull.AF_air
         return -tauX/1000000
-
+    
     
 @dataclass
 class WindModel2D(BaseWindModel):
