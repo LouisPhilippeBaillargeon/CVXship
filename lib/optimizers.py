@@ -927,18 +927,6 @@ class Fixed_Path_Optimizer:
 
         # ---- Reconstruct 2D speed from 1D speed along the path ----
         speed_mag_opt = (np.diff(d_opt) / self.itinerary.timestep) * 1000 / 3600   # m/s, shape (T_future,)
-        ship_speed_2d = np.zeros((len(speed_mag_opt), 2), dtype=float)
-
-        for t, speed_mag_t in enumerate(speed_mag_opt):
-            dist = min(max(d_opt[t], 0.0), D_breaks[-1])
-
-            if dist >= D_breaks[-1]:
-                seg_idx = len(segment_lengths) - 1
-            else:
-                seg_idx = np.searchsorted(D_breaks, dist, side="right") - 1
-                seg_idx = max(0, min(seg_idx, len(segment_lengths) - 1))
-
-            ship_speed_2d[t] = speed_mag_t * segment_dirs[seg_idx]
 
 
         # ---- Reconstruct zones ----
@@ -970,7 +958,7 @@ class Fixed_Path_Optimizer:
                 total_distance          = total_path_length,
 
                 ship_pos                = ship_pos_2d,
-                ship_speed              = ship_speed_2d,
+                ship_speed              = np.array(ship_speed.value),
                 speed_rel_water         = np.array(speed_rel_water.value),
                 speed_rel_water_mag     = np.array(speed_rel_water_mag.value),
 
