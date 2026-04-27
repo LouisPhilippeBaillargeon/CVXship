@@ -3,8 +3,8 @@ from typing import List
 import time
 
 from lib.load_params import load_config
-from lib.models import PropulsionModel, BaseWaveModel, WaveModel1D, WaveModel2D, BaseWindModel, WindModel1D, WindModel2D, GeneratorModel, save_obj, load_obj
-from lib.paths import WIND_MODEL_1D, WIND_MODEL_2D, WAVE_MODEL_1D, WAVE_MODEL_2D, PROPULSION_MODEL, GENERATOR_MODEL
+from lib.models import PropulsionModel, BaseWaveModel, WaveModel1D, WaveModel2D, WaveModelPathAligned2D, BaseWindModel, WindModel1D, WindModel2D, WindModelPathAligned2D, GeneratorModel, CalmWaterModel, save_obj, load_obj
+from lib.paths import WIND_MODEL_1D, WIND_MODEL_2D, WIND_MODEL_PATH_ALIGNED_2D, WAVE_MODEL_1D, WAVE_MODEL_2D, WAVE_MODEL_PATH_ALIGNED_2D, PROPULSION_MODEL, GENERATOR_MODEL, CALM_MODEL
 from lib.plotting import plot_solutions, plot_zones_and_points, load_solutions_from_pkl
 from lib.optimizers import GlobalOptimizer, NaiveController, Fixed_Path_Optimizer, ShortestPath
 from lib.utils import point_in_zones, dx_dy_km, classify_timesteps, _assert_finite
@@ -26,9 +26,9 @@ if __name__ == "__main__":
 
     x, y, _ = dx_dy_km(map, itinerary.transits[-1].lat, itinerary.transits[-1].lon)
 
-    states.timesteps_completed = 15
-    states.current_x_pos = 200
-    states.current_y_pos = 400
+    #states.timesteps_completed = 15
+    #states.current_x_pos = 200
+    #states.current_y_pos = 400
 
     path = ShortestPath(
         map                 = map,
@@ -37,9 +37,25 @@ if __name__ == "__main__":
         weather             = weather,
         ship                = ship,)
     path.compute([x,y])
+    course_angles = path.compute_course_angles()                     # shape (nb_zones,)
+    course_angles = np.repeat(course_angles[:, None], weather.wind_x.shape[1], axis=1)
 
     base_wind_model = BaseWindModel(ship, fit_range)
     base_wave_model = BaseWaveModel(ship, fit_range)
+
+    path_zone_ids = np.asarray(path.sol.zone_sequence, dtype=int)
+
+    segment_vecs = np.asarray(path.sol.waypoints[1:], dtype=float) - np.asarray(path.sol.waypoints[:-1], dtype=float)
+    theta_seg = np.arctan2(segment_vecs[:, 1], segment_vecs[:, 0])
+
+    course_angles_path = np.repeat(theta_seg[:, None], weather.wind_x.shape[1], axis=1)
+
+    wind_x_path = weather.wind_x[path_zone_ids, :]
+    wind_y_path = weather.wind_y[path_zone_ids, :]
+    wave_amp_path = weather.mean_wave_amplitude[path_zone_ids, :]
+    wave_freq_path = weather.mean_wave_frequency[path_zone_ids, :]
+    wave_len_path = weather.mean_wave_length[path_zone_ids, :]
+    wave_dir_path = weather.mean_wave_direction[path_zone_ids, :]
 
     if new_ship:
         start = time.time()
@@ -48,11 +64,18 @@ if __name__ == "__main__":
             gen = GeneratorModel(generator=g)
             print(gen.fit_convex_model(debug=True))
             generatorModels.append(gen)
+        
+        calm_model = CalmWaterModel(ship = ship)
+        calm_model.plot_calm_water_models_ieee(
+            nb_points=200,
+            fit_if_needed=True,
+            show=True,
+        )
 
         propulsion_model = PropulsionModel(
             ship = ship,
             grid_granularity = 40,
-            pitch_granularity = 10,
+            pitch_granularity = 1,
             fit_range = fit_range,
         )
 
@@ -67,20 +90,47 @@ if __name__ == "__main__":
         propulsion_model.plot_feasibility_mask()
         
         save_obj(GENERATOR_MODEL, generatorModels)
+        save_obj(CALM_MODEL, calm_model)
         save_obj(PROPULSION_MODEL, propulsion_model)
 
     else:
         generatorModels = load_obj(GENERATOR_MODEL)
+        calm_model = load_obj(CALM_MODEL)
         propulsion_model = load_obj(PROPULSION_MODEL)
         print("Saved ship model loaded")
 
 
     if new_weather:
         start = time.time()
+        wind_model_path_2D = WindModelPathAligned2D(ship, fit_range)
+        wind_model_path_2D.fit_convex_models(
+            wind_x_path,
+            wind_y_path,
+            course_angles_path,
+            nb_parallel_steps=40,
+            nb_perp_steps=9,
+            conservative=False,
+        )
+        print("average max error wind path-aligned 2D", np.mean(wind_model_path_2D.relative_errors), "MN")
+
+        wave_model_path_2D = WaveModelPathAligned2D(ship=ship, fit_range=fit_range)
+        wave_model_path_2D.fit_convex_models(
+            wave_amp_path,
+            wave_freq_path,
+            wave_len_path,
+            wave_dir_path,
+            course_angles_path,
+            nb_parallel_steps=40,
+            nb_perp_steps=9,
+            conservative=False,
+        )
+        print("average max error wave path-aligned 2D", np.mean(wave_model_path_2D.relative_errors), "MN")
+
+        save_obj(WAVE_MODEL_PATH_ALIGNED_2D, wave_model_path_2D)
+        save_obj(WIND_MODEL_PATH_ALIGNED_2D, wind_model_path_2D)
+        '''
         if dimensions == "1D" or dimensions == "both":
             wind_model_1D = WindModel1D(ship, fit_range)
-            course_angles = path.compute_course_angles()                     # shape (nb_zones,)
-            course_angles = np.repeat(course_angles[:, None], weather.wind_x.shape[1], axis=1)
             wind_model_1D.fit_convex_models(weather.wind_x, weather.wind_y, course_angles)
             print("average max error wind 1D", np.mean(wind_model_1D.relative_errors) , "%")
 
@@ -105,11 +155,14 @@ if __name__ == "__main__":
 
             save_obj(WAVE_MODEL_2D, wave_model_2D)
             save_obj(WIND_MODEL_2D, wind_model_2D)
+        '''
 
         end = time.time()
         print("Weather model fit took :", end - start, "seconds")
 
     else:
+        wind_model_path_2D = load_obj(WIND_MODEL_PATH_ALIGNED_2D)
+        wave_model_path_2D = load_obj(WAVE_MODEL_PATH_ALIGNED_2D)
         if dimensions == "1D" or dimensions == "both":
             wave_model_1D = load_obj(WAVE_MODEL_1D)
             wind_model_1D = load_obj(WIND_MODEL_1D)
@@ -128,6 +181,8 @@ if __name__ == "__main__":
         plot_solutions(solutions)
 
     else:
+        
+        print("calm water coeffs", calm_model.res_coeffs)
         if path.sol is None:
             raise RuntimeError("ShortestPath did not produce a solution.")
         
@@ -138,7 +193,7 @@ if __name__ == "__main__":
 
         ref_speed = (path.sol.total_distance/sail_time)*1000/3600
 
-        naive = NaiveController(map, itinerary, states, weather, ship)
+        naive = NaiveController(map, itinerary, states, weather, ship, path.sol, course_angles)
         naive.compute(debug=False)
         plot_zones_and_points(naive.sol.ship_pos, naive.map.zone_ineq)
 
@@ -147,13 +202,15 @@ if __name__ == "__main__":
         naive.wave_model = base_wave_model
         naive.propulsion_model = propulsion_model
         naive.generator_models = generatorModels
+        naive.calm_model=calm_model
         n_all, naive_solution, dt_h = compute_non_convex_cost_all_timesteps(naive)
 
         if dimensions == "1D" or dimensions == "both":
             optimizer = Fixed_Path_Optimizer(
-                wave_model=wave_model_1D,
-                wind_model=wind_model_1D,
+                wave_model=wave_model_path_2D,
+                wind_model=wind_model_path_2D,
                 propulsion_model=propulsion_model,
+                calm_model=calm_model,
                 generator_models=generatorModels,
                 map=map,
                 itinerary=itinerary,
@@ -184,6 +241,7 @@ if __name__ == "__main__":
                 wave_model          = wave_model_2D,
                 wind_model          = wind_model_2D,
                 propulsion_model    = propulsion_model,
+                calm_model          = calm_model,
                 generator_models    = generatorModels,
                 map                 = map,
                 itinerary           = itinerary,
