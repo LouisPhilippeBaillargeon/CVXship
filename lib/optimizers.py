@@ -307,9 +307,11 @@ class GlobalOptimizer:
         constraints += [speed_rel_water_mag >= cp.norm(speed_rel_water,axis=1)]
 
         for t in range(T_future):
-            zone_avg_t = (zone[t, :] + zone[t+1, :]) / 2.0
-            constraints += [speed_rel_water[t,0]==ship_speed[t,0]-(zone_avg_t@current_x_future[:,t])]
-            constraints += [speed_rel_water[t,1]==ship_speed[t,1]-(zone_avg_t@current_y_future[:,t])]
+            constraints += [speed_rel_water[t,0]==ship_speed[t,0]-(zone[t, :]@current_x_future[:,t])]
+            constraints += [speed_rel_water[t,1]==ship_speed[t,1]-(zone[t, :]@current_y_future[:,t])]
+            #zone_avg_t = (zone[t, :] + zone[t+1, :]) / 2.0
+            #constraints += [speed_rel_water[t,0]==ship_speed[t,0]-(zone_avg_t@current_x_future[:,t])]
+            #constraints += [speed_rel_water[t,1]==ship_speed[t,1]-(zone_avg_t@current_y_future[:,t])]
             #constraints += [speed_rel_water[t,0]==ship_speed[t,0]-(zone[t,:]@current_x_future[:,t])]
             #constraints += [speed_rel_water[t,1]==ship_speed[t,1]-(zone[t,:]@current_y_future[:,t])]
             
@@ -391,8 +393,9 @@ class GlobalOptimizer:
         irr_future = self.weather.irradiance[:, self.states.timesteps_completed : self.states.timesteps_completed + T_future]  # shape [nb_zones, T_future]
         constraints += [solar_power>=0]
         for t in range(T_future):
-            zone_avg_t = (zone[t, :] + zone[t+1, :]) / 2.0
-            constraints += [solar_power[t] <= self.ship.solarPannels.area * self.ship.solarPannels.efficiency * (zone_avg_t@irr_future[:,t])]
+            #zone_avg_t = (zone[t, :] + zone[t+1, :]) / 2.0
+            #constraints += [solar_power[t] <= self.ship.solarPannels.area * self.ship.solarPannels.efficiency * (zone_avg_t@irr_future[:,t])]
+            constraints += [solar_power[t] <= self.ship.solarPannels.area * self.ship.solarPannels.efficiency * (zone[t, :]@irr_future[:,t])]
 
         #=================================================SHORE POWER==================================================
         shore_power = cp.Variable(T_future)
@@ -449,8 +452,17 @@ class GlobalOptimizer:
             constraints += [gen_costs >=0]
         else:
             #constraints += [generation_power <= max_p]
-            constraints += [gen_costs >=(cp.multiply(a, cp.square(generation_power)) +cp.multiply(b, generation_power) +c)*self.itinerary.fuel_price] # $/h
-            constraints += [gen_costs >=0]
+            gen_on_fixed = np.zeros((len(self.generator_models), T_future), dtype=float)
+            gen_on_fixed[:, instant_sail[:-1].astype(bool)] = 1.0
+
+            constraints += [
+                gen_costs >= (
+                    cp.multiply(a, cp.square(generation_power))
+                    + cp.multiply(b, generation_power)
+                    + cp.multiply(c, gen_on_fixed)
+                ) * self.itinerary.fuel_price
+            ]
+            constraints += [gen_costs >= 0]
 
         #================================================POWER BALANCE=================================================
         for t in range(T_future):
@@ -479,7 +491,9 @@ class GlobalOptimizer:
             if unit_commitment:
                 gen_on_out = np.array(gen_on.value)
             else:
-                gen_on_out = np.ones((len(self.generator_models),T_future))
+                gen_on_out = np.zeros((len(self.generator_models), T_future), dtype=float)
+                sail_mask = instant_sail[:-1].astype(bool)
+                gen_on_out[:, sail_mask] = 1.0
 
             self.sol = Solution(
                 estimated_cost           = problem.value,
@@ -798,8 +812,9 @@ class Fixed_Path_Optimizer:
         irr_future = self.weather.irradiance[path_zone_ids, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
         constraints += [solar_power>=0]
         for t in range(T_future):
-            zone_avg_t = (seg[t, :] + seg[t+1, :]) / 2.0
-            constraints += [solar_power[t] <= self.ship.solarPannels.area * self.ship.solarPannels.efficiency * (zone_avg_t@irr_future[:,t])]
+            #zone_avg_t = (seg[t, :] + seg[t+1, :]) / 2.0
+            #constraints += [solar_power[t] <= self.ship.solarPannels.area * self.ship.solarPannels.efficiency * (zone_avg_t@irr_future[:,t])]
+            constraints += [solar_power[t] <= self.ship.solarPannels.area * self.ship.solarPannels.efficiency * (seg[t, :]@irr_future[:,t])]
 
         #=================================================SHORE POWER==================================================
         shore_power = cp.Variable(T_future, nonneg = True)
@@ -855,8 +870,17 @@ class Fixed_Path_Optimizer:
             constraints += [gen_costs >=0]
         else:
             #constraints += [generation_power <= max_p]
-            constraints += [gen_costs >=(cp.multiply(a, cp.square(generation_power)) +cp.multiply(b, generation_power) +c)*self.itinerary.fuel_price] # $/h
-            constraints += [gen_costs >=0]
+            gen_on_fixed = np.zeros((len(self.generator_models), T_future), dtype=float)
+            gen_on_fixed[:, instant_sail[:-1].astype(bool)] = 1.0
+
+            constraints += [
+                gen_costs >= (
+                    cp.multiply(a, cp.square(generation_power))
+                    + cp.multiply(b, generation_power)
+                    + cp.multiply(c, gen_on_fixed)
+                ) * self.itinerary.fuel_price
+            ]
+            constraints += [gen_costs >= 0]
 
         #================================================POWER BALANCE=================================================
         for t in range(T_future):
@@ -930,7 +954,9 @@ class Fixed_Path_Optimizer:
             if unit_commitment:
                 gen_on_out = np.array(gen_on.value)
             else:
-                gen_on_out = np.ones((len(self.generator_models),T_future))
+                gen_on_out = np.zeros((len(self.generator_models), T_future), dtype=float)
+                sail_mask = instant_sail[:-1].astype(bool)
+                gen_on_out[:, sail_mask] = 1.0
 
             print("prop_power",np.array(prop_power.value))
 
@@ -1074,7 +1100,8 @@ class NaiveController:
             if interval_sail_fraction[t] <= 1e-9:
                 continue
 
-            zone_weights = 0.5 * (zone[t, :] + zone[t + 1, :])
+            #zone_weights = 0.5 * (zone[t, :] + zone[t + 1, :])
+            zone_weights = zone[t, :]
             global_t = self.states.timesteps_completed + t
 
             current_x = float(zone_weights @ self.weather.current_x[:, global_t])
@@ -1170,7 +1197,8 @@ class NaiveController:
 
         for t in range(T_future):
             global_t = self.states.timesteps_completed + t
-            zone_weights = 0.5 * (zone[t, :] + zone[t + 1, :])
+            #zone_weights = 0.5 * (zone[t, :] + zone[t + 1, :])
+            zone_weights = zone[t, :]
 
             irradiance = float(zone_weights @ self.weather.irradiance[:, global_t])
             solar_power_available[t] = max(
@@ -1195,17 +1223,24 @@ class NaiveController:
         for _ in range(nb_bisection_iter):
             trial = 0.5 * (lower + upper)
 
-            _, _, _, _, _, SOC = self._simulate_battery_schedule(
+            (
+                _solar_power,
+                _shore_power,
+                _shore_power_cost,
+                _battery_charge,
+                battery_discharge,
+                SOC,
+            ) = self._simulate_battery_schedule(
                 constant_discharge_power=trial,
                 solar_power_available=solar_power_available,
                 interval_sail_fraction=interval_sail_fraction,
                 port_idx=port_idx,
+                enforce_available_energy=False,
             )
 
             feasible = (
-                np.min(SOC) >= -1e-8
-                and np.max(SOC) <= self.ship.battery.capacity + 1e-8
-                and SOC[-1] >= self.itinerary.soc_f - 1e-8
+                np.all(SOC >= -1e-8)
+                and np.all(SOC <= self.ship.battery.capacity + 1e-8)
             )
 
             if feasible:
@@ -1215,16 +1250,18 @@ class NaiveController:
 
         return lower
 
+
     def _simulate_battery_schedule(
         self,
         constant_discharge_power: float,
         solar_power_available: np.ndarray,
         interval_sail_fraction: np.ndarray,
         port_idx: np.ndarray,
+        enforce_available_energy: bool = True,
     ):
         T_future = len(interval_sail_fraction)
 
-        solar_power = np.zeros(T_future, dtype=float)
+        solar_power = np.asarray(solar_power_available, dtype=float).copy()
         shore_power = np.zeros(T_future, dtype=float)
         shore_power_cost = np.zeros(T_future, dtype=float)
         battery_charge = np.zeros(T_future, dtype=float)
@@ -1234,63 +1271,78 @@ class NaiveController:
         SOC[0] = float(self.states.soc)
 
         dt_h = float(self.itinerary.timestep)
+        capacity = float(self.ship.battery.capacity)
+        max_charge_pow = float(self.ship.battery.max_charge_pow)
+        max_discharge_pow = float(self.ship.battery.max_discharge_pow)
         charge_eff = float(self.ship.battery.charge_eff)
         discharge_eff = float(self.ship.battery.discharge_eff)
-        adjusted_leak = float(self.ship.battery.leak ** dt_h)
+        adjusted_leak = float(self.ship.battery.leak) ** dt_h
 
         for t in range(T_future):
             soc_after_leak = adjusted_leak * SOC[t]
+            sail_frac = float(interval_sail_fraction[t])
 
-            if interval_sail_fraction[t] > 1e-9:
-                solar_power[t] = solar_power_available[t]
-                battery_discharge[t] = constant_discharge_power
-                SOC[t + 1] = (
-                    soc_after_leak
-                    - dt_h * battery_discharge[t] / discharge_eff
+            if sail_frac > 1e-9:
+                # Sailing: solar is available for evaluator power balance,
+                # but it does NOT charge the battery in Naive.
+                requested_discharge = float(constant_discharge_power) * sail_frac
+                requested_discharge = min(requested_discharge, max_discharge_pow)
+
+                if enforce_available_energy:
+                    max_discharge_from_soc = soc_after_leak * discharge_eff / dt_h
+                    battery_discharge[t] = min(requested_discharge, max_discharge_from_soc)
+                else:
+                    battery_discharge[t] = requested_discharge
+
+                battery_charge[t] = 0.0
+
+            else:
+                # Port: charge battery as much as possible.
+                # Priority 1: solar. Priority 2: shore power.
+                p = int(port_idx[t])
+                if p < 0:
+                    raise ValueError(f"Invalid port_idx[{t}]={p} during non-sailing interval.")
+
+                remaining_charge_power_by_soc = max(
+                    0.0,
+                    (capacity - soc_after_leak) / (charge_eff * dt_h),
                 )
-                continue
 
-            p = int(port_idx[t])
-            if p < 0:
-                SOC[t + 1] = soc_after_leak
-                continue
+                solar_charge = min(
+                    max(0.0, float(solar_power[t])),
+                    max_charge_pow,
+                    remaining_charge_power_by_soc,
+                )
 
-            remaining_charge_room_mwh = max(0.0, self.ship.battery.capacity - soc_after_leak)
-            max_charge_power_from_soc = remaining_charge_room_mwh / max(dt_h * charge_eff, 1e-12)
+                remaining_charge_power_by_soc -= solar_charge
+                remaining_ship_charge_power = max_charge_pow - solar_charge
 
-            total_charge_limit = min(
-                self.ship.battery.max_charge_pow,
-                max_charge_power_from_soc,
-            )
+                shore_power[t] = min(
+                    float(self.itinerary.transits[p].max_charge_power),
+                    remaining_ship_charge_power,
+                    remaining_charge_power_by_soc,
+                )
 
-            solar_charge_power = min(solar_power_available[t], total_charge_limit)
-            remaining_charge_limit = max(0.0, total_charge_limit - solar_charge_power)
+                shore_power_cost[t] = (
+                    shore_power[t] * float(self.itinerary.transits[p].power_cost)
+                )
 
-            shore_charge_power = min(
-                self.itinerary.transits[p].max_charge_power,
-                remaining_charge_limit,
-            )
-
-            solar_power[t] = solar_charge_power
-            shore_power[t] = shore_charge_power
-            shore_power_cost[t] = shore_charge_power * self.itinerary.transits[p].power_cost
-            battery_charge[t] = solar_charge_power + shore_charge_power
+                battery_charge[t] = solar_charge + shore_power[t]
+                battery_discharge[t] = 0.0
 
             SOC[t + 1] = (
                 soc_after_leak
+                - dt_h * battery_discharge[t] / discharge_eff
                 + dt_h * charge_eff * battery_charge[t]
             )
 
-        SOC = np.clip(SOC, 0.0, self.ship.battery.capacity)
+            # Do not hide real infeasibility. Only clean tiny numerical noise.
+            if abs(SOC[t + 1]) < 1e-9:
+                SOC[t + 1] = 0.0
+            if abs(SOC[t + 1] - capacity) < 1e-9:
+                SOC[t + 1] = capacity
 
-        return (
-            solar_power,
-            shore_power,
-            shore_power_cost,
-            battery_charge,
-            battery_discharge,
-            SOC,
-        )
+        return solar_power, shore_power, shore_power_cost, battery_charge, battery_discharge, SOC
 
 
 @dataclass

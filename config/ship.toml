@@ -113,12 +113,12 @@ wake_fraction   = 0.3
 # leak          : (/1)
 # ============================
 [battery]
-capacity        = 4
-max_charge_pow  = 1
-max_discharge_pow= 1
+capacity        = 10
+max_charge_pow  = 3
+max_discharge_pow= 3
 discharge_eff   = 0.95
 charge_eff      = 0.95
-leak            = 1.0
+leak            = 0.9995
 
 # ============================
 # SOLAR PANNELS

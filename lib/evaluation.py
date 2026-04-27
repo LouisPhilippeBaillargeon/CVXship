@@ -248,6 +248,8 @@ def compute_non_convex_cost_all_timesteps(runner, eps=1e-9, debug=False):
         total_gen_power = max(0.0, total_gen_power)
 
         gen_on_t = np.asarray(sol.gen_on[:, t], dtype=float)
+        if total_gen_power <= eps:
+            gen_on_t[:] = 0.0
         sched = np.asarray(sol.generation_power[:, t], dtype=float).copy()
         sched[gen_on_t <= 0.5] = 0.0
 
