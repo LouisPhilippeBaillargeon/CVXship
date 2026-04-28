@@ -360,7 +360,7 @@ def build_or_load_adjacency_matrix(n_zones=None, cache=True):
     """
     Return a (Z,Z) adjacency matrix Adj with 1 if transition z->z' is allowed.
     Zones are adjacent iff they share at least 2 corner_id values.
-    Diagonal is 1 (stay). CSV zones are 1-based; output is 0-based.
+    Diagonal is 1 (stay).
     """
     zones_csv  = ZONES
     cache_path = ADJ
@@ -381,13 +381,13 @@ def build_or_load_adjacency_matrix(n_zones=None, cache=True):
 
     df[["zone_id", "corner_id"]] = df[["zone_id", "corner_id"]].astype(int)
 
-    # Collect corners per zone_id (1-based in file)
+    # Collect corners per zone_id
     corners_per_zone = {
         zid: set(grp["corner_id"].to_list())
         for zid, grp in df.groupby("zone_id")
     }
 
-    # Determine Z (number of zones to output, 0-based indexing in code)
+    # Determine Z (number of zones to output)
     Z = n_zones if n_zones is not None else (max(corners_per_zone) if corners_per_zone else 0)
     adj = np.zeros((Z, Z), dtype=int)
     np.fill_diagonal(adj, 1)  # staying in same zone is allowed
@@ -398,7 +398,7 @@ def build_or_load_adjacency_matrix(n_zones=None, cache=True):
             if zid2 <= zid1:
                 continue
             if len(c1 & c2) >= 2:
-                i, j = zid1 - 1, zid2 - 1  # convert to 0-based
+                i, j = zid1, zid2
                 if i < Z and j < Z:
                     adj[i, j] = 1
                     adj[j, i] = 1

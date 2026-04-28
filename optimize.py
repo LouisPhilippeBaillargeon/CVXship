@@ -69,7 +69,7 @@ if __name__ == "__main__":
         calm_model.plot_calm_water_models_ieee(
             nb_points=200,
             fit_if_needed=True,
-            show=True,
+            show=False,
         )
 
         propulsion_model = PropulsionModel(
@@ -216,8 +216,8 @@ if __name__ == "__main__":
             if ok:
                 print("Optimization succeeded.")
                 n_all, fixed_path_sol, dt_h = compute_non_convex_cost_all_timesteps(optimizer, debug=False)
-                plot_solutions([optimizer.sol, fixed_path_sol],["Convex Fixed Path solution", "Non-convex Fixed Path solution"], show=True, subfolder="Fixed Path")
-                plot_solutions([fixed_path_sol, naive_solution],["Fixed Path Optimizer", "Naive Controller"], show = True, subfolder="All sol compared")
+                plot_solutions([optimizer.sol, fixed_path_sol],["Convex Fixed Path solution", "Non-convex Fixed Path solution"], show=False, subfolder="Fixed Path")
+                plot_solutions([fixed_path_sol, naive_solution],["Fixed Path Optimizer", "Naive Controller"], show = False, subfolder="All sol compared")
             else:
                 print("Optimization failed.")
        
@@ -244,8 +244,8 @@ if __name__ == "__main__":
             optimizer.optimize(debug=True)
             plot_zones_and_points(optimizer.sol.ship_pos, optimizer.map.zone_ineq)
             n_all, global_sol, dt_h = compute_non_convex_cost_all_timesteps(optimizer, debug=False)
-            plot_solutions([optimizer.sol, global_sol],["Convex Gloabal solution", "Non-convex Global solution"], show=True, subfolder="Global Path")
-            plot_solutions([global_sol, naive_solution],["Global Optimizer", "Naive Controller"], show = True, subfolder="All sol compared")
+            plot_solutions([optimizer.sol, global_sol],["Convex Gloabal solution", "Non-convex Global solution"], show=False, subfolder="Global Path")
+            plot_solutions([global_sol, naive_solution],["Global Optimizer", "Naive Controller"], show = False, subfolder="All sol compared")
 
     
     '''

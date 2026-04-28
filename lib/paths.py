@@ -6,15 +6,16 @@ CONFIG = ROOT / "config"
 
 SHIP = CONFIG / "ship.toml"
 ITINERARY = CONFIG / "itinerary.toml"
-
+MAP_TOML = CONFIG / "map.toml"
 
 CONFIG_MAP = CONFIG / "map"
+DEPTH_GRID = CONFIG_MAP / "depth_grid.csv"
+NAVIGABILITY_MAP = CONFIG_MAP / "navigability_map.npy"
 ZONES = CONFIG_MAP / "zones.csv"
 CORNERS = CONFIG_MAP / "corners.csv"
 ZONE_INEQ = CONFIG_MAP / "zones_ineq.npz"
 TRANSITION_INEQ = CONFIG_MAP / "transition_ineq.npz"
 ADJ = CONFIG_MAP / "zones_adj.npy"
-MAP_PARAMS = CONFIG_MAP / "map_params.csv"
 
 
 WEATHER = CONFIG / "weather"

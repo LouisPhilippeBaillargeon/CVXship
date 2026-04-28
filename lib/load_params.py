@@ -6,7 +6,7 @@ import tomllib
 import math
 
 from lib.utils import build_or_load_adjacency_matrix, dx_dy_km, point_in_zones
-from lib.paths import SHIP, MAP_PARAMS, ITINERARY, ZONE_INEQ, TRANSITION_INEQ
+from lib.paths import SHIP, MAP_TOML, ITINERARY, ZONE_INEQ, TRANSITION_INEQ, ADJ
 from lib.weather import weather_from_nc_file
 
 #===================================================SHIP======================================================================================
@@ -97,6 +97,7 @@ class ShipInfo:
     rho_air         : float
     g               : float
     vessel_no       : int
+    min_depth       : float
 
 @dataclass
 class Ship:
@@ -220,31 +221,30 @@ def _compute_zone_centroids(info: MapInfo, zone_ineq: np.ndarray) -> np.ndarray:
     return centroids
 
 def load_map() -> Map:
-    df = pd.read_csv(MAP_PARAMS)
-    row = df.iloc[0].to_dict()
-    info = MapInfo(**row)
+    with open(MAP_TOML, "rb") as f:
+        data = tomllib.load(f)
+
+    info = MapInfo(**data["params"])
 
     data = np.load(ZONE_INEQ)
-    key = "lambda_array" if "lambda_array" in data.files else data.files[0]
-    zone_ineq = data[key]
-    nb_zones  = zone_ineq.shape[2]
-    zone_adj = build_or_load_adjacency_matrix()
+    zone_ineq = data["lambda_array"]
+    nb_zones = zone_ineq.shape[2]
+
+    zone_adj = np.load(ADJ)
 
     data = np.load(TRANSITION_INEQ)
-    trans_from = data["transition_ineqs_from"]
-    trans_to   = data["transition_ineqs_to"]
-    trans_from = np.nan_to_num(trans_from, nan=0.0)
-    trans_to = np.nan_to_num(trans_to, nan=0.0)
+    trans_from = np.nan_to_num(data["transition_ineqs_from"], nan=0.0)
+    trans_to = np.nan_to_num(data["transition_ineqs_to"], nan=0.0)
+
     m = Map(
         info=info,
         zone_ineq=zone_ineq,
-        trans_ineq_from = trans_from,
-        trans_ineq_to = trans_to,
+        trans_ineq_from=trans_from,
+        trans_ineq_to=trans_to,
         zone_adj=zone_adj,
-        nb_zones = nb_zones,
+        nb_zones=nb_zones,
     )
     m.zone_centroids = _compute_zone_centroids(m.info, m.zone_ineq)
-
     return m
 
 
