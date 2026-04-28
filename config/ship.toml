@@ -19,34 +19,44 @@ vessel_no       = 4
 
 # ============================
 # HULL
-# B             : Beam_len (m)
-# L             : Length_total (m)
+# B             : Beam length (m)
+# L             : Total ship length (m)
 # LPP           : Length between perpendiculars (m)
-# CB            : Block coefficient
-# kyy           : Non-dimensional radius of gyration of pitch, % LPP
+# LWL           : Length at waterline (m)
+# CB            : Block coefficient (-)
+# CM            : Midship section coefficient (-)
+# CWP           : Waterplane area coefficient (-)
+# kyy           : Non-dimensional radius of gyration in pitch, as a fraction of LPP (-)
 # T             : Draught at midship (m)
-# TF            : Draught at F.P. (m)
-# TA            : Draught at A.P. (m)
-# E1            : Waterline angle (rad), See https://www.sciencedirect.com/science/article/pii/S0029801821013020
-# E1            : Waterline angle (rad), See https://www.sciencedirect.com/science/article/pii/S0029801821013020
-# AL_air        : Side above water projected area (m^2)
-# AF_air        : Front above water projected area (m^2)
-# AL_water      : Side bellow water projected area (m^2)
-# AF_water      : Front bellow water projected area (m^2)
-# sL            : xb coordinate of the centroid of ALw in the ship body reference frame
-# sH            : yb coordinates of the centroid of ALw in the ship body reference frame
-# CDt           : Coefficient for Blenderman wind computation, see https://github.com/cybergalactic/FossenHandbook chap 10
-# CDlAF_bow     : Coefficient for Blenderman wind computation, see https://github.com/cybergalactic/FossenHandbook chap 10
-# CDlAF_stern   : Coefficient for Blenderman wind computation, see https://github.com/cybergalactic/FossenHandbook chap 10
-# delta         : Coefficient for Blenderman wind computation, see https://github.com/cybergalactic/FossenHandbook chap 10
-# kappa         : Coefficient for Blenderman wind computation, see https://github.com/cybergalactic/FossenHandbook chap 10
-# CD_water_curve and CD_water_breakpoints : F_calm = 0.5*rho*A_front*CD(v)v^2
+# TF            : Draught at forward perpendicular (m)
+# TA            : Draught at aft perpendicular (m)
+# E1            : Waterline entrance angle (rad), see https://www.sciencedirect.com/science/article/pii/S0029801821013020
+# E2            : Additional hull angle parameter (rad), see same source as E1
+# AL_air        : Side projected area above water (m^2)
+# AF_air        : Front projected area above water (m^2)
+# AL_water      : Side projected area below water (m^2)
+# AF_water      : Front projected area below water (m^2)
+# total_wet_area: Wetted hull area (m^2)
+# sL            : xb coordinate of the centroid of AL_water in the ship body reference frame (m)
+# sH            : yb coordinate of the centroid of AL_water in the ship body reference frame (m)
+# CDt           : Blendermann wind coefficient
+# CDlAF_bow     : Blendermann wind coefficient
+# CDlAF_stern   : Blendermann wind coefficient
+# delta         : Blendermann wind coefficient
+# kappa         : Blendermann wind coefficient
+# AT            : Immersed transom area at rest (m^2), used by Holtrop
+# ABT           : Transverse bulb area at the still-water plane (m^2), used by Holtrop
+# h_B           : Vertical position of the center of ABT above keel (m), used by Holtrop
+# LCB_percent   : Longitudinal center of buoyancy forward of 0.5*LWL, as % of LWL, used by Holtrop
 # ============================
 [hull]
 B               = 25.4
 L               = 175.0
 LPP             = 175.0
+LWL             = 175.0
 CB              = 0.569
+CM              = 0.98
+CWP             = 0.8
 kyy             = 0.24
 T               = 9.5
 TF              = 9.5
@@ -65,18 +75,10 @@ CDlAF_bow       = 0.55
 CDlAF_stern     = 0.55
 delta           = 0.4
 kappa           = 1.4
-CT_water_breakpoints = [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
-CT_water_curve = [
-    0.0025,  # Fn = 0.10
-    0.0027,  # 0.15
-    0.0032,  # 0.20
-    0.0042,  # 0.25
-    0.0058,  # 0.30
-    0.0078,  # 0.35
-    0.0105,  # 0.40
-    0.0135,  # 0.45
-    0.0170   # 0.50
-]
+AT              = 0.0
+ABT             = 0.0
+h_B             = 0.0
+LCB_percent     = 0.0
 
 # ============================
 # PROPULSION
@@ -92,16 +94,15 @@ CT_water_curve = [
 # ============================
 [propulsion]
 D               = 7.2
-min_pitch       = 0
-max_pitch       = 10
+min_pitch       = 5.2
+max_pitch       = 5.2
 AE_AO           = 0.59
 nb_blades       = 6
 nb_propellers   = 2
 max_n           = 3.0
-min_pow         = 4.0
+min_pow         = 0.0
 max_pow         = 20.0
 wake_fraction   = 0.3
-
 # ============================
 # BATTERY
 # capacity      : (MWh)
@@ -112,13 +113,12 @@ wake_fraction   = 0.3
 # leak          : (/1)
 # ============================
 [battery]
-capacity        = 4
-max_charge_pow  = 1
-max_discharge_pow= 1
+capacity        = 10
+max_charge_pow  = 3
+max_discharge_pow= 3
 discharge_eff   = 0.95
 charge_eff      = 0.95
-leak            = 1.0
-
+leak            = 0.9995
 
 # ============================
 # SOLAR PANNELS
@@ -145,21 +145,28 @@ iddle_fuel      = 9.52
 
 [[generators]]
 name            = "Gen2"
-#power           = [0.28, 0.56, 1.4, 1.96, 2.08, 2.4, 2.8]
-power           = [0.28, 5.6, 14, 19.6, 20.8, 24, 28]
+power           = [0.28, 0.56, 1.4, 1.96, 2.08, 2.4, 2.8]
 eff             = [232, 215, 185, 180, 183, 185, 190]
 iddle_fuel      = 9.52
 
 [[generators]]
 name            = "Gen3"
-#power           = [0.28, 0.56, 1.4, 1.96, 2.08, 2.4, 2.8]
-power           = [0.28, 5.6, 14, 19.6, 20.8, 24, 28]
+power           = [0.28, 0.56, 1.4, 1.96, 2.08, 2.4, 2.8]
 eff             = [232, 215, 185, 180, 183, 185, 190]
 iddle_fuel      = 9.52
 
 [[generators]]
 name            = "Gen4"
-#power           = [0.28, 0.56, 1.4, 1.96, 2.08, 2.4, 2.8]
-power           = [0.28, 5.6, 14, 19.6, 20.8, 24, 28]
+power           = [0.28, 0.56, 1.4, 1.96, 2.08, 2.4, 2.8]
 eff             = [232, 215, 185, 180, 183, 185, 190]
 iddle_fuel      = 9.52
+# ============================
+# Fit range
+# ============================
+[fit_range]
+min_speed       = 9.0
+max_speed       = 11.0
+min_resistance  = 0.5
+max_resistance  = 1.0
+min_prop_power  = 8.0
+max_prop_power  = 12.0
