@@ -16,6 +16,7 @@ displacement    = 24009.38537
 rho_air         = 1.224
 g               = 9.81
 vessel_no       = 4
+min_depth       = 15.525
 
 # ============================
 # HULL

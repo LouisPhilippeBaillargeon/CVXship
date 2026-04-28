@@ -1402,8 +1402,7 @@ class ShortestPath:
             )
             return self.sol
 
-        zone_seq_idx = self._build_zone_sequence(init_zone, end_zone)   # 0-based indices
-        zone_seq = [z + 1 for z in zone_seq_idx]                        # CSV ids assumed 1-based
+        zone_seq_idx = self._build_zone_sequence(init_zone, end_zone)
 
         # Re-factor later if corners move into self.map
         corners_df = pd.read_csv(CORNERS)
@@ -1417,7 +1416,7 @@ class ShortestPath:
         zone_corner_ids = _ordered_zone_corner_ids(zone_corners_df)
         zone_edges = _zone_edges_from_corner_ids(zone_corner_ids)
 
-        portals = self._extract_portals(zone_seq, zone_edges, corner_xy, debug=debug)
+        portals = self._extract_portals(zone_seq_idx, zone_edges, corner_xy, debug=debug)
         n_portals = len(portals)
 
         if n_portals == 0:
@@ -1457,13 +1456,11 @@ class ShortestPath:
         total_distance = self._polyline_length(waypoints)
 
         if debug:
-            print(f"zone_seq = {zone_seq}")
+            print(f"zone_seq_idx = {zone_seq_idx}")
             print(f"n_portals = {n_portals}")
             print(f"lambda = {lam_val}")
             print(f"transition_points =\n{transition_points}")
             print(f"total_distance = {total_distance}")
-
-        zone_seq_idx = [z - 1 for z in zone_seq]  # 0-based indices
            
         self.sol = ShortestPathSolution(
             waypoints=waypoints,
