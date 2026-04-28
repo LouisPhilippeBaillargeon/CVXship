@@ -354,6 +354,7 @@ class States:
     soc                : float
     zone               : float
     current_heading    : float
+    current_d          : float = 0
 
 def load_states(map, itinerary) -> States:
     current_x_pos, current_y_pos, _ = dx_dy_km(map, itinerary.transits[0].lat, itinerary.transits[0].lon)

@@ -29,6 +29,7 @@ if __name__ == "__main__":
     #states.timesteps_completed = 15
     #states.current_x_pos = 200
     #states.current_y_pos = 400
+    #states.current_d = 123.4
 
     path = ShortestPath(
         map                 = map,
@@ -211,6 +212,9 @@ if __name__ == "__main__":
             ok = optimizer.optimize(
                 unit_commitment=False,
                 debug=True,
+                restrict_to_naive=True,
+                naive_solution=naive.sol,
+                naive_segment_radius=1,
             )
 
             if ok:
@@ -241,7 +245,12 @@ if __name__ == "__main__":
             #optimizer.states.zone = point_in_zones(init_pos, optimizer.map.zone_ineq)
             #x, y, _ = dx_dy_km(optimizer.map, optimizer.itinerary.transits[-1].lat, optimizer.itinerary.transits[-1].lon)
 
-            optimizer.optimize(debug=True)
+            optimizer.optimize(
+                debug=True,
+                restrict_to_naive=True,
+                naive_solution=naive.sol,
+                naive_zone_radius=1,
+            )
             plot_zones_and_points(optimizer.sol.ship_pos, optimizer.map.zone_ineq)
             n_all, global_sol, dt_h = compute_non_convex_cost_all_timesteps(optimizer, debug=False)
             plot_solutions([optimizer.sol, global_sol],["Convex Gloabal solution", "Non-convex Global solution"], show=False, subfolder="Global Path")

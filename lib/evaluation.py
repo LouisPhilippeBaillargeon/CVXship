@@ -1,5 +1,4 @@
 import numpy as np
-
 from lib.optimizers import Solution
 
 def compute_non_convex_cost_all_timesteps(runner, eps=1e-9, debug=False):
@@ -87,23 +86,12 @@ def compute_non_convex_cost_all_timesteps(runner, eps=1e-9, debug=False):
 
         segment_dirs = segment_vecs / segment_lengths[:, None]
         distance_breaks = np.concatenate([[0.0], np.cumsum(segment_lengths)])
-
-        # Convert path_distance to the same origin as distance_breaks.
-        d0 = float(path_distance[0])
-        path_distance_local = path_distance - d0
-
         speed_mag_cmd = np.linalg.norm(V_cmd, axis=1)
 
         for t in range(T):
-            if not bool(sol.instant_sail[t]):
-                ship_speed_eval[t, :] = 0.0
-                continue
-
-            #d_mid = 0.5 * (path_distance_local[t] + path_distance_local[t + 1])
-            d_ref = path_distance_local[t]
+            d_ref = path_distance[t]
             s = np.searchsorted(distance_breaks, d_ref, side="right") - 1
             s = int(np.clip(s, 0, len(segment_dirs) - 1))
-
             ship_speed_eval[t, :] = speed_mag_cmd[t] * segment_dirs[s, :]
 
     elif path_distance is not None and waypoints is None:

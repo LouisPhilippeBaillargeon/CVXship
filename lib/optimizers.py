@@ -87,6 +87,38 @@ def _zone_edges_from_corner_ids(zone_corner_ids: Dict[int, List[int]]) -> Dict[i
         zone_edges[zone_id] = edges
     return zone_edges
 
+def _one_hot_window_from_indices(indices: np.ndarray, nb_choices: int, radius: int = 1) -> np.ndarray:
+    """
+    Returns mask[t, i] = 1 if choice i is allowed at time t.
+    Allowed choices are index[t] +/- radius.
+    """
+    indices = np.asarray(indices, dtype=int).reshape(-1)
+    mask = np.zeros((len(indices), nb_choices), dtype=float)
+
+    for t, idx in enumerate(indices):
+        lo = max(0, idx - radius)
+        hi = min(nb_choices - 1, idx + radius)
+        mask[t, lo:hi + 1] = 1.0
+
+    return mask
+
+
+def _indices_from_one_hot(x: np.ndarray) -> np.ndarray:
+    """
+    Converts zone/seg matrix [T, nb_choices] to selected indices [T].
+    Robust to small numerical noise.
+    """
+    return np.argmax(np.asarray(x), axis=1)
+
+
+def _segment_indices_from_distance(D_breaks: np.ndarray, d_values: np.ndarray) -> np.ndarray:
+    """
+    Converts path distances to segment indices.
+    """
+    d_values = np.asarray(d_values, dtype=float).reshape(-1)
+    s = np.searchsorted(D_breaks, d_values, side="right") - 1
+    return np.clip(s, 0, len(D_breaks) - 2).astype(int)
+
 
 @dataclass
 class GlobalOptimizer:
@@ -114,8 +146,10 @@ class GlobalOptimizer:
         debug = False,
         max_transitions = False, #if true the problem can only make up to nb_zone transitions. Makes computation faster.
         ordered_zones = False, #if true, the ship can only go from zone z+1 to zone z.
-        warm_start = False,
         min_timestep = False,
+        restrict_to_naive=False,
+        naive_solution=None,
+        naive_zone_radius=1,
     ):
         
         constraints = []
@@ -277,6 +311,33 @@ class GlobalOptimizer:
                 min_dist_by_id = _compute_min_crossing_distance_per_zone(CORNERS, ZONES)
                 print("Minimum crossing distance per zone [km]:", min_dist_by_id)
                 print("Minimum crossing timesteps per zone:", min_zone_steps_by_id)
+        
+        # ========================================== RESTRICT TO NAIVE +/- R ZONES ==========================================
+        if restrict_to_naive:
+            if naive_solution is None:
+                raise ValueError("restrict_to_naive=True requires naive_solution.")
+
+            naive_zone_idx = _indices_from_one_hot(naive_solution.zone)
+
+            if len(naive_zone_idx) != T_future + 1:
+                raise ValueError(
+                    f"naive_solution.zone has length {len(naive_zone_idx)}, "
+                    f"but expected {T_future + 1}."
+                )
+
+            allowed_zone_mask = _one_hot_window_from_indices(
+                naive_zone_idx,
+                nb_choices=self.map.nb_zones,
+                radius=naive_zone_radius,
+            )
+
+            for t in range(T_future + 1):
+                for z in range(self.map.nb_zones):
+                    if allowed_zone_mask[t, z] < 0.5:
+                        constraints += [zone[t, z] == 0]
+
+            if debug:
+                print(f"Restricted GlobalOptimizer zones to naive +/- {naive_zone_radius}.")
 
         #=================================================EARTH-FIXED SPEED=================================================
         speed_mag = cp.Variable(T_future)
@@ -558,9 +619,16 @@ class Fixed_Path_Optimizer:
 
     sol: Optional[Solution] = field(default=None, init=False)
 
+    def segment_from_distance(D_breaks, d_abs):
+        s = np.searchsorted(D_breaks, d_abs, side="right") - 1
+        return int(np.clip(s, 0, len(D_breaks) - 2))
+
     def optimize(self,
         unit_commitment = False,
         debug = False,
+        restrict_to_naive=False,
+        naive_solution=None,
+        naive_segment_radius=1,
     ):
         
         constraints = []
@@ -600,10 +668,33 @@ class Fixed_Path_Optimizer:
         D_breaks = np.concatenate(([0.0], np.cumsum(segment_lengths)))   # shape (N_seg+1,)
         total_path_length = float(D_breaks[-1])
 
+        # ====================================== NAIVE SEGMENT REFERENCE ======================================
+        naive_seg_idx = None
+        if restrict_to_naive:
+            if naive_solution is None:
+                raise ValueError("restrict_to_naive=True requires naive_solution.")
+            if naive_solution.path_distance is None:
+                raise ValueError("Fixed path restriction requires naive_solution.path_distance.")
+
+            naive_seg_idx = _segment_indices_from_distance(
+                D_breaks,
+                naive_solution.path_distance,
+            )
+
+            if len(naive_seg_idx) != T_future + 1:
+                raise ValueError(
+                    f"naive_solution.path_distance has length {len(naive_seg_idx)}, "
+                    f"but expected {T_future + 1}."
+                )
+
         #==================================================ITTINERARY==================================================
         d = cp.Variable(T_future+1, nonneg=True)
         #initial position
-        constraints += [d[0] == 0]
+        d0 = float(getattr(self.states, "current_d", 0.0))
+        constraints += [d[0] == d0]
+        constraints += [d >= d0]
+        constraints += [d <= total_path_length]
+        constraints += [d[-1] == total_path_length]
 
         for t in range(T_future+1):
             if(instant_sail[t]==0):
@@ -632,6 +723,22 @@ class Fixed_Path_Optimizer:
             constraints += [d[t] <= upper_expr]
         
         constraints += [d[1:] >= d[:-1]]
+
+        # ========================================== RESTRICT TO NAIVE +/- R SEGMENTS ==========================================
+        if restrict_to_naive:
+            allowed_seg_mask = _one_hot_window_from_indices(
+                naive_seg_idx,
+                nb_choices=nb_path_zones,
+                radius=naive_segment_radius,
+            )
+
+            for t in range(T_future + 1):
+                for s in range(nb_path_zones):
+                    if allowed_seg_mask[t, s] < 0.5:
+                        constraints += [seg[t, s] == 0]
+
+            if debug:
+                print(f"Restricted Fixed_Path_Optimizer segments to naive +/- {naive_segment_radius}.")
 
 
         #=================================================EARTH-FIXED SPEED=================================================
