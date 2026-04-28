@@ -1484,7 +1484,6 @@ class WaveModel2D(BaseWaveModel):
         mean_wave_frequency, # [nb_zones, nb_timestep]
         mean_wave_length, # [nb_zones, nb_timestep]
         mean_wave_direction, # [nb_zones, nb_timestep]
-        fit_range,
     ):
         nb_zones                = mean_wave_amplitudes.shape[0]
         nb_timesteps            = mean_wave_amplitudes.shape[1]

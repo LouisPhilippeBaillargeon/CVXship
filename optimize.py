@@ -14,7 +14,7 @@ from lib.evaluation import compute_non_convex_cost_all_timesteps
 new_weather = False
 new_ship = False
 see_previous_sol = False
-dimensions = "1D"  # "1D", "2D" or "both"
+dimensions = "both"  # "1D", "2D" or "both"
 
 if __name__ == "__main__":
     
@@ -102,19 +102,20 @@ if __name__ == "__main__":
 
     if new_weather:
         start = time.time()
-        wind_model_path_2D = WindModelPathAligned2D(ship, fit_range)
-        wind_model_path_2D.fit_convex_models(
+        if dimensions == "1D" or dimensions == "both":
+            wind_model_1D = WindModelPathAligned2D(ship, fit_range)
+            wind_model_1D.fit_convex_models(
             wind_x_path,
             wind_y_path,
             course_angles_path,
             nb_parallel_steps=40,
             nb_perp_steps=9,
             conservative=False,
-        )
-        print("average max error wind path-aligned 2D", np.mean(wind_model_path_2D.relative_errors), "MN")
+            )
+            print("average max error wind 1D", np.mean(wind_model_1D.relative_errors) , "%")
 
-        wave_model_path_2D = WaveModelPathAligned2D(ship=ship, fit_range=fit_range)
-        wave_model_path_2D.fit_convex_models(
+            wave_model_1D = WaveModelPathAligned2D(ship = ship,fit_range = fit_range)
+            wave_model_1D.fit_convex_models(
             wave_amp_path,
             wave_freq_path,
             wave_len_path,
@@ -123,23 +124,11 @@ if __name__ == "__main__":
             nb_parallel_steps=40,
             nb_perp_steps=9,
             conservative=False,
-        )
-        print("average max error wave path-aligned 2D", np.mean(wave_model_path_2D.relative_errors), "MN")
-
-        save_obj(WAVE_MODEL_PATH_ALIGNED_2D, wave_model_path_2D)
-        save_obj(WIND_MODEL_PATH_ALIGNED_2D, wind_model_path_2D)
-        '''
-        if dimensions == "1D" or dimensions == "both":
-            wind_model_1D = WindModel1D(ship, fit_range)
-            wind_model_1D.fit_convex_models(weather.wind_x, weather.wind_y, course_angles)
-            print("average max error wind 1D", np.mean(wind_model_1D.relative_errors) , "%")
-
-            wave_model_1D = WaveModel1D(ship = ship,fit_range = fit_range)
-            wave_model_1D.fit_convex_models(weather.mean_wave_amplitude,weather.mean_wave_frequency,weather.mean_wave_length,weather.mean_wave_direction, course_angles)
+            )
             print("average max error wave 1D", np.mean(wave_model_1D.relative_errors) , "%")
 
-            save_obj(WAVE_MODEL_1D, wave_model_1D)
-            save_obj(WIND_MODEL_1D, wind_model_1D)
+            save_obj(WAVE_MODEL_PATH_ALIGNED_2D, wave_model_1D)
+            save_obj(WIND_MODEL_PATH_ALIGNED_2D, wind_model_1D)
 
         if dimensions == "2D" or dimensions == "both":
             wind_model_2D = WindModel2D(ship, fit_range)
@@ -155,17 +144,15 @@ if __name__ == "__main__":
 
             save_obj(WAVE_MODEL_2D, wave_model_2D)
             save_obj(WIND_MODEL_2D, wind_model_2D)
-        '''
+  
 
         end = time.time()
         print("Weather model fit took :", end - start, "seconds")
 
     else:
-        wind_model_path_2D = load_obj(WIND_MODEL_PATH_ALIGNED_2D)
-        wave_model_path_2D = load_obj(WAVE_MODEL_PATH_ALIGNED_2D)
         if dimensions == "1D" or dimensions == "both":
-            wave_model_1D = load_obj(WAVE_MODEL_1D)
-            wind_model_1D = load_obj(WIND_MODEL_1D)
+            wave_model_1D = load_obj(WAVE_MODEL_PATH_ALIGNED_2D)
+            wind_model_1D = load_obj(WIND_MODEL_PATH_ALIGNED_2D)
         if dimensions == "2D" or dimensions == "both":
             wave_model_2D = load_obj(WAVE_MODEL_2D)
             wind_model_2D = load_obj(WIND_MODEL_2D)
@@ -181,7 +168,6 @@ if __name__ == "__main__":
         plot_solutions(solutions)
 
     else:
-        
         print("calm water coeffs", calm_model.res_coeffs)
         if path.sol is None:
             raise RuntimeError("ShortestPath did not produce a solution.")
@@ -207,8 +193,8 @@ if __name__ == "__main__":
 
         if dimensions == "1D" or dimensions == "both":
             optimizer = Fixed_Path_Optimizer(
-                wave_model=wave_model_path_2D,
-                wind_model=wind_model_path_2D,
+                wave_model=wave_model_1D,
+                wind_model=wind_model_1D,
                 propulsion_model=propulsion_model,
                 calm_model=calm_model,
                 generator_models=generatorModels,
