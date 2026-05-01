@@ -7,14 +7,14 @@ from lib.models import PropulsionModel, BaseWaveModel, WaveModel1D, WaveModel2D,
 from lib.paths import WIND_MODEL_1D, WIND_MODEL_2D, WIND_MODEL_PATH_ALIGNED_2D, WAVE_MODEL_1D, WAVE_MODEL_2D, WAVE_MODEL_PATH_ALIGNED_2D, PROPULSION_MODEL, GENERATOR_MODEL, CALM_MODEL
 from lib.plotting import plot_solutions, plot_zones_and_points, load_solutions_from_pkl
 from lib.optimizers import GlobalOptimizer, NaiveController, Fixed_Path_Optimizer, ShortestPath
-from lib.utils import point_in_zones, dx_dy_km, classify_timesteps, _assert_finite
+from lib.utils import point_in_zones, dx_dy_km, classify_timesteps, _assert_finite, xy_from_path_distance
 from lib.evaluation import compute_non_convex_cost_all_timesteps
 
 
 new_weather = False
 new_ship = False
 see_previous_sol = False
-dimensions = "both"  # "1D", "2D" or "both"
+dimensions = "2D"  # "1D", "2D" or "both"
 
 if __name__ == "__main__":
     
@@ -26,11 +26,6 @@ if __name__ == "__main__":
 
     x, y, _ = dx_dy_km(map, itinerary.transits[-1].lat, itinerary.transits[-1].lon)
 
-    #states.timesteps_completed = 15
-    #states.current_x_pos = 200
-    #states.current_y_pos = 400
-    #states.current_d = 123.4
-
     path = ShortestPath(
         map                 = map,
         itinerary           = itinerary,
@@ -38,18 +33,13 @@ if __name__ == "__main__":
         weather             = weather,
         ship                = ship,)
     path.compute([x,y])
-    course_angles = path.compute_course_angles()                     # shape (nb_zones,)
+
+    course_angles = path.compute_course_angles()
     course_angles = np.repeat(course_angles[:, None], weather.wind_x.shape[1], axis=1)
+    path_zone_ids = np.asarray(path.sol.zone_sequence, dtype=int)
 
     base_wind_model = BaseWindModel(ship, fit_range)
     base_wave_model = BaseWaveModel(ship, fit_range)
-
-    path_zone_ids = np.asarray(path.sol.zone_sequence, dtype=int)
-
-    segment_vecs = np.asarray(path.sol.waypoints[1:], dtype=float) - np.asarray(path.sol.waypoints[:-1], dtype=float)
-    theta_seg = np.arctan2(segment_vecs[:, 1], segment_vecs[:, 0])
-
-    course_angles_path = np.repeat(theta_seg[:, None], weather.wind_x.shape[1], axis=1)
 
     wind_x_path = weather.wind_x[path_zone_ids, :]
     wind_y_path = weather.wind_y[path_zone_ids, :]
@@ -66,11 +56,11 @@ if __name__ == "__main__":
             print(gen.fit_convex_model(debug=True))
             generatorModels.append(gen)
         
-        calm_model = CalmWaterModel(ship = ship)
+        calm_model = CalmWaterModel(ship = ship, fit_range = fit_range)
         calm_model.plot_calm_water_models_ieee(
             nb_points=200,
             fit_if_needed=True,
-            show=False,
+            show=True,
         )
 
         propulsion_model = PropulsionModel(
@@ -104,32 +94,26 @@ if __name__ == "__main__":
     if new_weather:
         start = time.time()
         if dimensions == "1D" or dimensions == "both":
-            wind_model_1D = WindModelPathAligned2D(ship, fit_range)
+            wind_model_1D = WindModel1D(ship, fit_range)
             wind_model_1D.fit_convex_models(
             wind_x_path,
             wind_y_path,
-            course_angles_path,
-            nb_parallel_steps=40,
-            nb_perp_steps=9,
-            conservative=False,
+            course_angles,
             )
             print("average max error wind 1D", np.mean(wind_model_1D.relative_errors) , "%")
 
-            wave_model_1D = WaveModelPathAligned2D(ship = ship,fit_range = fit_range)
+            wave_model_1D = WaveModel1D(ship = ship,fit_range = fit_range)
             wave_model_1D.fit_convex_models(
             wave_amp_path,
             wave_freq_path,
             wave_len_path,
             wave_dir_path,
-            course_angles_path,
-            nb_parallel_steps=40,
-            nb_perp_steps=9,
-            conservative=False,
+            course_angles,
             )
             print("average max error wave 1D", np.mean(wave_model_1D.relative_errors) , "%")
 
-            save_obj(WAVE_MODEL_PATH_ALIGNED_2D, wave_model_1D)
-            save_obj(WIND_MODEL_PATH_ALIGNED_2D, wind_model_1D)
+            save_obj(WAVE_MODEL_1D, wave_model_1D)
+            save_obj(WIND_MODEL_1D, wind_model_1D)
 
         if dimensions == "2D" or dimensions == "both":
             wind_model_2D = WindModel2D(ship, fit_range)
@@ -152,8 +136,8 @@ if __name__ == "__main__":
 
     else:
         if dimensions == "1D" or dimensions == "both":
-            wave_model_1D = load_obj(WAVE_MODEL_PATH_ALIGNED_2D)
-            wind_model_1D = load_obj(WIND_MODEL_PATH_ALIGNED_2D)
+            wave_model_1D = load_obj(WAVE_MODEL_1D)
+            wind_model_1D = load_obj(WIND_MODEL_1D)
         if dimensions == "2D" or dimensions == "both":
             wave_model_2D = load_obj(WAVE_MODEL_2D)
             wind_model_2D = load_obj(WIND_MODEL_2D)
@@ -212,6 +196,7 @@ if __name__ == "__main__":
             ok = optimizer.optimize(
                 unit_commitment=False,
                 debug=True,
+                max_transitions = True,
                 restrict_to_naive=True,
                 naive_solution=naive.sol,
                 naive_segment_radius=1,
@@ -220,8 +205,8 @@ if __name__ == "__main__":
             if ok:
                 print("Optimization succeeded.")
                 n_all, fixed_path_sol, dt_h = compute_non_convex_cost_all_timesteps(optimizer, debug=False)
-                plot_solutions([optimizer.sol, fixed_path_sol],["Convex Fixed Path solution", "Non-convex Fixed Path solution"], show=False, subfolder="Fixed Path")
-                plot_solutions([fixed_path_sol, naive_solution],["Fixed Path Optimizer", "Naive Controller"], show = False, subfolder="All sol compared")
+                plot_solutions([optimizer.sol, fixed_path_sol],["Convex Fixed Path solution", "Non-convex Fixed Path solution"], show=True, subfolder="Fixed Path")
+                plot_solutions([fixed_path_sol, naive_solution],["Fixed Path Optimizer", "Naive Controller"], show = True, subfolder="All sol compared")
             else:
                 print("Optimization failed.")
        
@@ -242,8 +227,8 @@ if __name__ == "__main__":
 
             # Plot current position and destination
             init_pos = np.array([optimizer.states.current_x_pos, optimizer.states.current_y_pos])
-            #optimizer.states.zone = point_in_zones(init_pos, optimizer.map.zone_ineq)
-            #x, y, _ = dx_dy_km(optimizer.map, optimizer.itinerary.transits[-1].lat, optimizer.itinerary.transits[-1].lon)
+            optimizer.states.zone = point_in_zones(init_pos, optimizer.map.zone_ineq)
+            x, y, _ = dx_dy_km(optimizer.map, optimizer.itinerary.transits[-1].lat, optimizer.itinerary.transits[-1].lon)
 
             optimizer.optimize(
                 debug=True,
@@ -253,8 +238,8 @@ if __name__ == "__main__":
             )
             plot_zones_and_points(optimizer.sol.ship_pos, optimizer.map.zone_ineq)
             n_all, global_sol, dt_h = compute_non_convex_cost_all_timesteps(optimizer, debug=False)
-            plot_solutions([optimizer.sol, global_sol],["Convex Gloabal solution", "Non-convex Global solution"], show=False, subfolder="Global Path")
-            plot_solutions([global_sol, naive_solution],["Global Optimizer", "Naive Controller"], show = False, subfolder="All sol compared")
+            plot_solutions([optimizer.sol, global_sol],["Convex Gloabal solution", "Non-convex Global solution"], show=True, subfolder="Global Path")
+            plot_solutions([global_sol, naive_solution],["Global Optimizer", "Naive Controller"], show = True, subfolder="All sol compared")
 
     
     '''

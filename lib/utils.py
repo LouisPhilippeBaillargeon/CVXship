@@ -17,6 +17,27 @@ def _assert_finite(name, arr):
     if not np.isfinite(arr).all():
         bad = np.argwhere(~np.isfinite(arr))
         raise ValueError(f"{name} has non-finite entries; first bad index: {bad[0]} value={arr[tuple(bad[0])]}")
+    
+def xy_from_path_distance(waypoints, d_abs):
+    waypoints = np.asarray(waypoints, dtype=float)
+
+    seg_vecs = waypoints[1:] - waypoints[:-1]
+    seg_lens = np.linalg.norm(seg_vecs, axis=1)
+
+    if np.any(seg_lens <= 0):
+        raise ValueError("Consecutive waypoints must be distinct.")
+
+    D_breaks = np.concatenate(([0.0], np.cumsum(seg_lens)))
+    d_abs = float(np.clip(d_abs, 0.0, D_breaks[-1]))
+
+    if d_abs >= D_breaks[-1]:
+        return waypoints[-1].copy()
+
+    s = np.searchsorted(D_breaks, d_abs, side="right") - 1
+    s = int(np.clip(s, 0, len(seg_lens) - 1))
+
+    alpha = (d_abs - D_breaks[s]) / seg_lens[s]
+    return waypoints[s] + alpha * seg_vecs[s]
 
 def _compute_tight_big_M_zone(map_obj, zone_ineq, safety_margin=1.0):
     """

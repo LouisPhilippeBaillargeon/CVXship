@@ -207,13 +207,14 @@ def compute_non_convex_cost_all_timesteps(runner, eps=1e-9, debug=False):
             )
 
             ua = (1.0 - ship.propulsion.wake_fraction) * Vs
-
-            prop_power[t], n, feasible, best_pitch = propulsion_model.compute_power_from_ua_res(
+            res_per_prop = total_resistance[t] / ship.propulsion.nb_propellers
+            p_per_prop, n, feasible, best_pitch = propulsion_model.compute_power_from_ua_res(
                 ua,
-                total_resistance[t],
+                res_per_prop,
                 eval_infeasible=True,
                 debug=debug,
             )
+            prop_power[t] = ship.propulsion.nb_propellers * p_per_prop
 
             n_all[t] = float(n)
 
