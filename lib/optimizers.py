@@ -598,8 +598,8 @@ class GlobalOptimizer:
 class Fixed_Path_Optimizer:
     # Left point indexing
     # Convex non-linear least-squares models
-    wave_model          : WaveModelPathAligned2D
-    wind_model          : WindModelPathAligned2D
+    wave_model          : WaveModel1D
+    wind_model          : WindModel1D
     propulsion_model    : PropulsionModel
     calm_model          : CalmWaterModel
     generator_models    : List[GeneratorModel]
@@ -821,13 +821,15 @@ class Fixed_Path_Optimizer:
         normalized_speed = cp.Variable(T_future, nonneg=True)
         constraints += [normalized_rel_speed == speed_rel_water_mag/self.ship.info.max_speed]
         constraints += [normalized_speed == speed_mag/self.ship.info.max_speed]
-        normalized_vx = ship_speed[:, 0] / self.ship.info.max_speed
-        normalized_vy = ship_speed[:, 1] / self.ship.info.max_speed
-        normalized_rel_vx = speed_rel_water[:, 0] / self.ship.info.max_speed
-        normalized_rel_vy = speed_rel_water[:, 1] / self.ship.info.max_speed
+        #normalized_vx = ship_speed[:, 0] / self.ship.info.max_speed
+        #normalized_vy = ship_speed[:, 1] / self.ship.info.max_speed
+        #normalized_rel_vx = speed_rel_water[:, 0] / self.ship.info.max_speed
+        #normalized_rel_vy = speed_rel_water[:, 1] / self.ship.info.max_speed
 
         wind_model_future = self.wind_model.thrust_coeffs[:, self.states.timesteps_completed : self.states.timesteps_completed + T_future, :]
         wave_model_future = self.wave_model.thrust_coeffs[:, self.states.timesteps_completed : self.states.timesteps_completed + T_future, :]
+        #wind_model_future = self.wind_model.thrust_coeffs[path_zone_ids, self.states.timesteps_completed : self.states.timesteps_completed + T_future, :]
+        #wave_model_future = self.wave_model.thrust_coeffs[path_zone_ids, self.states.timesteps_completed : self.states.timesteps_completed + T_future, :]
         #wind_max_res_future = self.wind_model.max_convex_resistance[path_zone_ids, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
         #wave_max_res_future = self.wave_model.max_convex_resistance[path_zone_ids, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
 
@@ -840,16 +842,10 @@ class Fixed_Path_Optimizer:
                     c = wind_model_future[z, t, :]
                     wind_fit_expr = (
                         c[0]
-                        + c[1]  * normalized_vx[t]
-                        + c[2]  * cp.square(normalized_vx[t])
-                        + c[3]  * cp.power(normalized_vx[t], 4)
-                        + c[4]  * normalized_vy[t]
-                        + c[5]  * cp.square(normalized_vy[t])
-                        + c[6]  * cp.power(normalized_vy[t], 4)
-                        + c[7]  * normalized_speed[t]
-                        + c[8]  * cp.square(normalized_speed[t])
-                        + c[9]  * cp.power(normalized_speed[t], 3)
-                        + c[10] * cp.power(normalized_speed[t], 4)
+                        + c[1] * normalized_speed[t]
+                        + c[2] * cp.square(normalized_speed[t])
+                        + c[3] * cp.power(normalized_speed[t], 3)
+                        + c[4] * cp.power(normalized_speed[t], 4)
                     )
                     constraints += [
                         wind_resistance[t] >= wind_fit_expr - WIND_BIG_M * (1 - seg[t, z])
@@ -857,16 +853,10 @@ class Fixed_Path_Optimizer:
                     c = wave_model_future[z, t, :]
                     wave_fit_expr = (
                         c[0]
-                        + c[1]  * normalized_rel_vx[t]
-                        + c[2]  * cp.square(normalized_rel_vx[t])
-                        + c[3]  * cp.power(normalized_rel_vx[t], 4)
-                        + c[4]  * normalized_rel_vy[t]
-                        + c[5]  * cp.square(normalized_rel_vy[t])
-                        + c[6]  * cp.power(normalized_rel_vy[t], 4)
-                        + c[7]  * normalized_rel_speed[t]
-                        + c[8]  * cp.square(normalized_rel_speed[t])
-                        + c[9]  * cp.power(normalized_rel_speed[t], 3)
-                        + c[10] * cp.power(normalized_rel_speed[t], 4)
+                        + c[1] * normalized_rel_speed[t]
+                        + c[2] * cp.square(normalized_rel_speed[t])
+                        + c[3] * cp.power(normalized_rel_speed[t], 3)
+                        + c[4] * cp.power(normalized_rel_speed[t], 4)
                     )
                     constraints += [
                         wave_resistance[t] >= wave_fit_expr - WAVE_BIG_M * (1 - seg[t, z])

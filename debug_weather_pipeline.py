@@ -26,8 +26,8 @@ from lib.evaluation import compute_non_convex_cost_all_timesteps
 #   "1d"
 #   "path_aligned_2d"
 # ============================================================
-WIND_MODEL_TO_TEST = "path_aligned_2d"
-WAVE_MODEL_TO_TEST = "path_aligned_2d"
+WIND_MODEL_TO_TEST = "1d"
+WAVE_MODEL_TO_TEST = "1d"
 
 OUT_DIR = os.path.join(PLOTS, f"debug_weather_pipeline_{WIND_MODEL_TO_TEST}")
 os.makedirs(OUT_DIR, exist_ok=True)

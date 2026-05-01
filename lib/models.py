@@ -311,7 +311,7 @@ class CalmWaterModel:
     "Uses Moland et al. 2017 model F = 0.5*rho*A_hull*C(v')v'^2. C(v') is evaluated at expected nominal speed in the convex optimizer and computed exactly in the evaluator."
     "C = (1+k)C_F + delta C_F + C_W"
     ship: Ship
-    fit_range : Optional[FitRange] = field(default=None, init=False) #A good fit is often possible over 1 m/s to max speed, so its often preferable to not give a fit range and fit over all possible speed values above 1m/s
+    fit_range : Optional[FitRange] = field(default=None) #A good fit is often possible over 1 m/s to max speed, so its often preferable to not give a fit range and fit over all possible speed values above 1m/s
     fitted_Cx : Optional[float] = field(default=None, init=False)
     res_coeffs: Optional[np.ndarray] = field(default=None, init=False)
     
@@ -359,7 +359,7 @@ class CalmWaterModel:
     def fit_constant_C(self, nb_points: int = 100) -> float:
         """
         Fit a constant calm-water resistance coefficient self.fitted_Cx over the
-        speed range [fit_range.min_speed, fit_range.max_speed] by least squares. Use 1m/s to max speed if fit tange was not provided
+        speed range [fit_range.min_speed, fit_range.max_speed] by least squares. Use 1m/s to max speed if fit range was not provided
 
         The fitted model is:
             F_calm(v) ≈ 0.5 * rho_water * A_hull * fitted_Cx * v^2
