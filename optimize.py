@@ -6,15 +6,15 @@ from lib.load_params import load_config
 from lib.models import PropulsionModel, BaseWaveModel, WaveModel1D, WaveModel2D, WaveModelPathAligned2D, BaseWindModel, WindModel1D, WindModel2D, WindModelPathAligned2D, GeneratorModel, CalmWaterModel, save_obj, load_obj
 from lib.paths import WIND_MODEL_1D, WIND_MODEL_2D, WIND_MODEL_PATH_ALIGNED_2D, WAVE_MODEL_1D, WAVE_MODEL_2D, WAVE_MODEL_PATH_ALIGNED_2D, PROPULSION_MODEL, GENERATOR_MODEL, CALM_MODEL
 from lib.plotting import plot_solutions, plot_zones_and_points, load_solutions_from_pkl
-from lib.optimizers import GlobalOptimizer, NaiveController, Fixed_Path_Optimizer, ShortestPath
+from lib.optimizers import GlobalOptimizer, NaiveController, Fixed_Path_Optimizer, ShortestPath, GlobalOptimizerInteger
 from lib.utils import point_in_zones, dx_dy_km, classify_timesteps, _assert_finite, xy_from_path_distance
 from lib.evaluation import compute_non_convex_cost_all_timesteps
 
 
-new_weather = True
-new_ship = True
+new_weather = False
+new_ship = False
 see_previous_sol = False
-dimensions = "both"  # "1D", "2D" or "both"
+dimensions = "2D"  # "1D", "2D" or "both"
 
 if __name__ == "__main__":
     
@@ -212,7 +212,7 @@ if __name__ == "__main__":
        
         
         if dimensions == "2D" or dimensions == "both":
-            optimizer = GlobalOptimizer(
+            optimizer = GlobalOptimizerInteger(
                 wave_model          = wave_model_2D,
                 wind_model          = wind_model_2D,
                 propulsion_model    = propulsion_model,
@@ -232,9 +232,6 @@ if __name__ == "__main__":
 
             optimizer.optimize(
                 debug=True,
-                restrict_to_naive=True,
-                naive_solution=naive.sol,
-                naive_zone_radius=1,
             )
             plot_zones_and_points(optimizer.sol.ship_pos, optimizer.map.zone_ineq)
             n_all, global_sol, dt_h = compute_non_convex_cost_all_timesteps(optimizer, debug=False)
