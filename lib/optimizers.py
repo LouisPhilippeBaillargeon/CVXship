@@ -592,7 +592,7 @@ class GlobalOptimizer:
         else:
             print(f"Optimization status: {problem.status}")
             return 0
-        
+
 
 @dataclass
 class Fixed_Path_Optimizer:

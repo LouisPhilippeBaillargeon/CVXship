@@ -11,10 +11,10 @@ from lib.utils import point_in_zones, dx_dy_km, classify_timesteps, _assert_fini
 from lib.evaluation import compute_non_convex_cost_all_timesteps
 
 
-new_weather = False
-new_ship = False
+new_weather = True
+new_ship = True
 see_previous_sol = False
-dimensions = "2D"  # "1D", "2D" or "both"
+dimensions = "both"  # "1D", "2D" or "both"
 
 if __name__ == "__main__":
     
