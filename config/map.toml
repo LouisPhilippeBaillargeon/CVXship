@@ -1,0 +1,6 @@
+[params]
+sw_lat = 43.5
+sw_lon = -64
+span_km_east = 500
+span_km_north = 500
+resolution_km = 1.0

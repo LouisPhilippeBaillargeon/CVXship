@@ -6,7 +6,7 @@ import tomllib
 import math
 
 from lib.utils import build_or_load_adjacency_matrix, dx_dy_km, point_in_zones
-from lib.paths import SHIP, MAP_PARAMS, ITINERARY, ZONE_INEQ, TRANSITION_INEQ
+from lib.paths import SHIP, MAP_TOML, ITINERARY, ZONE_INEQ, TRANSITION_INEQ, ADJ
 from lib.weather import weather_from_nc_file
 
 #===================================================SHIP======================================================================================
@@ -25,30 +25,43 @@ class Propulsion:
 
 @dataclass
 class Hull:
-    B               : float # Beam_len (m)
-    L               : float # Length_total (m)
-    LPP             : float # Length between perpendiculars (m)
-    CB              : float # Block coefficient
-    kyy             : float # Non-dimensional radius of gyration of pitch, % LPP
-    T               : float # Draught at midship (m) 
-    TF              : float # Draught at F.P. (m) 
-    TA              : float # Draught at A.P. (m)
-    E1              : float # See https://www.sciencedirect.com/science/article/pii/S0029801821013020
-    E2              : float # See https://www.sciencedirect.com/science/article/pii/S0029801821013020
-    AL_air          : float	# Side above water area
-    AF_air          : float # Front above water area
-    AF_water        : float # Front bellow water area
-    AL_water        : float # Side bellow water area
-    total_wet_area  : float
-    sL              : float # xb coordinate of the centroid of ALw in the ship body reference frame
-    sH              : float # yb coordinate of the centroid of ALw in the ship body reference frame
-    CDt             : float # Coefficient for Blenderman computation
-    CDlAF_bow       : float # Coefficient for Blenderman computation
-    CDlAF_stern     : float # Coefficient for Blenderman computation
-    delta           : float # Coefficient for Blenderman computation
-    kappa           : float # Coefficient for Blenderman computation
-    CT_water_curve        : List[float]
-    CT_water_breakpoints  : List[float]
+    B: float               # Beam length (m)
+    L: float               # Total ship length (m)
+    LPP: float             # Length between perpendiculars (m)
+    LWL: float             # Length at waterline (m)
+
+    CB: float              # Block coefficient (-)
+    CM: float              # Midship section coefficient (-)
+    CWP: float             # Waterplane area coefficient (-)
+
+    kyy: float             # Non-dimensional radius of gyration in pitch, fraction of LPP (-)
+
+    T: float               # Draught at midship (m)
+    TF: float              # Draught at forward perpendicular (m)
+    TA: float              # Draught at aft perpendicular (m)
+
+    E1: float              # Waterline entrance angle (rad)
+    E2: float              # Additional hull angle parameter (rad)
+
+    AL_air: float          # Side projected area above water (m^2)
+    AF_air: float          # Front projected area above water (m^2)
+    AF_water: float        # Front projected area below water (m^2)
+    AL_water: float        # Side projected area below water (m^2)
+    total_wet_area: float  # Wetted hull area (m^2)
+
+    sL: float              # xb coordinate of centroid of AL_water in body frame (m)
+    sH: float              # yb coordinate of centroid of AL_water in body frame (m)
+
+    CDt: float             # Blendermann wind coefficient
+    CDlAF_bow: float       # Blendermann wind coefficient
+    CDlAF_stern: float     # Blendermann wind coefficient
+    delta: float           # Blendermann wind coefficient
+    kappa: float           # Blendermann wind coefficient
+
+    AT: float              # Immersed transom area at rest (m^2), Holtrop
+    ABT: float             # Transverse bulb area at still-water plane (m^2), Holtrop
+    h_B: float             # Vertical position of bulb-area center above keel (m), Holtrop
+    LCB_percent: float     # LCB forward of 0.5*LWL, as % of LWL, Holtrop
 
 @dataclass
 class Generator:
@@ -84,6 +97,7 @@ class ShipInfo:
     rho_air         : float
     g               : float
     vessel_no       : int
+    min_depth       : float
 
 @dataclass
 class Ship:
@@ -122,10 +136,6 @@ def load_ship() -> Ship:
                 iddle_fuel = iddle_fuel,
             )
         )
-
-    max_Fr = info.max_speed/np.sqrt(info.g*hull.LPP)
-    if(max_Fr>max(hull.CT_water_breakpoints)):
-        print("Warning : max Froude number ", max_Fr, "at max configured speed ", info.max_speed, "is outside the bounds of ship.hull.CT_water_breakpoints. This can lead to underestimation of water resistance at high speeds.")
 
     return Ship(
         hull=hull,
@@ -211,33 +221,56 @@ def _compute_zone_centroids(info: MapInfo, zone_ineq: np.ndarray) -> np.ndarray:
     return centroids
 
 def load_map() -> Map:
-    df = pd.read_csv(MAP_PARAMS)
-    row = df.iloc[0].to_dict()
-    info = MapInfo(**row)
+    with open(MAP_TOML, "rb") as f:
+        data = tomllib.load(f)
+
+    info = MapInfo(**data["params"])
 
     data = np.load(ZONE_INEQ)
-    key = "lambda_array" if "lambda_array" in data.files else data.files[0]
-    zone_ineq = data[key]
-    nb_zones  = zone_ineq.shape[2]
-    zone_adj = build_or_load_adjacency_matrix()
+    zone_ineq = data["lambda_array"]
+    nb_zones = zone_ineq.shape[2]
+
+    zone_adj = np.load(ADJ)
 
     data = np.load(TRANSITION_INEQ)
-    trans_from = data["transition_ineqs_from"]
-    trans_to   = data["transition_ineqs_to"]
-    trans_from = np.nan_to_num(trans_from, nan=0.0)
-    trans_to = np.nan_to_num(trans_to, nan=0.0)
+    trans_from = np.nan_to_num(data["transition_ineqs_from"], nan=0.0)
+    trans_to = np.nan_to_num(data["transition_ineqs_to"], nan=0.0)
+
     m = Map(
         info=info,
         zone_ineq=zone_ineq,
-        trans_ineq_from = trans_from,
-        trans_ineq_to = trans_to,
+        trans_ineq_from=trans_from,
+        trans_ineq_to=trans_to,
         zone_adj=zone_adj,
-        nb_zones = nb_zones,
+        nb_zones=nb_zones,
     )
     m.zone_centroids = _compute_zone_centroids(m.info, m.zone_ineq)
-
     return m
 
+
+@dataclass
+class FitRange:
+    min_speed       : float
+    max_speed       : float
+    min_resistance  : float
+    max_resistance  : float 
+    min_prop_power  : int
+    max_prop_power  : int
+
+def load_fit_range() -> FitRange:
+    with open(SHIP, "rb") as f:
+        data = tomllib.load(f)
+
+    fit_data = data["fit_range"]
+
+    return FitRange(
+        min_speed=float(fit_data["min_speed"]),
+        max_speed=float(fit_data["max_speed"]),
+        min_resistance=float(fit_data["min_resistance"]),
+        max_resistance=float(fit_data["max_resistance"]),
+        min_prop_power=float(fit_data["min_prop_power"]),
+        max_prop_power=float(fit_data["max_prop_power"]),
+    )
 
 #===================================================ITINERARY======================================================================================
 @dataclass
@@ -321,6 +354,7 @@ class States:
     soc                : float
     zone               : float
     current_heading    : float
+    current_d          : float = 0
 
 def load_states(map, itinerary) -> States:
     current_x_pos, current_y_pos, _ = dx_dy_km(map, itinerary.transits[0].lat, itinerary.transits[0].lon)
@@ -342,7 +376,8 @@ def load_config():
     states = load_states(map, itinerary)
     ship = load_ship()
     weather = weather_from_nc_file(map, itinerary)
-    return map, itinerary, states, ship, weather
+    fit_range = load_fit_range()
+    return map, itinerary, states, ship, weather, fit_range
 
 
 

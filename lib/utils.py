@@ -12,6 +12,33 @@ from lib.paths import ADJ, ZONES
 import numpy as np
 import matplotlib.pyplot as plt
 
+def _assert_finite(name, arr):
+    arr = np.asarray(arr)
+    if not np.isfinite(arr).all():
+        bad = np.argwhere(~np.isfinite(arr))
+        raise ValueError(f"{name} has non-finite entries; first bad index: {bad[0]} value={arr[tuple(bad[0])]}")
+    
+def xy_from_path_distance(waypoints, d_abs):
+    waypoints = np.asarray(waypoints, dtype=float)
+
+    seg_vecs = waypoints[1:] - waypoints[:-1]
+    seg_lens = np.linalg.norm(seg_vecs, axis=1)
+
+    if np.any(seg_lens <= 0):
+        raise ValueError("Consecutive waypoints must be distinct.")
+
+    D_breaks = np.concatenate(([0.0], np.cumsum(seg_lens)))
+    d_abs = float(np.clip(d_abs, 0.0, D_breaks[-1]))
+
+    if d_abs >= D_breaks[-1]:
+        return waypoints[-1].copy()
+
+    s = np.searchsorted(D_breaks, d_abs, side="right") - 1
+    s = int(np.clip(s, 0, len(seg_lens) - 1))
+
+    alpha = (d_abs - D_breaks[s]) / seg_lens[s]
+    return waypoints[s] + alpha * seg_vecs[s]
+
 def _compute_tight_big_M_zone(map_obj, zone_ineq, safety_margin=1.0):
     """
     Compute a tight disabling Big-M for zone inequalities:
@@ -354,7 +381,7 @@ def build_or_load_adjacency_matrix(n_zones=None, cache=True):
     """
     Return a (Z,Z) adjacency matrix Adj with 1 if transition z->z' is allowed.
     Zones are adjacent iff they share at least 2 corner_id values.
-    Diagonal is 1 (stay). CSV zones are 1-based; output is 0-based.
+    Diagonal is 1 (stay).
     """
     zones_csv  = ZONES
     cache_path = ADJ
@@ -375,13 +402,13 @@ def build_or_load_adjacency_matrix(n_zones=None, cache=True):
 
     df[["zone_id", "corner_id"]] = df[["zone_id", "corner_id"]].astype(int)
 
-    # Collect corners per zone_id (1-based in file)
+    # Collect corners per zone_id
     corners_per_zone = {
         zid: set(grp["corner_id"].to_list())
         for zid, grp in df.groupby("zone_id")
     }
 
-    # Determine Z (number of zones to output, 0-based indexing in code)
+    # Determine Z (number of zones to output)
     Z = n_zones if n_zones is not None else (max(corners_per_zone) if corners_per_zone else 0)
     adj = np.zeros((Z, Z), dtype=int)
     np.fill_diagonal(adj, 1)  # staying in same zone is allowed
@@ -392,7 +419,7 @@ def build_or_load_adjacency_matrix(n_zones=None, cache=True):
             if zid2 <= zid1:
                 continue
             if len(c1 & c2) >= 2:
-                i, j = zid1 - 1, zid2 - 1  # convert to 0-based
+                i, j = zid1, zid2
                 if i < Z and j < Z:
                     adj[i, j] = 1
                     adj[j, i] = 1
