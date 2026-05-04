@@ -1896,7 +1896,7 @@ class PropulsionModel:
 
         if(abs(self.ship.propulsion.min_pitch-self.ship.propulsion.max_pitch)<eps):
             P, n_solution, feasible = self.power_from_ua_res_fixed_pitch(ua, R_req, self.ship.propulsion.max_pitch, self.max_J[-1], eval_infeasible=eval_infeasible, debug=False)
-            return P, n_solution, feasible, -1
+            return P, n_solution, feasible, self.ship.propulsion.max_pitch
         
         min_power = 100000000000000000000000000
         best_pitch = -1

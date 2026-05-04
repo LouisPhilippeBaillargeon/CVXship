@@ -141,13 +141,8 @@ def run_simulink_model(optimizer, n_estimated, pitch, debug = False):
     eng.workspace['vessel_no']              = float(optimizer.ship.info.vessel_no)
     eng.workspace['rho_air']                = float(optimizer.ship.info.rho_air)
 
-    Fr = optimizer.sol.speed_rel_water_mag[0]/np.sqrt(optimizer.ship.info.g*optimizer.ship.hull.LPP)
-    CT = np.interp(
-            Fr,
-            optimizer.ship.hull.CT_water_breakpoints,
-            optimizer.ship.hull.CT_water_curve
-    )
-    CX = CT*optimizer.ship.hull.total_wet_area/optimizer.ship.hull.AF_water
+
+    CX = optimizer.calm_model.compute_C(optimizer.sol.speed_rel_water_mag[0])
     eng.workspace['CX']                     = float(CX)
 
 
@@ -265,11 +260,13 @@ def run_simulink_model(optimizer, n_estimated, pitch, debug = False):
     print("convex estimated cost : "    , optimizer.sol.estimated_cost)
 
     optimizer.states.timesteps_completed+= 1
-    optimizer.states.current_x_pos      = xpos[-1]
-    optimizer.states.current_y_pos      = ypos[-1]
-    optimizer.states.current_x_speed    = vx[-1]
-    optimizer.states.current_y_speed    = vy[-1]
-    optimizer.states.soc                = soc[-1]
+    optimizer.states.current_x_pos      = float(xpos[-1]) / 1000.0
+    optimizer.states.current_y_pos      = float(ypos[-1]) / 1000.0
+    optimizer.states.current_x_speed    = float(vx[-1])
+    optimizer.states.current_y_speed    = float(vy[-1])
+    optimizer.states.current_speed      = float(np.hypot(vx[-1], vy[-1]))
+    optimizer.states.soc                = float(soc[-1])
+    optimizer.states.current_heading    = float(heading[-1])
 
     print("new xpos : ", xpos)
     print("new ypos : ", ypos)
