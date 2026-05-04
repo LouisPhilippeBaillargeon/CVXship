@@ -1,6 +1,7 @@
 import numpy as np
 from lib.optimizers import Solution
 
+
 def compute_non_convex_cost_all_timesteps(runner, eps=1e-9, debug=False):
     """
     Strategy-agnostic evaluator with fixed optimizer timestep only.
@@ -139,6 +140,7 @@ def compute_non_convex_cost_all_timesteps(runner, eps=1e-9, debug=False):
     # Outputs
     # ============================================================
     n_all = np.zeros(T)
+    best_pitch = np.zeros(T)
     total_cost_all = np.zeros(T)
     gen_power_all = np.zeros((nb_gen, T))
     gen_costs_all = np.zeros((nb_gen, T))
@@ -208,7 +210,7 @@ def compute_non_convex_cost_all_timesteps(runner, eps=1e-9, debug=False):
 
             ua = (1.0 - ship.propulsion.wake_fraction) * Vs
             res_per_prop = total_resistance[t] / ship.propulsion.nb_propellers
-            p_per_prop, n, feasible, best_pitch = propulsion_model.compute_power_from_ua_res(
+            p_per_prop, n, feasible, best_pitch[t] = propulsion_model.compute_power_from_ua_res(
                 ua,
                 res_per_prop,
                 eval_infeasible=True,
@@ -305,4 +307,4 @@ def compute_non_convex_cost_all_timesteps(runner, eps=1e-9, debug=False):
         path_distance=getattr(sol, "path_distance", None),
     )
 
-    return n_all, non_conv_sol, dt_h
+    return n_all, non_conv_sol, dt_h, best_pitch

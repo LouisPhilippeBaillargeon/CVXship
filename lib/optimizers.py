@@ -197,13 +197,13 @@ class GlobalOptimizer:
                 assert p >= 0        
                 constraints += [ship_pos[t,0] == port_x[p]]
                 constraints += [ship_pos[t,1] == port_y[p]]
-                print("ship is in port", p, " at instant ", t)
+                if debug:
+                    print("ship is in port", p, " at instant ", t)
         
         #======================================================ZONES===================================================
         zone = cp.Variable((T_future + 1, self.map.nb_zones), boolean=True)
 
         big_M = _compute_tight_big_M_zone(self.map, self.map.zone_ineq)
-        print("big_M",big_M)
         
         #position must be in the chosen zone
         for t in range(T_future+1):
@@ -238,9 +238,6 @@ class GlobalOptimizer:
 
         big_M_to = _compute_tight_big_M_transition(self.map, self.map.trans_ineq_to)
         big_M_from = _compute_tight_big_M_transition(self.map, self.map.trans_ineq_from)
-
-        print("big_M_to",big_M_to)
-        print("big_M_from",big_M_from)
         
         #During transitions certain inequalities from both zones must be respected so that the full line is in one of the convex zones at all times
         for t in range(T_future):
@@ -250,9 +247,13 @@ class GlobalOptimizer:
                 for iz in range(self.map.nb_zones):
                     if (self.map.zone_adj[z,iz]==1):
                         if(np.sum(trans_to[:,:,z,iz])):
+                            if(big_M_to[z, iz]==0):
+                                print("Error: tight big-M thougth transition from ", z, "to ", iz, "was impossible, but it is." )
                             constraints += [trans_to[0,0,z,iz]*ship_pos[t,1] + trans_to[0,1,z,iz]*ship_pos[t,0] + trans_to[0,2,z,iz]>=big_M_to[z, iz]*(2-zone[t,z]-zone[t+1,iz])]
                             constraints += [trans_to[1,0,z,iz]*ship_pos[t,1] + trans_to[1,1,z,iz]*ship_pos[t,0] + trans_to[1,2,z,iz]>=big_M_to[z, iz]*(2-zone[t,z]-zone[t+1,iz])]
                         if(np.sum(trans_from[:,:,z,iz])):
+                            if(big_M_from[iz, z]==0):
+                                print("Error: tight big-M thougth transition from ", z, "to ", iz, "was impossible, but it is." )
                             constraints += [trans_from[0,0,z,iz]*ship_pos[t+1,1] + trans_from[0,1,z,iz]*ship_pos[t+1,0] + trans_from[0,2,z,iz]>=big_M_from[z, iz]*(2-zone[t,z]-zone[t+1,iz])]
                             constraints += [trans_from[1,0,z,iz]*ship_pos[t+1,1] + trans_from[1,1,z,iz]*ship_pos[t+1,0] + trans_from[1,2,z,iz]>=big_M_from[z, iz]*(2-zone[t,z]-zone[t+1,iz])]
 
@@ -766,12 +767,6 @@ class Fixed_Path_Optimizer:
         wind_y_seg = self.weather.wind_y[:,self.states.timesteps_completed : self.states.timesteps_completed + T_future]
         irr_seg = self.weather.irradiance[:, self.states.timesteps_completed : self.states.timesteps_completed + T_future]  # shape [nb_zones, T_future]
 
-        print("current_x_seg", np.min(current_x_seg), np.max(current_x_seg))
-        print("current_y_seg", np.min(current_y_seg), np.max(current_y_seg))
-        print("wind_x_seg", np.min(wind_x_seg), np.max(wind_x_seg))
-        print("wind_y_seg", np.min(wind_y_seg), np.max(wind_y_seg))
-        print("irr_seg", np.min(irr_seg), np.max(irr_seg))
-
         current_x_seg = self.weather.current_x[path_zone_ids, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
         current_y_seg = self.weather.current_y[path_zone_ids, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
         wind_x_seg    = self.weather.wind_x[path_zone_ids, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
@@ -993,9 +988,6 @@ class Fixed_Path_Optimizer:
         problem.solve(solver="MOSEK", verbose=debug,)
         print("AFTER SOLVE: status =", problem.status, "value =", problem.value)
 
-        print("T_future : ",T_future)
-        print("weather : ",self.weather.current_x.shape[1])
-
         # ============================== RECONSTRUCT 2D POSITIONS / SPEEDS ===============================
         d_opt = np.asarray(d.value, dtype=float).reshape(-1)   # shape (T_future+1,)
 
@@ -1042,8 +1034,6 @@ class Fixed_Path_Optimizer:
                 gen_on_out = np.zeros((len(self.generator_models), T_future), dtype=float)
                 sail_mask = instant_sail[:-1].astype(bool)
                 gen_on_out[:, sail_mask] = 1.0
-
-            print("prop_power",np.array(prop_power.value))
 
             self.sol = Solution(
                 estimated_cost           = problem.value,
