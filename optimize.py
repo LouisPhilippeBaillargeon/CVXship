@@ -15,7 +15,7 @@ from lib.simulation import run_simulink_model
 new_weather = False
 new_ship = False
 see_previous_sol = False
-dimensions = "both"  # "1D", "2D" or "both"
+dimensions = "2D"  # "1D", "2D" or "both"
 
 if __name__ == "__main__":
     
@@ -192,7 +192,7 @@ if __name__ == "__main__":
                 path_zone_ids=path.sol.zone_sequence,
                 ref_speed = ref_speed
             )
-            '''
+
             ok = optimizer.optimize(
                 unit_commitment=False,
                 debug=True,
@@ -208,7 +208,7 @@ if __name__ == "__main__":
                 plot_solutions([fixed_path_sol, naive_solution],["Fixed Path Optimizer", "Naive Controller"], show = True, subfolder="All sol compared")
             else:
                 print("Optimization failed.")
-            '''
+
             
        
         
@@ -225,7 +225,7 @@ if __name__ == "__main__":
                 weather             = weather,
                 ship                = ship,
                 ref_speed           = ref_speed,)
-            '''
+
             # Plot current position and destination
             init_pos = np.array([optimizer.states.current_x_pos, optimizer.states.current_y_pos])
             optimizer.states.zone = point_in_zones(init_pos, optimizer.map.zone_ineq)
@@ -233,6 +233,8 @@ if __name__ == "__main__":
 
             optimizer.optimize(
                 debug=True,
+                ordered_zones = True,
+                min_timestep = True,
                 restrict_to_naive=True,
                 naive_solution=naive.sol,
                 naive_zone_radius=1,
@@ -241,7 +243,7 @@ if __name__ == "__main__":
             n_all, global_sol, dt_h, best_pitch = compute_non_convex_cost_all_timesteps(optimizer, debug=False)
             plot_solutions([optimizer.sol, global_sol],["Convex Gloabal solution", "Non-convex Global solution"], show=True, subfolder="Global Path")
             plot_solutions([global_sol, naive_solution],["Global Optimizer", "Naive Controller"], show = True, subfolder="All sol compared")
-            '''
+
 
 
     # Optimize and Simulate
@@ -254,7 +256,7 @@ end_x, end_y, _ = dx_dy_km(
     itinerary.transits[-1].lat,
     itinerary.transits[-1].lon,
 )
-
+'''
 while states.timesteps_completed < itinerary.nb_timesteps:
     print("Current timestep:", states.timesteps_completed)
 
@@ -357,3 +359,4 @@ while states.timesteps_completed < itinerary.nb_timesteps:
         states.timesteps_completed += 1
 
 print("Total simulated cost:", total_cost_simul)
+'''

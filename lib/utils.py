@@ -175,117 +175,159 @@ def _zone_edges_from_corner_ids(zone_corner_ids: dict[int, list[int]]) -> dict[i
     return zone_edges
 
 
+def _segment_segment_distance_2d(a0, a1, b0, b1) -> float:
+    """
+    Minimum Euclidean distance between two 2D line segments.
+    Inputs are length-2 arrays/lists in km.
+    """
+    a0 = np.asarray(a0, dtype=float)
+    a1 = np.asarray(a1, dtype=float)
+    b0 = np.asarray(b0, dtype=float)
+    b1 = np.asarray(b1, dtype=float)
+
+    u = a1 - a0
+    v = b1 - b0
+    w = a0 - b0
+
+    A = float(np.dot(u, u))
+    B = float(np.dot(u, v))
+    C = float(np.dot(v, v))
+    D = float(np.dot(u, w))
+    E = float(np.dot(v, w))
+
+    eps = 1e-12
+
+    # Degenerate cases
+    if A < eps and C < eps:
+        return float(np.linalg.norm(a0 - b0))
+
+    if A < eps:
+        t = np.clip(E / C, 0.0, 1.0)
+        return float(np.linalg.norm(a0 - (b0 + t * v)))
+
+    if C < eps:
+        s = np.clip(-D / A, 0.0, 1.0)
+        return float(np.linalg.norm((a0 + s * u) - b0))
+
+    denom = A * C - B * B
+
+    if abs(denom) > eps:
+        s = np.clip((B * E - C * D) / denom, 0.0, 1.0)
+    else:
+        # Nearly parallel: start with one endpoint projection.
+        s = 0.0
+
+    t = np.clip((B * s + E) / C, 0.0, 1.0)
+
+    # Recompute s after clamping t.
+    s = np.clip((B * t - D) / A, 0.0, 1.0)
+
+    p = a0 + s * u
+    q = b0 + t * v
+    return float(np.linalg.norm(p - q))
+
+
 def _compute_min_crossing_distance_per_zone(corners_path, zone_corners_path) -> dict[int, float]:
     """
-    Re-factor needed : Corners should be stored in the map object and this function should use it.
-    For each zone, compute the shortest valid segment that represents a minimum
-    crossing distance through that zone.
+    For each zone, compute the true minimum crossing distance [km].
 
-    Rules used:
-      1) Candidate endpoints must be zone corners.
-      2) Ignore segments that are themselves a shared frontier edge with another zone.
-      3) For interior zones (2+ distinct neighboring zones):
-         require the two endpoints to connect the zone to two different neighbors.
-      4) For terminal zones (only 1 distinct neighboring zone):
-         allow one endpoint on the shared frontier side and the other on a non-shared
-         corner of the zone.
+    Interior zone:
+        shortest distance between two frontier edges shared with two different
+        neighboring zones.
 
-    Returns:
-        {zone_id: min_crossing_distance_km}
+    Terminal zone:
+        shortest distance between the single frontier edge and any non-frontier
+        edge of the terminal zone.
+
+    This replaces the previous corner-pair approximation.
     """
     corners_df = pd.read_csv(corners_path)
     zone_corners_df = pd.read_csv(zone_corners_path)
 
-    # corner_id -> (x, y)
     corner_xy = {
-        int(r.corner_id): (float(r.x), float(r.y))
+        int(r.corner_id): np.array([float(r.x), float(r.y)], dtype=float)
         for r in corners_df.itertuples(index=False)
     }
 
-    # ordered corners per zone
     zone_corner_ids = _ordered_zone_corner_ids(zone_corners_df)
-
-    # which zones use each corner
-    corner_to_zones: dict[int, set[int]] = {}
-    for r in zone_corners_df.itertuples(index=False):
-        cid = int(r.corner_id)
-        zid = int(r.zone_id)
-        corner_to_zones.setdefault(cid, set()).add(zid)
-
-    # polygon edges for each zone
     zone_edges = _zone_edges_from_corner_ids(zone_corner_ids)
 
-    # which zones share each edge
+    # edge -> zones sharing that edge
     edge_to_zones: dict[frozenset[int], set[int]] = {}
     for zid, edges in zone_edges.items():
         for e in edges:
-            edge_to_zones.setdefault(e, set()).add(zid)
+            edge_to_zones.setdefault(e, set()).add(int(zid))
 
-    min_dist = {}
+    min_dist: dict[int, float] = {}
 
-    for z, corner_ids in zone_corner_ids.items():
-        # For each corner of zone z, what other zones also use it?
-        corner_other_zones = {
-            cid: (corner_to_zones[cid] - {z})
-            for cid in corner_ids
-        }
+    for z, edges in zone_edges.items():
+        z = int(z)
 
-        # All distinct neighboring zones of zone z
-        distinct_neighbors = set()
-        for s in corner_other_zones.values():
-            distinct_neighbors |= s
+        frontier_edges = []
+        non_frontier_edges = []
+
+        for e in edges:
+            shared_by = edge_to_zones.get(e, {z})
+            other_zones = set(shared_by) - {z}
+
+            if len(other_zones) > 0:
+                # In your map this should normally be exactly one neighbor.
+                for oz in other_zones:
+                    frontier_edges.append((e, int(oz)))
+            else:
+                non_frontier_edges.append(e)
+
+        distinct_neighbors = sorted({oz for _, oz in frontier_edges})
 
         best = np.inf
 
-        for i in range(len(corner_ids)):
-            c1 = int(corner_ids[i])
-            oz1 = corner_other_zones[c1]
+        if len(distinct_neighbors) >= 2:
+            # Interior zone: crossing from one neighboring frontier to another.
+            for i in range(len(frontier_edges)):
+                e1, n1 = frontier_edges[i]
+                for j in range(i + 1, len(frontier_edges)):
+                    e2, n2 = frontier_edges[j]
 
-            for j in range(i + 1, len(corner_ids)):
-                c2 = int(corner_ids[j])
-                oz2 = corner_other_zones[c2]
+                    if n1 == n2:
+                        continue
 
-                # Exclude the pair if it is a frontier edge shared with another zone
-                edge = frozenset((c1, c2))
-                shared_by = edge_to_zones.get(edge, {z})
-                if len(shared_by - {z}) > 0:
-                    continue
+                    c10, c11 = tuple(e1)
+                    c20, c21 = tuple(e2)
 
-                valid_pair = False
-
-                if len(distinct_neighbors) >= 2:
-                    # Interior zone: endpoints must connect to two different neighbors
-                    valid_pair = any(a != b for a in oz1 for b in oz2)
-
-                elif len(distinct_neighbors) == 1:
-                    # Terminal zone: allow one endpoint on the shared side and one
-                    # endpoint on a non-shared corner
-                    valid_pair = (
-                        (len(oz1) > 0 and len(oz2) == 0) or
-                        (len(oz2) > 0 and len(oz1) == 0)
+                    d = _segment_segment_distance_2d(
+                        corner_xy[c10], corner_xy[c11],
+                        corner_xy[c20], corner_xy[c21],
                     )
+                    best = min(best, d)
 
-                else:
-                    # Isolated zone: no neighboring zone found in the CSV structure
-                    valid_pair = False
+        elif len(distinct_neighbors) == 1:
+            # Terminal zone: crossing from the shared frontier into/out of the zone.
+            for e_frontier, _ in frontier_edges:
+                c10, c11 = tuple(e_frontier)
 
-                if not valid_pair:
-                    continue
+                for e_other in non_frontier_edges:
+                    c20, c21 = tuple(e_other)
 
-                x1, y1 = corner_xy[c1]
-                x2, y2 = corner_xy[c2]
-                d = float(np.hypot(x2 - x1, y2 - y1))
-                if d < best:
-                    best = d
+                    d = _segment_segment_distance_2d(
+                        corner_xy[c10], corner_xy[c11],
+                        corner_xy[c20], corner_xy[c21],
+                    )
+                    best = min(best, d)
+
+        else:
+            raise ValueError(
+                f"Zone {z} has no neighboring zone based on shared edges. "
+                "Cannot compute a crossing distance."
+            )
 
         if not np.isfinite(best):
             raise ValueError(
-                f"Could not determine a valid minimum crossing distance for zone {z}. "
-                f"Neighbors found: {sorted(distinct_neighbors)}. "
-                f"Check corners.csv / zones.csv consistency or crossing rules."
+                f"Could not determine minimum crossing distance for zone {z}. "
+                f"Neighbors found: {distinct_neighbors}. "
+                "Check corners.csv / zones.csv consistency."
             )
 
-        min_dist[z] = best
+        min_dist[z] = float(best)
 
     return min_dist
 

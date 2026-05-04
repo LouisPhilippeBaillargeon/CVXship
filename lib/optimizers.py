@@ -144,7 +144,6 @@ class GlobalOptimizer:
     def optimize(self,
         unit_commitment = False,
         debug = False,
-        max_transitions = False, #if true the problem can only make up to nb_zone transitions. Makes computation faster.
         ordered_zones = False, #if true, the ship can only go from zone z+1 to zone z.
         min_timestep = False,
         restrict_to_naive=False,
@@ -256,15 +255,6 @@ class GlobalOptimizer:
                                 print("Error: tight big-M thougth transition from ", z, "to ", iz, "was impossible, but it is." )
                             constraints += [trans_from[0,0,z,iz]*ship_pos[t+1,1] + trans_from[0,1,z,iz]*ship_pos[t+1,0] + trans_from[0,2,z,iz]>=big_M_from[z, iz]*(2-zone[t,z]-zone[t+1,iz])]
                             constraints += [trans_from[1,0,z,iz]*ship_pos[t+1,1] + trans_from[1,1,z,iz]*ship_pos[t+1,0] + trans_from[1,2,z,iz]>=big_M_from[z, iz]*(2-zone[t,z]-zone[t+1,iz])]
-
-        if(max_transitions):
-            transit_segment = cp.Variable(T_future, boolean=True)
-            for t in range(T_future):
-                for z in range(self.map.nb_zones):
-                    constraints += [transit_segment[t]>=zone[t,z]-zone[t+1,z]]
-                    constraints += [transit_segment[t]>=zone[t+1,z]-zone[t,z]]
-            
-            constraints += [cp.sum(transit_segment)<=self.map.nb_zones-1]
         
         if (ordered_zones):
             for t in range(T_future):
@@ -284,10 +274,9 @@ class GlobalOptimizer:
                 timestep_h=self.itinerary.timestep,
             )
 
-            # Convert from CSV zone ids starting at 1 to model indices starting at 0
             min_zone_steps = np.zeros(self.map.nb_zones, dtype=int)
             for zone_id_csv, n_steps in min_zone_steps_by_id.items():
-                z_idx = int(zone_id_csv) - 1
+                z_idx = int(zone_id_csv)
                 if not (0 <= z_idx < self.map.nb_zones):
                     raise ValueError(
                         f"Zone id {zone_id_csv} from {ZONES} is outside model range."
@@ -295,14 +284,28 @@ class GlobalOptimizer:
                 min_zone_steps[z_idx] = int(n_steps)
 
             if debug:
-                print("Minimum crossing timesteps per zone:", min_zone_steps)
+                print("min_zone_steps_by_id:", min_zone_steps_by_id)
+                print("min_zone_steps array:", min_zone_steps)
+                print("port_zone_idx from zone_ineq:", compute_port_zone_indices(self.map, self.itinerary))
+                print("map.zone_adj shape:", self.map.zone_adj.shape)
+                print("map.zone_ineq nb_zones:", self.map.zone_ineq.shape[2])
 
             # Optional visit indicator:
             # if a zone is used at least once, it must be occupied for at least min_zone_steps[z] instants
             # This avoids forcing unused/skipped zones to appear.
             zone_used = cp.Variable(self.map.nb_zones, boolean=True)
 
+            # Skip terminal zones
+            start_zone = int(np.argmax(point_in_zones(
+                np.array([self.states.current_x_pos, self.states.current_y_pos]),
+                self.map.zone_ineq
+            )))
+            end_zone = int(port_zone_idx[-1])
+
             for z in range(self.map.nb_zones):
+                if z in (start_zone, end_zone):
+                    continue
+
                 occ_z = cp.sum(zone[:, z])
                 constraints += [occ_z >= zone_used[z]]
                 constraints += [occ_z <= (T_future + 1) * zone_used[z]]

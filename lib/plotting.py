@@ -236,6 +236,27 @@ def plot_solutions(
     _plot_1d_overlay_multi(collect("battery_discharge", T), t, "battery_discharge", "Battery discharge power [MW]", directory = plot_dir)
     _plot_1d_overlay_multi(collect("SOC", T + 1), t_plus_1, "SOC", "State of charge [-]", directory = plot_dir)
 
+    # ===================== ZONE INDEX =====================
+    def extract_zone_idx(sol, n):
+        z = getattr(sol, "zone", None)
+        if z is None:
+            return None
+        z = np.asarray(z)
+        if z.ndim == 2 and z.shape[0] >= n:
+            return np.argmax(z[:n, :], axis=1)
+        return None
+
+    zone_idxs = [extract_zone_idx(sol, T + 1) for sol in solutions]
+
+    fig, ax = plt.subplots()
+    for z_idx, label in zip(zone_idxs, labels):
+        if z_idx is not None:
+            ax.step(t_plus_1, z_idx, where="post", label=label)
+
+    ax.legend(loc="best", frameon=False)
+    _finalize_axis(ax, xlabel="Timestep", ylabel="Zone index [-]", title="zone_index")
+    _save_and_maybe_show(fig, "cmp_zone_index", show, directory=plot_dir)
+
     # ===================== TRAJECTORY =====================
     positions = [slice_2d(getattr(sol, "ship_pos", None), T + 1) for sol in solutions]
 
