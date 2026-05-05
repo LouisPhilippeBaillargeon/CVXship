@@ -57,14 +57,70 @@ def _ensure_plots_dir():
     os.makedirs(PLOTS, exist_ok=True)
 
 
-def _save_and_maybe_show(fig, name: str, show: bool = False, directory=PLOTS):
+def _save_and_maybe_show(
+    fig,
+    name: str,
+    show: bool = False,
+    directory=PLOTS,
+    font_scale: float = 1.0,
+):
     """
-    Always save to PLOTS/<name>.png.
-    Show only if requested, otherwise close the figure.
+    Save figure to PLOTS/<name>.png with robust layout handling.
+
+    Parameters
+    ----------
+    fig : matplotlib.figure.Figure
+    name : str
+        File name (without extension)
+    show : bool
+        If True, display the figure
+    directory : str
+        Output directory
+    font_scale : float
+        Multiplier for all text sizes (e.g., 1.5, 2.0)
     """
+    import os
+    import matplotlib.pyplot as plt
+
     _ensure_plots_dir()
     path = os.path.join(directory, f"{name}.png")
-    fig.savefig(path, bbox_inches="tight")
+
+    # -----------------------------
+    # Scale all fonts in the figure
+    # -----------------------------
+    if font_scale != 1.0:
+        for ax in fig.get_axes():
+            # Title
+            if ax.title:
+                ax.title.set_fontsize(ax.title.get_fontsize() * font_scale)
+
+            # Axis labels
+            if ax.xaxis.label:
+                ax.xaxis.label.set_fontsize(ax.xaxis.label.get_fontsize() * font_scale)
+            if ax.yaxis.label:
+                ax.yaxis.label.set_fontsize(ax.yaxis.label.get_fontsize() * font_scale)
+
+            # Tick labels
+            for label in ax.get_xticklabels() + ax.get_yticklabels():
+                label.set_fontsize(label.get_fontsize() * font_scale)
+
+            # Legend
+            leg = ax.get_legend()
+            if leg is not None:
+                for text in leg.get_texts():
+                    text.set_fontsize(text.get_fontsize() * font_scale)
+
+    # -----------------------------
+    # Layout fix (prevents clipping)
+    # -----------------------------
+    fig.tight_layout(pad=1.2)
+    fig.subplots_adjust(left=0.18, bottom=0.18)
+
+    # -----------------------------
+    # Save
+    # -----------------------------
+    fig.savefig(path, bbox_inches="tight", dpi=300)
+
     if show:
         plt.show()
     else:

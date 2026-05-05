@@ -566,7 +566,7 @@ class CalmWaterModel:
             title="Calm-water resistance coefficient",
         )
         ax.legend(loc="best", frameon=False)
-        _save_and_maybe_show(fig, "calm_water_C_vs_speed", show, directory=plot_dir)
+        _save_and_maybe_show(fig, "calm_water_C_vs_speed", show, directory=plot_dir, font_scale=2)
 
         # ---------------------------------
         # Plot resistance comparison
@@ -604,9 +604,27 @@ class CalmWaterModel:
             title="Calm-water resistance model comparison",
         )
         ax.legend(loc="best", frameon=False)
-        _save_and_maybe_show(fig, "calm_water_resistance_comparison", show, directory=plot_dir)
+        _save_and_maybe_show(fig, "calm_water_resistance_comparison", show, directory=plot_dir, font_scale=2)
 
 
+
+def compute_rel_wind_speed_and_rel_attack_angle(wind_speed_vector,ship_speed_vector):
+    heading = np.pi/2-np.atan2(ship_speed_vector[1],ship_speed_vector[0]) #heading in the north=0, clockwise referential
+    Beta_Vw = np.pi/2-np.atan2(wind_speed_vector[1],wind_speed_vector[0]) #wind_angle in the north=0, clockwise referential
+
+    wind_speed = np.linalg.norm(wind_speed_vector)
+    ship_speed = np.linalg.norm(ship_speed_vector)
+
+    u_w = wind_speed*np.cos(Beta_Vw-heading)
+    v_w = wind_speed*np.sin(Beta_Vw-heading)
+
+    u_rw = ship_speed-u_w
+    v_rw = 0 - v_w          #sway assumed 0
+
+    V_rw = np.sqrt(np.square(u_rw)+np.square(v_rw)) #relative wind speed
+    gamma_rw = -np.atan2(v_rw,u_rw)                 #relative angle of attack
+
+    return V_rw, gamma_rw
 
 
 @dataclass
@@ -2116,13 +2134,32 @@ class PropulsionModel:
         """
         Show a 2D heatmap of error P_fit - P_real.
         """
-        error = (self.P_fit - self.P_real)*self.mask_fit
+        import matplotlib.pyplot as plt
+
+        error = (self.P_fit - self.P_real) * self.mask_fit
+
         plt.figure(figsize=(10, 6))
-        heat = plt.imshow(error, extent=[self.min_thrust, self.max_thrust, self.min_ua, self.max_ua],origin='lower', aspect='auto', cmap="inferno")
-        plt.colorbar(heat, label="error [MW]")
-        plt.xlabel("Resistance [MN]")
-        plt.ylabel("Advance speed [m/s]")
-        plt.title("Power Fit Error Heatmap")
+
+        heat = plt.imshow(
+            error,
+            extent=[self.min_thrust, self.max_thrust, self.min_ua, self.max_ua],
+            origin='lower',
+            aspect='auto',
+            cmap="inferno"
+        )
+
+        cbar = plt.colorbar(heat)
+        cbar.set_label("error [MW]", fontsize=30)
+        cbar.ax.tick_params(labelsize=14)
+
+        plt.xlabel("Resistance [MN]", fontsize=30)
+        plt.ylabel("Advance speed [m/s]", fontsize=30)
+        plt.title("Power Fit Error Heatmap", fontsize=30)
+
+        plt.xticks(fontsize=20)
+        plt.yticks(fontsize=20)
+
+        plt.tight_layout()  # <-- key fix
         plt.show()
      
     def _require_fit_data(self):

@@ -13,9 +13,9 @@ from lib.simulation import run_simulink_model
 
 
 new_weather = False
-new_ship = False
+new_ship = True
 see_previous_sol = False
-dimensions = "2D"  # "1D", "2D" or "both"
+dimensions = "1D"  # "1D", "2D" or "both"
 
 if __name__ == "__main__":
     
