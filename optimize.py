@@ -13,7 +13,7 @@ from lib.simulation import run_simulink_model
 from dataclasses import dataclass
 
 
-new_weather = True
+new_weather = False
 new_ship = False
 see_previous_sol = False
 dimensions = "2D"  # "1D", "2D" or "both"
