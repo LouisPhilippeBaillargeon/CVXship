@@ -900,55 +900,60 @@ class WindModel1D(BaseWindModel):
 
 @dataclass
 class WindModelPathAligned2D(BaseWindModel):
-    """
-    Path-aligned 2D wind resistance convex fit.
+    heading_half_angle_deg: float = 45.0
 
-    Fits R_wind(vx, vy) over a narrow path-aligned velocity tube:
-        v_parallel in [fit_range.min_speed, fit_range.max_speed]
-        v_perp     in [-perp_speed_max, +perp_speed_max]
+    def _sector_linear_constraints(self, course_angle: float):
+        u = np.array([np.cos(course_angle), np.sin(course_angle)])
+        theta = np.deg2rad(self.heading_half_angle_deg)
 
-    The fitted expression has the same 11-coefficient structure as WindModel2D:
-        c0
-        + c1*vx + c2*vx^2 + c3*vx^4
-        + c4*vy + c5*vy^2 + c6*vy^4
-        + c7*vs + c8*vs^2 + c9*vs^3 + c10*vs^4
+        u_left = np.array([
+            np.cos(course_angle + theta),
+            np.sin(course_angle + theta)
+        ])
 
-    where vx, vy, vs are normalized by ship.info.max_speed.
-    """
+        u_right = np.array([
+            np.cos(course_angle - theta),
+            np.sin(course_angle - theta)
+        ])
 
-    perp_speed_max: float = 3.0
+        # inward normals
+        n_left = np.array([u_left[1], -u_left[0]])
+        n_right = np.array([-u_right[1], u_right[0]])
+
+        A = np.vstack([n_left, n_right])
+        b = np.zeros(2)
+
+        return A, b
 
     def fit_convex_model(
         self,
         wind_speed_x,
         wind_speed_y,
         course_angle,
-        nb_parallel_steps: int = 40,
-        nb_perp_steps: int = 9,
+        nb_speed_steps: int = 40,
+        nb_angle_steps: int = 21,
         debug: bool = False,
         conservative: bool = False,
     ):
-        v_parallel_vals = np.linspace(
+        theta_max = np.deg2rad(self.heading_half_angle_deg)
+
+        speed_vals = np.linspace(
             self.fit_range.min_speed,
             self.fit_range.max_speed,
-            nb_parallel_steps,
+            nb_speed_steps,
         )
 
-        v_perp_vals = np.linspace(
-            -self.perp_speed_max,
-            self.perp_speed_max,
-            nb_perp_steps,
+        angle_offsets = np.linspace(
+            -theta_max,
+            theta_max,
+            nb_angle_steps,
         )
 
-        VP, VN = np.meshgrid(v_parallel_vals, v_perp_vals)
+        V, DA = np.meshgrid(speed_vals, angle_offsets)
+        ANG = course_angle + DA
 
-        ux = np.cos(course_angle)
-        uy = np.sin(course_angle)
-        nx = -np.sin(course_angle)
-        ny = np.cos(course_angle)
-
-        VX = VP * ux + VN * nx
-        VY = VP * uy + VN * ny
+        VX = V * np.cos(ANG)
+        VY = V * np.sin(ANG)
         VS = np.sqrt(VX**2 + VY**2)
 
         Resistance = np.zeros_like(VX, dtype=float)
@@ -965,67 +970,55 @@ class WindModelPathAligned2D(BaseWindModel):
         vy_n = VY / scale
         vs_n = VS / scale
 
-        vx_n2 = vx_n**2
-        vx_n4 = vx_n**4
-        vy_n2 = vy_n**2
-        vy_n4 = vy_n**4
-        vs_n2 = vs_n**2
-        vs_n3 = vs_n**3
-        vs_n4 = vs_n**4
-
         R_fit = cp.Variable(VX.shape)
 
         intercept = cp.Variable()
-
-        param_vx = cp.Variable()
-        param_vx_2 = cp.Variable()
-        param_vx_4 = cp.Variable()
-
-        param_vy = cp.Variable()
-        param_vy_2 = cp.Variable()
-        param_vy_4 = cp.Variable()
-
         param_vs = cp.Variable()
         param_vs_2 = cp.Variable()
         param_vs_3 = cp.Variable()
         param_vs_4 = cp.Variable()
+        param_vx = cp.Variable()
+        param_vx_2 = cp.Variable()
+        param_vx_4 = cp.Variable()
+        param_vy = cp.Variable()
+        param_vy_2 = cp.Variable()
+        param_vy_4 = cp.Variable()
 
         constraints = [
+            param_vs_2 >= eps,
+            param_vs_3 >= eps,
+            param_vs_4 >= eps,
             param_vx_2 >= eps,
             param_vx_4 >= eps,
             param_vy_2 >= eps,
             param_vy_4 >= eps,
-            param_vs_2 >= eps,
-            param_vs_3 >= eps,
-            param_vs_4 >= eps,
         ]
 
-        for iy in range(VX.shape[0]):
-            for ix in range(VX.shape[1]):
-                expr = (
-                    intercept
-                    + param_vx   * vx_n[iy, ix]
-                    + param_vx_2 * vx_n2[iy, ix]
-                    + param_vx_4 * vx_n4[iy, ix]
-                    + param_vy   * vy_n[iy, ix]
-                    + param_vy_2 * vy_n2[iy, ix]
-                    + param_vy_4 * vy_n4[iy, ix]
-                    + param_vs   * vs_n[iy, ix]
-                    + param_vs_2 * vs_n2[iy, ix]
-                    + param_vs_3 * vs_n3[iy, ix]
-                    + param_vs_4 * vs_n4[iy, ix]
-                )
-                constraints += [R_fit[iy, ix] == expr]
+        expr = (
+            intercept
+            + param_vs   * vs_n
+            + param_vs_2 * vs_n**2
+            + param_vs_3 * vs_n**3
+            + param_vs_4 * vs_n**4
+            + param_vx   * vx_n
+            + param_vx_2 * vx_n**2
+            + param_vx_4 * vx_n**4
+            + param_vy   * vy_n
+            + param_vy_2 * vy_n**2
+            + param_vy_4 * vy_n**4
+        )
 
-                if conservative:
-                    constraints += [R_fit[iy, ix] >= Resistance[iy, ix]]
+        constraints += [R_fit == expr]
+
+        if conservative:
+            constraints += [R_fit >= Resistance]
 
         objective = cp.Minimize(cp.sum_squares(R_fit - Resistance))
         problem = cp.Problem(objective, constraints)
         problem.solve(solver="MOSEK", verbose=debug)
 
         if problem.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-            raise RuntimeError(f"Path-aligned wind fit failed: {problem.status}")
+            raise RuntimeError(f"Wind fit problem not solved optimally: {problem.status}")
 
         abs_err = np.abs(R_fit.value - Resistance)
 
@@ -1043,55 +1036,134 @@ class WindModelPathAligned2D(BaseWindModel):
             param_vy_4.value,
         ], dtype=float)
 
-        if debug:
-            print("WindModelPathAligned2D")
-            print("  wind:", wind_speed_x, wind_speed_y)
-            print("  course_angle:", course_angle)
-            print("  max abs error:", np.nanmax(abs_err))
-            print("  mean abs error:", np.nanmean(abs_err))
-            print("  true min/max:", np.nanmin(Resistance), np.nanmax(Resistance))
-            print("  fit  min/max:", np.nanmin(R_fit.value), np.nanmax(R_fit.value))
+        A, b = self._sector_linear_constraints(course_angle)
 
-        return np.nanmax(abs_err), coeffs, float(np.nanmax(R_fit.value))
+        return (
+            float(np.nanmax(abs_err)),
+            coeffs,
+            float(np.nanmax(R_fit.value)),
+            float(np.nanmean(np.abs(Resistance))),
+            float(np.nanmax(np.abs(Resistance))),
+            A,
+            b,
+            VX,
+            VY,
+            Resistance,
+            R_fit.value,
+            abs_err,
+        )
 
     def fit_convex_models(
         self,
         wind_speed_x,
         wind_speed_y,
         course_angles,
-        nb_parallel_steps: int = 40,
-        nb_perp_steps: int = 9,
+        nb_speed_steps: int = 40,
+        nb_angle_steps: int = 21,
         debug: bool = False,
         conservative: bool = False,
     ):
-        """
-        wind_speed_x, wind_speed_y: [nb_path_segments, nb_timesteps]
-        course_angles:              [nb_path_segments, nb_timesteps]
-        """
         nb_segments = wind_speed_x.shape[0]
         nb_timesteps = wind_speed_x.shape[1]
 
         self.thrust_coeffs = np.zeros((nb_segments, nb_timesteps, 11))
         self.relative_errors = np.zeros((nb_segments, nb_timesteps))
         self.max_convex_resistance = np.zeros((nb_segments, nb_timesteps))
+        self.mean_true_resistance = np.zeros((nb_segments, nb_timesteps))
+        self.max_true_resistance = np.zeros((nb_segments, nb_timesteps))
+
+        self.speed_constraint_A = np.zeros((nb_segments, 2, 2))
+        self.speed_constraint_b = np.zeros((nb_segments, 2))
+
+        worst = {
+            "err": -np.inf,
+            "s": None,
+            "t": None,
+            "VX": None,
+            "VY": None,
+            "Rtrue": None,
+            "Rfit": None,
+            "E": None,
+        }
 
         for s in range(nb_segments):
+            A, b = self._sector_linear_constraints(course_angles[s, 0])
+            self.speed_constraint_A[s, :, :] = A
+            self.speed_constraint_b[s, :] = b
+
             for t in range(nb_timesteps):
                 (
-                    self.relative_errors[s, t],
-                    self.thrust_coeffs[s, t, :],
-                    self.max_convex_resistance[s, t],
+                    err,
+                    coeffs,
+                    max_fit,
+                    mean_true,
+                    max_true,
+                    _A,
+                    _b,
+                    VX,
+                    VY,
+                    Rtrue,
+                    Rfit,
+                    E,
                 ) = self.fit_convex_model(
                     wind_speed_x[s, t],
                     wind_speed_y[s, t],
                     course_angles[s, t],
-                    nb_parallel_steps=nb_parallel_steps,
-                    nb_perp_steps=nb_perp_steps,
-                    debug=debug,
+                    nb_speed_steps=nb_speed_steps,
+                    nb_angle_steps=nb_angle_steps,
+                    debug=False,
                     conservative=conservative,
                 )
 
+                self.relative_errors[s, t] = err
+                self.thrust_coeffs[s, t, :] = coeffs
+                self.max_convex_resistance[s, t] = max_fit
+                self.mean_true_resistance[s, t] = mean_true
+                self.max_true_resistance[s, t] = max_true
+
+                if err > worst["err"]:
+                    worst.update({
+                        "err": err,
+                        "s": s,
+                        "t": t,
+                        "VX": VX,
+                        "VY": VY,
+                        "Rtrue": Rtrue,
+                        "Rfit": Rfit,
+                        "E": E,
+                    })
+
             print("path segment", s, "wind fitted")
+
+        if debug:
+            print("\n[WindModelPathAligned2D debug]")
+            print("Worst absolute fit error:", worst["err"])
+            print("Worst segment:", worst["s"])
+            print("Worst timestep:", worst["t"])
+            print("Average true wind resistance:",
+                  np.nanmean(np.abs(self.mean_true_resistance)))
+            print("Max true wind resistance:",
+                  np.nanmax(np.abs(self.max_true_resistance)))
+
+            for Z, title in [
+                (worst["Rtrue"], "True wind resistance"),
+                (worst["Rfit"], "Fitted wind resistance"),
+                (worst["E"], "Absolute fit error"),
+            ]:
+                fig, ax = plt.subplots(figsize=(6, 5))
+                pcm = ax.pcolormesh(
+                    worst["VX"],
+                    worst["VY"],
+                    Z,
+                    shading="auto",
+                )
+                fig.colorbar(pcm, ax=ax, label="MN")
+                ax.set_xlabel("ship speed x [m/s]")
+                ax.set_ylabel("ship speed y [m/s]")
+                ax.set_title(f"{title} - segment {worst['s']}, timestep {worst['t']}")
+                ax.set_aspect("equal", adjustable="box")
+                fig.tight_layout()
+                plt.show()
 
 
 @dataclass
@@ -1516,76 +1588,78 @@ class WaveModel2D(BaseWaveModel):
 
 @dataclass
 class WaveModelPathAligned2D(BaseWaveModel):
-    """
-    Path-aligned 2D wave resistance convex fit.
+    heading_half_angle_deg: float = 45.0
 
-    Fits R_wave(vx_rel_water, vy_rel_water) over a narrow tube aligned with
-    the fixed path segment direction:
+    def _sector_linear_constraints(self, course_angle: float):
+        theta = np.deg2rad(self.heading_half_angle_deg)
 
-        v_parallel in [fit_range.min_speed, fit_range.max_speed]
-        v_perp     in [-perp_speed_max, +perp_speed_max]
+        u_left = np.array([
+            np.cos(course_angle + theta),
+            np.sin(course_angle + theta),
+        ])
+        u_right = np.array([
+            np.cos(course_angle - theta),
+            np.sin(course_angle - theta),
+        ])
 
-    Inputs vx, vy are speed-through-water components, not earth-fixed speed.
-    """
+        n_left = np.array([u_left[1], -u_left[0]])
+        n_right = np.array([-u_right[1], u_right[0]])
 
-    perp_speed_max: float = 1.0
+        A = np.vstack([n_left, n_right])
+        b = np.zeros(2)
+
+        return A, b
 
     def fit_convex_model(
         self,
-        mean_wave_amplitude: float,
-        mean_wave_frequency: float,
-        mean_wave_length: float,
-        mean_wave_direction: float,
-        course_angle: float,
-        nb_parallel_steps: int = 40,
-        nb_perp_steps: int = 9,
+        mean_wave_amplitude,
+        mean_wave_frequency,
+        mean_wave_length,
+        mean_wave_direction,
+        course_angle,
+        nb_speed_steps: int = 40,
+        nb_angle_steps: int = 21,
         debug: bool = False,
         conservative: bool = False,
     ):
-        v_parallel_vals = np.linspace(
+        theta_max = np.deg2rad(self.heading_half_angle_deg)
+
+        speed_vals = np.linspace(
             self.fit_range.min_speed,
             self.fit_range.max_speed,
-            nb_parallel_steps,
+            nb_speed_steps,
         )
-        v_perp_vals = np.linspace(
-            -self.perp_speed_max,
-            self.perp_speed_max,
-            nb_perp_steps,
+        angle_offsets = np.linspace(
+            -theta_max,
+            theta_max,
+            nb_angle_steps,
         )
 
-        VP, VN = np.meshgrid(v_parallel_vals, v_perp_vals)
+        V, DA = np.meshgrid(speed_vals, angle_offsets)
+        ANG = course_angle + DA
 
-        ux = np.cos(course_angle)
-        uy = np.sin(course_angle)
-        nx = -np.sin(course_angle)
-        ny = np.cos(course_angle)
-
-        VX = VP * ux + VN * nx
-        VY = VP * uy + VN * ny
+        VX = V * np.cos(ANG)
+        VY = V * np.sin(ANG)
         VS = np.sqrt(VX**2 + VY**2)
 
         Resistance = np.zeros_like(VX, dtype=float)
 
         for iy in range(VX.shape[0]):
             for ix in range(VX.shape[1]):
-                ship_speed_rel_water_vec = np.array([VX[iy, ix], VY[iy, ix]], dtype=float)
-                Vs = float(VS[iy, ix])
-
-                wave_relative_angle_encounter = self.compute_wave_relative_angle_encounter(
-                    ship_speed_vector=ship_speed_rel_water_vec,
+                v_vec = np.array([VX[iy, ix], VY[iy, ix]], dtype=float)
+                alpha = self.compute_wave_relative_angle_encounter(
+                    ship_speed_vector=v_vec,
                     mean_wave_direction=mean_wave_direction,
                 )
-
                 Resistance[iy, ix] = self.compute_resistance(
                     mean_wave_amplitude,
                     mean_wave_frequency,
                     mean_wave_length,
-                    Vs,
-                    wave_relative_angle_encounter,
+                    float(VS[iy, ix]),
+                    alpha,
                 )
 
         scale = self.ship.info.max_speed
-
         vx_n = VX / scale
         vy_n = VY / scale
         vs_n = VS / scale
@@ -1593,57 +1667,51 @@ class WaveModelPathAligned2D(BaseWaveModel):
         R_fit = cp.Variable(VX.shape)
 
         intercept = cp.Variable()
-
-        param_vx = cp.Variable()
-        param_vx_2 = cp.Variable()
-        param_vx_4 = cp.Variable()
-
-        param_vy = cp.Variable()
-        param_vy_2 = cp.Variable()
-        param_vy_4 = cp.Variable()
-
         param_vs = cp.Variable()
         param_vs_2 = cp.Variable()
         param_vs_3 = cp.Variable()
         param_vs_4 = cp.Variable()
+        param_vx = cp.Variable()
+        param_vx_2 = cp.Variable()
+        param_vx_4 = cp.Variable()
+        param_vy = cp.Variable()
+        param_vy_2 = cp.Variable()
+        param_vy_4 = cp.Variable()
 
         constraints = [
+            param_vs_2 >= eps,
+            param_vs_3 >= eps,
+            param_vs_4 >= eps,
             param_vx_2 >= eps,
             param_vx_4 >= eps,
             param_vy_2 >= eps,
             param_vy_4 >= eps,
-            param_vs_2 >= eps,
-            param_vs_3 >= eps,
-            param_vs_4 >= eps,
         ]
 
-        for iy in range(VX.shape[0]):
-            for ix in range(VX.shape[1]):
-                expr = (
-                    intercept
-                    + param_vx   * vx_n[iy, ix]
-                    + param_vx_2 * vx_n[iy, ix]**2
-                    + param_vx_4 * vx_n[iy, ix]**4
-                    + param_vy   * vy_n[iy, ix]
-                    + param_vy_2 * vy_n[iy, ix]**2
-                    + param_vy_4 * vy_n[iy, ix]**4
-                    + param_vs   * vs_n[iy, ix]
-                    + param_vs_2 * vs_n[iy, ix]**2
-                    + param_vs_3 * vs_n[iy, ix]**3
-                    + param_vs_4 * vs_n[iy, ix]**4
-                )
+        expr = (
+            intercept
+            + param_vs * vs_n
+            + param_vs_2 * vs_n**2
+            + param_vs_3 * vs_n**3
+            + param_vs_4 * vs_n**4
+            + param_vx * vx_n
+            + param_vx_2 * vx_n**2
+            + param_vx_4 * vx_n**4
+            + param_vy * vy_n
+            + param_vy_2 * vy_n**2
+            + param_vy_4 * vy_n**4
+        )
 
-                constraints += [R_fit[iy, ix] == expr]
+        constraints += [R_fit == expr]
 
-                if conservative:
-                    constraints += [R_fit[iy, ix] >= Resistance[iy, ix]]
+        if conservative:
+            constraints += [R_fit >= Resistance]
 
-        objective = cp.Minimize(cp.sum_squares(R_fit - Resistance))
-        problem = cp.Problem(objective, constraints)
+        problem = cp.Problem(cp.Minimize(cp.sum_squares(R_fit - Resistance)), constraints)
         problem.solve(solver="MOSEK", verbose=debug)
 
         if problem.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-            raise RuntimeError(f"Path-aligned wave fit failed: {problem.status}")
+            raise RuntimeError(f"Wave fit problem not solved optimally: {problem.status}")
 
         abs_err = np.abs(R_fit.value - Resistance)
 
@@ -1661,16 +1729,22 @@ class WaveModelPathAligned2D(BaseWaveModel):
             param_vy_4.value,
         ], dtype=float)
 
-        if debug:
-            print("WaveModelPathAligned2D")
-            print("  course_angle:", course_angle)
-            print("  wave_dir:", mean_wave_direction)
-            print("  max abs error:", np.nanmax(abs_err))
-            print("  mean abs error:", np.nanmean(abs_err))
-            print("  true min/max:", np.nanmin(Resistance), np.nanmax(Resistance))
-            print("  fit  min/max:", np.nanmin(R_fit.value), np.nanmax(R_fit.value))
+        A, b = self._sector_linear_constraints(course_angle)
 
-        return np.nanmax(abs_err), coeffs, float(np.nanmax(R_fit.value))
+        return (
+            float(np.nanmax(abs_err)),
+            coeffs,
+            float(np.nanmax(R_fit.value)),
+            float(np.nanmean(np.abs(Resistance))),
+            float(np.nanmax(np.abs(Resistance))),
+            A,
+            b,
+            VX,
+            VY,
+            Resistance,
+            R_fit.value,
+            abs_err,
+        )
 
     def fit_convex_models(
         self,
@@ -1679,41 +1753,87 @@ class WaveModelPathAligned2D(BaseWaveModel):
         mean_wave_length,
         mean_wave_direction,
         course_angles,
-        nb_parallel_steps: int = 40,
-        nb_perp_steps: int = 9,
+        nb_speed_steps: int = 40,
+        nb_angle_steps: int = 21,
         debug: bool = False,
         conservative: bool = False,
     ):
-        """
-        Arrays are path-segment indexed:
-            shape [nb_path_segments, nb_timesteps]
-        """
         nb_segments = mean_wave_amplitudes.shape[0]
         nb_timesteps = mean_wave_amplitudes.shape[1]
 
         self.thrust_coeffs = np.zeros((nb_segments, nb_timesteps, 11))
         self.relative_errors = np.zeros((nb_segments, nb_timesteps))
         self.max_convex_resistance = np.zeros((nb_segments, nb_timesteps))
+        self.mean_true_resistance = np.zeros((nb_segments, nb_timesteps))
+        self.max_true_resistance = np.zeros((nb_segments, nb_timesteps))
+
+        self.speed_constraint_A = np.zeros((nb_segments, 2, 2))
+        self.speed_constraint_b = np.zeros((nb_segments, 2))
+
+        worst = {"err": -np.inf}
 
         for s in range(nb_segments):
+            A, b = self._sector_linear_constraints(course_angles[s, 0])
+            self.speed_constraint_A[s, :, :] = A
+            self.speed_constraint_b[s, :] = b
+
             for t in range(nb_timesteps):
-                (
-                    self.relative_errors[s, t],
-                    self.thrust_coeffs[s, t, :],
-                    self.max_convex_resistance[s, t],
-                ) = self.fit_convex_model(
+                out = self.fit_convex_model(
                     mean_wave_amplitudes[s, t],
                     mean_wave_frequency[s, t],
                     mean_wave_length[s, t],
                     mean_wave_direction[s, t],
                     course_angles[s, t],
-                    nb_parallel_steps=nb_parallel_steps,
-                    nb_perp_steps=nb_perp_steps,
-                    debug=debug,
+                    nb_speed_steps=nb_speed_steps,
+                    nb_angle_steps=nb_angle_steps,
+                    debug=False,
                     conservative=conservative,
                 )
 
+                err, coeffs, max_fit, mean_true, max_true, A, b, VX, VY, Rtrue, Rfit, E = out
+
+                self.relative_errors[s, t] = err
+                self.thrust_coeffs[s, t, :] = coeffs
+                self.max_convex_resistance[s, t] = max_fit
+                self.mean_true_resistance[s, t] = mean_true
+                self.max_true_resistance[s, t] = max_true
+
+                if err > worst["err"]:
+                    worst = {
+                        "err": err,
+                        "s": s,
+                        "t": t,
+                        "VX": VX,
+                        "VY": VY,
+                        "Rtrue": Rtrue,
+                        "Rfit": Rfit,
+                        "E": E,
+                    }
+
             print("path segment", s, "wave fitted")
+
+        if debug:
+            print("\n[WaveModelPathAligned2D debug]")
+            print("Worst absolute fit error:", worst["err"])
+            print("Worst segment:", worst["s"])
+            print("Worst timestep:", worst["t"])
+            print("Average true wave resistance:", np.nanmean(np.abs(self.mean_true_resistance)))
+            print("Max true wave resistance:", np.nanmax(np.abs(self.max_true_resistance)))
+
+            for Z, title in [
+                (worst["Rtrue"], "True wave resistance"),
+                (worst["Rfit"], "Fitted wave resistance"),
+                (worst["E"], "Absolute wave fit error"),
+            ]:
+                fig, ax = plt.subplots(figsize=(6, 5))
+                pcm = ax.pcolormesh(worst["VX"], worst["VY"], Z, shading="auto")
+                fig.colorbar(pcm, ax=ax, label="MN")
+                ax.set_xlabel("speed rel. water x [m/s]")
+                ax.set_ylabel("speed rel. water y [m/s]")
+                ax.set_title(f"{title} - segment {worst['s']}, timestep {worst['t']}")
+                ax.set_aspect("equal", adjustable="box")
+                fig.tight_layout()
+                plt.show()
 
 @dataclass
 class PropulsionModel:

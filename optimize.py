@@ -13,10 +13,10 @@ from lib.simulation import run_simulink_model
 from dataclasses import dataclass
 
 
-new_weather = False
+new_weather = True
 new_ship = False
 see_previous_sol = False
-dimensions = "both"  # "1D", "2D" or "both"
+dimensions = "2D"  # "1D", "2D" or "both"
 
 
 if __name__ == "__main__":
@@ -143,9 +143,9 @@ if __name__ == "__main__":
                 wind_x_path,
                 wind_y_path,
                 course_angles,
-                nb_parallel_steps=30,
-                nb_perp_steps=15,
-                debug=False,
+                #nb_parallel_steps=30,
+                #nb_perp_steps=15,
+                debug=True,
             )
 
             wave_model_path_2D = WaveModelPathAligned2D(ship, fit_range)
@@ -155,9 +155,9 @@ if __name__ == "__main__":
                 wave_len_path,
                 wave_dir_path,
                 course_angles,
-                nb_parallel_steps=30,
-                nb_perp_steps=15,
-                debug=False,
+                #nb_parallel_steps=30,
+                #nb_perp_steps=15,
+                debug=True,
             )
 
             save_obj(WIND_MODEL_PATH_ALIGNED_2D, wind_model_path_2D)

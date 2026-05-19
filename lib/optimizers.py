@@ -503,12 +503,26 @@ class GlobalOptimizer:
         for t in range(T_future):
             for h in range(H):
                 active_zone = zone[t + h, :]
-
                 if interval_sail_fraction[t] > 0.01:
+                                            
                     for z in range(self.map.nb_zones):
+                        if z not in zone_to_segment:
+                            continue
+                        s = zone_to_segment[z]
+                        A = self.wind_model.speed_constraint_A[s][:2]
+                        b = self.wind_model.speed_constraint_b[s][:2]
+
+                        for k in range(A.shape[0]):
+                            constraints += [
+                                A[k, 0] * ship_speed_x[t, h]
+                                + A[k, 1] * ship_speed_y[t, h]
+                                >= b[k] - 1000 * (1 - active_zone[z])
+                            ]
                         s = zone_to_segment[z]
                         c = wind_model_future[s, t, :]
                         cw = wave_model_future[s, t, :]
+
+
                         constraints += [
                             wind_resistance[t, h] >=
                             c[0]
@@ -726,6 +740,7 @@ class GlobalOptimizer:
 
         # ================================================= SOLVE ======================================================
         problem = cp.Problem(objective, constraints)
+
         start_solve = time.time()
 
         problem.solve(
