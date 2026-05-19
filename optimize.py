@@ -10,12 +10,14 @@ from lib.optimizers import GlobalOptimizer, NaiveController, Fixed_Path_Optimize
 from lib.utils import point_in_zones, dx_dy_km, classify_timesteps, _assert_finite, xy_from_path_distance
 from lib.evaluation import compute_non_convex_cost_all_timesteps
 from lib.simulation import run_simulink_model
+from dataclasses import dataclass
 
 
 new_weather = False
-new_ship = True
+new_ship = False
 see_previous_sol = False
-dimensions = "1D"  # "1D", "2D" or "both"
+dimensions = "2D"  # "1D", "2D" or "both"
+
 
 if __name__ == "__main__":
     
@@ -24,6 +26,9 @@ if __name__ == "__main__":
     _assert_finite("map.zone_adj", map.zone_adj)
     _assert_finite("map.trans_ineq_to", map.trans_ineq_to)
     _assert_finite("map.trans_ineq_from", map.trans_ineq_from)
+
+    #weather.current_x[5, :] = float(-2)
+    #weather.current_y[6, :] = float(-2)
 
     x, y, _ = dx_dy_km(map, itinerary.transits[-1].lat, itinerary.transits[-1].lon)
 
@@ -117,6 +122,7 @@ if __name__ == "__main__":
             save_obj(WIND_MODEL_1D, wind_model_1D)
 
         if dimensions == "2D" or dimensions == "both":
+            '''
             wind_model_2D = WindModel2D(ship, fit_range)
             wind_model_2D.fit_convex_models(weather.wind_x, weather.wind_y)
             print("average max error wind 2D", np.mean(wind_model_2D.relative_errors) , "%")
@@ -130,6 +136,32 @@ if __name__ == "__main__":
 
             save_obj(WAVE_MODEL_2D, wave_model_2D)
             save_obj(WIND_MODEL_2D, wind_model_2D)
+            '''
+
+            wind_model_path_2D = WindModelPathAligned2D(ship, fit_range)
+            wind_model_path_2D.fit_convex_models(
+                wind_x_path,
+                wind_y_path,
+                course_angles,
+                #nb_parallel_steps=30,
+                #nb_perp_steps=15,
+                debug=True,
+            )
+
+            wave_model_path_2D = WaveModelPathAligned2D(ship, fit_range)
+            wave_model_path_2D.fit_convex_models(
+                wave_amp_path,
+                wave_freq_path,
+                wave_len_path,
+                wave_dir_path,
+                course_angles,
+                #nb_parallel_steps=30,
+                #nb_perp_steps=15,
+                debug=True,
+            )
+
+            save_obj(WIND_MODEL_PATH_ALIGNED_2D, wind_model_path_2D)
+            save_obj(WAVE_MODEL_PATH_ALIGNED_2D, wave_model_path_2D)
   
 
         end = time.time()
@@ -140,8 +172,10 @@ if __name__ == "__main__":
             wave_model_1D = load_obj(WAVE_MODEL_1D)
             wind_model_1D = load_obj(WIND_MODEL_1D)
         if dimensions == "2D" or dimensions == "both":
-            wave_model_2D = load_obj(WAVE_MODEL_2D)
-            wind_model_2D = load_obj(WIND_MODEL_2D)
+            #wave_model_2D = load_obj(WAVE_MODEL_2D)
+            #wind_model_2D = load_obj(WIND_MODEL_2D)
+            wind_model_path_2D = load_obj(WIND_MODEL_PATH_ALIGNED_2D)
+            wave_model_path_2D = load_obj(WAVE_MODEL_PATH_ALIGNED_2D)
         print("Saved weather model loaded")
     
     if see_previous_sol:
@@ -151,7 +185,7 @@ if __name__ == "__main__":
             "solution_02_Global.pkl",
         ]
         solutions = load_solutions_from_pkl(files, subfolder="my_experiment")
-        plot_solutions(solutions)
+        plot_solutions(solutions, benchmark_label="Naive Controller")
 
     else:
         if path.sol is None:
@@ -175,6 +209,11 @@ if __name__ == "__main__":
         naive.generator_models = generatorModels
         naive.calm_model=calm_model
         n_all, naive_solution, dt_h, best_pitch = compute_non_convex_cost_all_timesteps(naive)
+
+        print("Shortest path waypoints:")
+        print(path.sol.waypoints)
+        print("Shortest path zone sequence:")
+        print(path.sol.zone_sequence)
 
         if dimensions == "1D" or dimensions == "both":
             optimizer = Fixed_Path_Optimizer(
@@ -200,22 +239,70 @@ if __name__ == "__main__":
                 naive_solution=naive.sol,
                 naive_segment_radius=1,
             )
-
             if ok:
                 print("Optimization succeeded.")
                 n_all, fixed_path_sol, dt_h, best_pitch = compute_non_convex_cost_all_timesteps(optimizer, debug=False)
-                plot_solutions([optimizer.sol, fixed_path_sol],["Convex Fixed Path solution", "Non-convex Fixed Path solution"], show=True, subfolder="Fixed Path")
-                plot_solutions([fixed_path_sol, naive_solution],["Fixed Path Optimizer", "Naive Controller"], show = True, subfolder="All sol compared")
+                def _point_to_polyline_min_dist(points, waypoints):
+                    points = np.asarray(points, dtype=float)
+                    waypoints = np.asarray(waypoints, dtype=float)
+
+                    seg_a = waypoints[:-1]
+                    seg_b = waypoints[1:]
+                    seg_v = seg_b - seg_a
+                    seg_l2 = np.sum(seg_v**2, axis=1)
+
+                    out = []
+                    for p in points:
+                        best = np.inf
+                        for a, v, l2 in zip(seg_a, seg_v, seg_l2):
+                            if l2 <= 1e-12:
+                                continue
+                            u = np.clip(np.dot(p - a, v) / l2, 0.0, 1.0)
+                            proj = a + u * v
+                            best = min(best, np.linalg.norm(p - proj))
+                        out.append(best)
+
+                    return np.asarray(out)
+
+
+                for name, sol in [
+                    ("optimizer.sol", optimizer.sol),
+                    ("fixed_path_sol", fixed_path_sol),
+                    ("naive.sol", naive.sol),
+                    ("naive_solution", naive_solution),
+                ]:
+                    print("\n---", name, "---")
+                    print("has fixed_path_waypoints:", getattr(sol, "fixed_path_waypoints", None) is not None)
+                    print("has crossing_point:", getattr(sol, "crossing_point", None) is not None)
+                    print("ship_pos first/last:", sol.ship_pos[0], sol.ship_pos[-1])
+
+                    wp = getattr(sol, "fixed_path_waypoints", None)
+                    if wp is None:
+                        wp = path.sol.waypoints
+
+                    d = _point_to_polyline_min_dist(sol.ship_pos, wp)
+                    print("max distance ship_pos to fixed path [km]:", np.max(d))
+                    print("mean distance ship_pos to fixed path [km]:", np.mean(d))
+
+                    if getattr(sol, "crossing_point", None) is not None:
+                        dq = _point_to_polyline_min_dist(sol.crossing_point, wp)
+                        print("max distance crossing_point to fixed path [km]:", np.max(dq))
+                        print("mean distance crossing_point to fixed path [km]:", np.mean(dq))
+                plot_solutions([optimizer.sol, fixed_path_sol],["Convex Fixed Path solution", "Non-convex Fixed Path solution"], benchmark_label="Non-convex Fixed Path solution", show=False, subfolder="Fixed Path", map=optimizer.map)
             else:
                 print("Optimization failed.")
+
+            if dimensions == "1D":
+                plot_solutions([fixed_path_sol, naive_solution],["Global Optimizer", "Naive Controller"], benchmark_label="Naive Controller", show = True, subfolder="All sol compared", map=optimizer.map)
+                
 
             
        
         
         if dimensions == "2D" or dimensions == "both":
             optimizer = GlobalOptimizer(
-                wave_model          = wave_model_2D,
-                wind_model          = wind_model_2D,
+                wave_model          = wave_model_path_2D,
+                wind_model          = wind_model_path_2D,
                 propulsion_model    = propulsion_model,
                 calm_model          = calm_model,
                 generator_models    = generatorModels,
@@ -224,7 +311,8 @@ if __name__ == "__main__":
                 states              = states,
                 weather             = weather,
                 ship                = ship,
-                ref_speed           = ref_speed,)
+                ref_speed           = ref_speed,
+                path_zone_ids=path.sol.zone_sequence,)
 
             # Plot current position and destination
             init_pos = np.array([optimizer.states.current_x_pos, optimizer.states.current_y_pos])
@@ -235,18 +323,23 @@ if __name__ == "__main__":
                 debug=True,
                 ordered_zones = True,
                 min_timestep = True,
-                restrict_to_naive=True,
+                restrict_to_naive=False,
                 naive_solution=naive.sol,
                 naive_zone_radius=1,
             )
             plot_zones_and_points(optimizer.sol.ship_pos, optimizer.map.zone_ineq)
             n_all, global_sol, dt_h, best_pitch = compute_non_convex_cost_all_timesteps(optimizer, debug=False)
-            plot_solutions([optimizer.sol, global_sol],["Convex Gloabal solution", "Non-convex Global solution"], show=True, subfolder="Global Path")
-            plot_solutions([global_sol, naive_solution],["Global Optimizer", "Naive Controller"], show = True, subfolder="All sol compared")
+            plot_solutions([optimizer.sol, global_sol],["Convex Gloabal solution", "Non-convex Global solution"], benchmark_label="Non-convex Global solution", show=False, subfolder="Global Path", map=optimizer.map)
+            if dimensions == "2D":
+                plot_solutions([global_sol, naive_solution],["Global Optimizer", "Naive Controller"], benchmark_label="Naive Controller", show = True, subfolder="All sol compared", map=optimizer.map)
+        if dimensions == "both":
+            plot_solutions([global_sol, fixed_path_sol, naive_solution],["Global Optimizer", "Fixed Path Optimizer", "Naive Controller"], benchmark_label="Naive Controller", show = True, subfolder="All sol compared", map=optimizer.map)
+
 
 
 
     # Optimize and Simulate
+'''
 total_cost_simul = 0
 total_cost_conv = 0
 total_cost_nonconv = 0
@@ -256,7 +349,7 @@ end_x, end_y, _ = dx_dy_km(
     itinerary.transits[-1].lat,
     itinerary.transits[-1].lon,
 )
-'''
+
 while states.timesteps_completed < itinerary.nb_timesteps:
     print("Current timestep:", states.timesteps_completed)
 
