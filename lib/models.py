@@ -916,7 +916,7 @@ class WindModelPathAligned2D(BaseWindModel):
     where vx, vy, vs are normalized by ship.info.max_speed.
     """
 
-    perp_speed_max: float = 1.0
+    perp_speed_max: float = 3.0
 
     def fit_convex_model(
         self,
@@ -1031,16 +1031,16 @@ class WindModelPathAligned2D(BaseWindModel):
 
         coeffs = np.array([
             intercept.value,
+            param_vs.value,
+            param_vs_2.value,
+            param_vs_3.value,
+            param_vs_4.value,
             param_vx.value,
             param_vx_2.value,
             param_vx_4.value,
             param_vy.value,
             param_vy_2.value,
             param_vy_4.value,
-            param_vs.value,
-            param_vs_2.value,
-            param_vs_3.value,
-            param_vs_4.value,
         ], dtype=float)
 
         if debug:
@@ -1649,16 +1649,16 @@ class WaveModelPathAligned2D(BaseWaveModel):
 
         coeffs = np.array([
             intercept.value,
+            param_vs.value,
+            param_vs_2.value,
+            param_vs_3.value,
+            param_vs_4.value,
             param_vx.value,
             param_vx_2.value,
             param_vx_4.value,
             param_vy.value,
             param_vy_2.value,
             param_vy_4.value,
-            param_vs.value,
-            param_vs_2.value,
-            param_vs_3.value,
-            param_vs_4.value,
         ], dtype=float)
 
         if debug:
@@ -2072,10 +2072,9 @@ class PropulsionModel:
 
     def plot_power_surface_speed_resistance(self):
         """
-        Plot 3D REAL and FITTED power surfaces over (advance speed, thrust),
-        hiding infeasible points (no zeros) and autoscaling axes accordingly.
+        Plot REAL and FITTED power as separate 2D heatmaps.
+        Figure size automatically adapts to large labels/titles.
         """
-        from matplotlib.patches import Patch
         import numpy as np
         import matplotlib.pyplot as plt
 
@@ -2084,51 +2083,74 @@ class PropulsionModel:
 
         mask = np.asarray(self.mask_fit, dtype=bool)
 
-        # --- Hide infeasible points (NaN removes them from plot_surface) ---
+        # --- Hide infeasible points ---
         P_real_plot = np.where(mask, self.P_real, np.nan)
         P_fit_plot  = np.where(mask, self.P_fit,  np.nan)
 
-        fig = plt.figure(figsize=(12, 9))
-        ax = fig.add_subplot(111, projection="3d")
-
-        ax.plot_surface(
-            self.U, self.T, P_real_plot,
-            color="green", alpha=0.7, linewidth=0, antialiased=True
-        )
-        ax.plot_surface(
-            self.U, self.T, P_fit_plot,
-            color="red", alpha=0.4, linewidth=0, antialiased=True
-        )
-
-        # --- Axis limits based on feasible points only ---
-        U_feas = self.U[mask]
-        T_feas = self.T[mask]
-        # Use finite power values (NaNs are excluded)
-        Z_feas = np.concatenate([P_real_plot[mask], P_fit_plot[mask]])
-        Z_feas = Z_feas[np.isfinite(Z_feas)]
-
-        ax.set_xlim(np.nanmin(U_feas), np.nanmax(U_feas))
-        ax.set_ylim(np.nanmin(T_feas), np.nanmax(T_feas))
-        if Z_feas.size:
-            ax.set_zlim(np.min(Z_feas), np.max(Z_feas))
-
-        ax.set_xlabel("Speed [m/s]", fontsize=16, labelpad=15)
-        ax.set_ylabel("Thrust [MN]", fontsize=16, labelpad=15)
-        ax.set_zlabel("Power [MW]", fontsize=16, labelpad=15)
-        ax.set_title("Real (B-series) vs Fitted Convex Power Model", fontsize=18, pad=25)
-
-        ax.tick_params(axis='both', which='major', labelsize=14)
-        ax.tick_params(axis='z', labelsize=14)
-
-        legend_elements = [
-            Patch(facecolor=plt.cm.viridis(0.6), edgecolor='k', label='Real'),
-            Patch(facecolor=plt.cm.plasma(0.6), edgecolor='k', label='Fitted')
+        plots = [
+            ("Real B-series Power", P_real_plot),
+            ("Convex Fitted Power", P_fit_plot),
         ]
-        ax.legend(handles=legend_elements, loc="upper left", fontsize=14)
 
-        ax.view_init(elev=25, azim=-135)
-        plt.tight_layout()
-        plt.show()
+        for title, Z in plots:
+
+            # Bigger adaptive figure
+            fig, ax = plt.subplots(
+                figsize=(14, 10),
+                constrained_layout=True   # <-- key fix
+            )
+
+            heat = ax.imshow(
+                Z,
+                extent=[
+                    self.min_thrust,
+                    self.max_thrust,
+                    self.min_ua,
+                    self.max_ua
+                ],
+                origin='lower',
+                aspect='auto',
+                cmap="inferno"
+            )
+
+            cbar = fig.colorbar(
+                heat,
+                ax=ax,
+                pad=0.02
+            )
+
+            cbar.set_label(
+                "Power [MW]",
+                fontsize=24,
+                labelpad=20
+            )
+
+            cbar.ax.tick_params(labelsize=18)
+
+            ax.set_xlabel(
+                "Resistance [MN]",
+                fontsize=28,
+                labelpad=20
+            )
+
+            ax.set_ylabel(
+                "Advance Speed [m/s]",
+                fontsize=28,
+                labelpad=20
+            )
+
+            ax.set_title(
+                title,
+                fontsize=24,
+                pad=25
+            )
+
+            ax.tick_params(
+                axis='both',
+                labelsize=20
+            )
+
+            plt.show()
 
     def plot_power_error_heatmap(self):
         """

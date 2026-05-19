@@ -11,6 +11,11 @@ outputs/
 plots/
 tmp/
 simulation/
+config/weather/
+cache/
+*.nc
+*.pkl
+
 
 *.png
 *.pdf

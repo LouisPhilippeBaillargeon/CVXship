@@ -7,7 +7,7 @@ import os
 import re
 import pickle
 
-from lib.paths import PLOTS
+from lib.paths import PLOTS, NAVIGABILITY_MAP
 from lib.utils import _halfspace_polygon_4ineq
 
 # ====================== PLOTTING UTILITIES ======================
@@ -64,62 +64,35 @@ def _save_and_maybe_show(
     directory=PLOTS,
     font_scale: float = 1.0,
 ):
-    """
-    Save figure to PLOTS/<name>.png with robust layout handling.
-
-    Parameters
-    ----------
-    fig : matplotlib.figure.Figure
-    name : str
-        File name (without extension)
-    show : bool
-        If True, display the figure
-    directory : str
-        Output directory
-    font_scale : float
-        Multiplier for all text sizes (e.g., 1.5, 2.0)
-    """
     import os
     import matplotlib.pyplot as plt
 
-    _ensure_plots_dir()
+    os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, f"{name}.png")
 
-    # -----------------------------
-    # Scale all fonts in the figure
-    # -----------------------------
     if font_scale != 1.0:
         for ax in fig.get_axes():
-            # Title
             if ax.title:
                 ax.title.set_fontsize(ax.title.get_fontsize() * font_scale)
 
-            # Axis labels
             if ax.xaxis.label:
                 ax.xaxis.label.set_fontsize(ax.xaxis.label.get_fontsize() * font_scale)
             if ax.yaxis.label:
                 ax.yaxis.label.set_fontsize(ax.yaxis.label.get_fontsize() * font_scale)
 
-            # Tick labels
             for label in ax.get_xticklabels() + ax.get_yticklabels():
                 label.set_fontsize(label.get_fontsize() * font_scale)
 
-            # Legend
             leg = ax.get_legend()
             if leg is not None:
                 for text in leg.get_texts():
                     text.set_fontsize(text.get_fontsize() * font_scale)
 
-    # -----------------------------
-    # Layout fix (prevents clipping)
-    # -----------------------------
     fig.tight_layout(pad=1.2)
     fig.subplots_adjust(left=0.18, bottom=0.18)
 
-    # -----------------------------
-    # Save
-    # -----------------------------
     fig.savefig(path, bbox_inches="tight", dpi=300)
+    print(f"[SAVED] {path}")
 
     if show:
         plt.show()
@@ -171,189 +144,782 @@ def _plot_xy(
         ax.legend(loc="best", frameon=False)
 
     _finalize_axis(ax, xlabel=xlabel, ylabel=ylabel, title=name)
-    _save_and_maybe_show(fig, name, show, directory=directory)
+    _save_and_maybe_show(fig, name, show, directory=directory,font_scale = 2.0)
 
+def _get_solution_positions(sol, n_expected=None):
+    if not hasattr(sol, "ship_pos") or sol.ship_pos is None:
+        return None
+
+    pos = np.asarray(sol.ship_pos, dtype=float)
+
+    if pos.ndim != 2 or pos.shape[1] != 2:
+        return None
+
+    if n_expected is not None:
+        pos = pos[:n_expected]
+
+    return pos
+
+
+def _zone_polygons_from_ineq(zone_ineq, eps_poly=1e-9):
+    polygons = []
+    nb_zones = zone_ineq.shape[2]
+
+    for z in range(nb_zones):
+        A = np.column_stack([
+            zone_ineq[1, :, z],  # x coefficient
+            zone_ineq[0, :, z],  # y coefficient
+        ])
+        b = zone_ineq[2, :, z].astype(float)
+
+        verts, _ = _halfspace_polygon_4ineq(A, b, eps=eps_poly)
+        if verts is not None:
+            polygons.append((z, verts))
+
+    return polygons
+
+
+def _draw_feasibility_map(ax, map_obj, alpha=0.35):
+    if not os.path.exists(NAVIGABILITY_MAP):
+        print(f"[WARN] NAVIGABILITY_MAP not found: {NAVIGABILITY_MAP}")
+        return False
+
+    nav = np.load(NAVIGABILITY_MAP)
+
+    ax.imshow(
+        nav,
+        cmap="Greys",
+        origin="lower",
+        extent=[
+            0.0,
+            float(map_obj.info.span_km_east),
+            0.0,
+            float(map_obj.info.span_km_north),
+        ],
+        interpolation="nearest",
+        alpha=alpha,
+        zorder=0,
+    )
+    return True
+
+
+def _draw_colored_zones(ax, zone_ineq, alpha=0.25, eps_poly=1e-9, label_zones=True):
+    polygons = _zone_polygons_from_ineq(zone_ineq, eps_poly=eps_poly)
+    cmap = plt.get_cmap("tab20")
+
+    all_verts = []
+
+    for z, verts in polygons:
+        color = cmap(z % cmap.N)
+        all_verts.append(verts)
+
+        ax.fill(
+            verts[:, 0],
+            verts[:, 1],
+            color=color,
+            alpha=alpha,
+            zorder=2,
+        )
+        ax.plot(
+            np.r_[verts[:, 0], verts[0, 0]],
+            np.r_[verts[:, 1], verts[0, 1]],
+            color=color,
+            linewidth=1.0,
+            zorder=3,
+        )
+
+        if label_zones:
+            c = verts.mean(axis=0)
+            ax.text(
+                c[0],
+                c[1],
+                str(z),
+                fontsize=8,
+                ha="center",
+                va="center",
+                zorder=4,
+            )
+
+    return all_verts
+
+
+def _draw_transition_constraints(
+    ax,
+    map_obj,
+    alpha=0.55,
+    linewidth=1.1,
+    linestyle="--",
+):
+    """
+    Draw transition constraint boundaries from map_obj.trans_ineq_to/from.
+
+    Assumes inequalities are stored as:
+        [Ay, Ax, Ac]
+    meaning:
+        Ay*y + Ax*x + Ac >= 0
+
+    This only draws the boundary line Ay*y + Ax*x + Ac = 0.
+    """
+    if not hasattr(map_obj, "trans_ineq_to") or not hasattr(map_obj, "trans_ineq_from"):
+        print("[WARN] map_obj has no trans_ineq_to/trans_ineq_from; skipping transition constraints.")
+        return []
+
+    x_min = 0.0
+    x_max = float(map_obj.info.span_km_east)
+    y_min = 0.0
+    y_max = float(map_obj.info.span_km_north)
+
+    xs = np.linspace(x_min, x_max, 300)
+    drawn_xy = []
+
+    def draw_one_family(trans_ineq, label_prefix):
+        nonlocal drawn_xy
+
+        if trans_ineq is None:
+            return
+
+        trans_ineq = np.asarray(trans_ineq, dtype=float)
+
+        # Expected shape: [2, 3, nb_zones, nb_zones]
+        if trans_ineq.ndim != 4 or trans_ineq.shape[1] != 3:
+            print(f"[WARN] Unexpected {label_prefix} shape: {trans_ineq.shape}")
+            return
+
+        nb_i = trans_ineq.shape[2]
+        nb_j = trans_ineq.shape[3]
+
+        first_label = True
+
+        for z_from in range(nb_i):
+            for z_to in range(nb_j):
+                block = trans_ineq[:, :, z_from, z_to]
+
+                if np.all(np.abs(block) < 1e-12):
+                    continue
+
+                for k in range(block.shape[0]):
+                    Ay, Ax, Ac = block[k, :]
+
+                    if abs(Ay) < 1e-12 and abs(Ax) < 1e-12:
+                        continue
+
+                    # Boundary: Ay*y + Ax*x + Ac = 0
+                    if abs(Ay) > 1e-12:
+                        ys = -(Ax * xs + Ac) / Ay
+                        mask = np.isfinite(ys) & (ys >= y_min) & (ys <= y_max)
+
+                        if np.count_nonzero(mask) < 2:
+                            continue
+
+                        x_plot = xs[mask]
+                        y_plot = ys[mask]
+
+                    else:
+                        # Vertical line: Ax*x + Ac = 0
+                        x0 = -Ac / Ax
+                        if not (x_min <= x0 <= x_max):
+                            continue
+
+                        y_plot = np.linspace(y_min, y_max, 300)
+                        x_plot = np.full_like(y_plot, x0)
+
+                    label = "Transition constraints" if first_label else None
+                    first_label = False
+
+                    ax.plot(
+                        x_plot,
+                        y_plot,
+                        linestyle=linestyle,
+                        linewidth=linewidth,
+                        alpha=alpha,
+                        label=label,
+                        zorder=8,
+                    )
+
+                    drawn_xy.append(np.column_stack([x_plot, y_plot]))
+
+    draw_one_family(map_obj.trans_ineq_to, "trans_ineq_to")
+    draw_one_family(map_obj.trans_ineq_from, "trans_ineq_from")
+
+    return drawn_xy
+
+
+def _plot_solution_map_overlay(
+    solutions,
+    labels,
+    map_obj,
+    T,
+    show=False,
+    directory=PLOTS,
+    name="cmp_ship_pos_xy_map",
+    draw_feasibility=True,
+    draw_zones=True,
+    show_positions=False,
+    show_crossing_points=False,
+    draw_transition_constraints = False,
+):
+    positions = [_get_solution_positions(sol, T + 1) for sol in solutions]
+
+    if not any(pos is not None and pos.shape[0] > 0 for pos in positions):
+        print("[WARN] No valid ship_pos found; skipping solution map overlay.")
+        return
+
+    fig, ax = plt.subplots(figsize=(7.2, 6.0), dpi=150)
+
+    all_xy = []
+
+    if draw_feasibility:
+        _draw_feasibility_map(ax, map_obj)
+
+    if draw_zones:
+        zone_polys = _draw_colored_zones(ax, map_obj.zone_ineq)
+        all_xy.extend(zone_polys)
+
+    for sol, pos, label in zip(solutions, positions, labels):
+        if pos is None or pos.shape[0] == 0:
+            continue
+
+        pos = np.asarray(pos, dtype=float)
+
+        fixed_path_xy = getattr(sol, "fixed_path_waypoints", None)
+        crossing_point = getattr(sol, "crossing_point", None)
+
+        color = ax._get_lines.get_next_color()
+
+        # ============================================================
+        # FIXED PATH SOLUTIONS
+        # ============================================================
+        if fixed_path_xy is not None:
+
+            fixed_path_xy = np.asarray(fixed_path_xy, dtype=float)
+
+            if (
+                fixed_path_xy.ndim == 2
+                and fixed_path_xy.shape[1] == 2
+                and fixed_path_xy.shape[0] >= 2
+            ):
+                all_xy.append(fixed_path_xy)
+
+                # Main displayed trajectory
+                ax.plot(
+                    fixed_path_xy[:, 0],
+                    fixed_path_xy[:, 1],
+                    "-",
+                    linewidth=2.0,
+                    color=color,
+                    label=label,
+                    zorder=10,
+                )
+
+                # Optional timestep positions
+                if show_positions:
+                    ax.scatter(
+                        pos[:, 0],
+                        pos[:, 1],
+                        s=24,
+                        marker="o",
+                        color=color,
+                        zorder=12,
+                    )
+
+        # ============================================================
+        # GLOBAL / BROKEN SEGMENT SOLUTIONS
+        # ============================================================
+        elif crossing_point is not None:
+
+            Q = np.asarray(crossing_point, dtype=float)
+
+            print("\n[PLOT DEBUG]", label)
+            print("pos shape:", pos.shape)
+            print("crossing_point shape:", Q.shape)
+            print("fixed_path_waypoints is None:", fixed_path_xy is None)
+
+            if (
+                Q.ndim == 2
+                and Q.shape[1] == 2
+                and Q.shape[0] == pos.shape[0] - 1
+            ):
+
+                broken_x = []
+                broken_y = []
+
+                for t in range(pos.shape[0] - 1):
+
+                    p0 = pos[t]
+                    q = Q[t]
+                    p1 = pos[t + 1]
+
+                    broken_x.extend([p0[0], q[0], p1[0], np.nan])
+                    broken_y.extend([p0[1], q[1], p1[1], np.nan])
+
+                broken_xy = np.column_stack([broken_x, broken_y])
+                all_xy.append(broken_xy[np.isfinite(broken_xy[:, 0])])
+
+                # Main displayed trajectory
+                ax.plot(
+                    broken_x,
+                    broken_y,
+                    "-",
+                    linewidth=2.0,
+                    color=color,
+                    label=label,
+                    zorder=10,
+                )
+
+                # Optional timestep positions
+                if show_positions:
+                    ax.scatter(
+                        pos[:, 0],
+                        pos[:, 1],
+                        s=22,
+                        marker="o",
+                        color=color,
+                        zorder=12,
+                    )
+
+                # Optional transition/crossing points
+                if show_crossing_points:
+                    ax.scatter(
+                        Q[:, 0],
+                        Q[:, 1],
+                        s=28,
+                        marker="x",
+                        color=color,
+                        zorder=13,
+                    )
+
+        # ============================================================
+        # FALLBACK
+        # ============================================================
+        else:
+
+            all_xy.append(pos)
+
+            ax.plot(
+                pos[:, 0],
+                pos[:, 1],
+                "-",
+                linewidth=2.0,
+                color=color,
+                label=label,
+                zorder=10,
+            )
+
+            if show_positions:
+                ax.scatter(
+                    pos[:, 0],
+                    pos[:, 1],
+                    s=24,
+                    marker="o",
+                    color=color,
+                    zorder=12,
+                )
+
+        # Start/end markers
+        ax.scatter(
+            pos[0, 0],
+            pos[0, 1],
+            s=70,
+            marker="s",
+            color=color,
+            zorder=15,
+        )
+
+        ax.scatter(
+            pos[-1, 0],
+            pos[-1, 1],
+            s=90,
+            marker="*",
+            color=color,
+            zorder=15,
+        )
+
+    # ============================================================
+    # AXIS LIMITS
+    # ============================================================
+    if all_xy:
+        all_xy = np.vstack(all_xy)
+
+        xmin, ymin = np.nanmin(all_xy, axis=0)
+        xmax, ymax = np.nanmax(all_xy, axis=0)
+
+        dx = max(xmax - xmin, 1e-6)
+        dy = max(ymax - ymin, 1e-6)
+
+        pad = 0.08
+
+        ax.set_xlim(xmin - pad * dx, xmax + pad * dx)
+        ax.set_ylim(ymin - pad * dy, ymax + pad * dy)
+
+    else:
+        ax.set_xlim(0, map_obj.info.span_km_east)
+        ax.set_ylim(0, map_obj.info.span_km_north)
+
+    ax.set_aspect("equal", adjustable="box")
+
+    ax.legend(loc="best", frameon=False)
+
+    _finalize_axis(
+        ax,
+        xlabel="x position [km]",
+        ylabel="y position [km]",
+        title="Ship trajectory over feasibility map",
+    )
+
+    _save_and_maybe_show(fig, name, show, directory=directory ,font_scale = 2.0)
 
 # ====================== MAIN SUMMARY / PLOTTING FUNCTIONS ======================
+def _flatten_TH(y):
+    y = np.asarray(y, dtype=float)
+    if y.ndim == 1:
+        return y
+    if y.ndim == 2:  # [T, H]
+        return y.reshape(-1)
+    return y
+
+
+def _flatten_gen_NTH(y):
+    y = np.asarray(y, dtype=float)
+    if y.ndim == 2:  # [nb_gen, T]
+        return y
+    if y.ndim == 3:  # [nb_gen, T, H]
+        return y.reshape(y.shape[0], -1)
+    return y
+
+
+def _speed_mag_from_solution(sol):
+    v = np.asarray(sol.ship_speed, dtype=float)
+
+    if v.ndim == 2:      # [T, 2]
+        return np.linalg.norm(v, axis=1)
+
+    if v.ndim == 3:
+        if v.shape[1] == 2:   # [T, 2, H]
+            return np.linalg.norm(v, axis=1).reshape(-1)
+        if v.shape[2] == 2:   # [T, H, 2]
+            return np.linalg.norm(v, axis=2).reshape(-1)
+
+    raise ValueError(f"Unsupported ship_speed shape: {v.shape}")
+
+
+def _series_x(y):
+    return np.arange(len(y))
+
+
+def _print_cost_summary_vs_benchmark(solutions, labels, benchmark_label):
+    """
+    Print absolute costs and percentage difference relative to a benchmark.
+
+    Percentage formula:
+        (sol.cost - benchmark.cost) / benchmark.cost * 100
+
+    Negative percentage  -> cheaper than benchmark
+    Positive percentage  -> more expensive than benchmark
+    """
+
+    import numpy as np
+
+    costs = np.array(
+        [float(sol.estimated_cost) for sol in solutions],
+        dtype=float
+    )
+
+    print("\n" + "=" * 80)
+    print("COST SUMMARY VS BENCHMARK")
+    print("=" * 80)
+
+    # Find benchmark
+    if benchmark_label not in labels:
+        raise ValueError(
+            f"Benchmark '{benchmark_label}' not found in labels: {labels}"
+        )
+
+    benchmark_idx = labels.index(benchmark_label)
+    benchmark_cost = costs[benchmark_idx]
+
+    print(f"Benchmark: {benchmark_label}")
+    print("-" * 80)
+
+    for label, cost in zip(labels, costs):
+
+        if abs(benchmark_cost) < 1e-12:
+            percent_diff = np.nan
+        else:
+            percent_diff = (
+                (cost - benchmark_cost) / benchmark_cost
+            ) * 100.0
+
+        delta = cost - benchmark_cost
+
+        if label == benchmark_label:
+            print(
+                f"{label:<35s}: "
+                f"{cost:>12,.6f} $   "
+                f"(benchmark)"
+            )
+        else:
+            print(
+                f"{label:<35s}: "
+                f"{cost:>12,.6f} $   "
+                f"{percent_diff:>10.4f}%   "
+                f"(Δ = {delta:,.6f} $)"
+            )
+
+    print("=" * 80 + "\n")
+
 def plot_solutions(
     solutions,
     labels=None,
-    show: bool = False,
-    subfolder: str | None = None,
+    benchmark_label=None,
+    show=False,
+    subfolder=None,
+    map=None,
+    draw_transition_constraints=False,
 ):
     """
-    Compare multiple solutions by printing summaries and overlaying their
-    signals on the same IEEE-style plots.
-    All figures are saved in PLOTS.
+    Plot one or more Solution objects.
+
+    Supports both:
+        old format: arrays shaped [T]
+        new format: arrays shaped [T, 2] for two half-timestep segments
+
+    Map plot supports:
+        fixed_path_waypoints
+        crossing_point
     """
-    set_ieee_plot_style()
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
 
     if labels is None:
         labels = [f"Solution {i}" for i in range(len(solutions))]
 
-    assert len(solutions) == len(labels), "solutions and labels must have same length"
+    if len(labels) != len(solutions):
+        raise ValueError("labels must have the same length as solutions.")
 
-    # ===================== SAVE SOLUTIONS AS PKL =====================
-    # Try to reuse the same plot directory used elsewhere in the module
-    plot_dir = os.path.join(PLOTS, subfolder) if subfolder else PLOTS
-    os.makedirs(plot_dir, exist_ok=True)
+    directory = PLOTS
+    if subfolder is not None:
+        directory = os.path.join(PLOTS, subfolder)
+    os.makedirs(directory, exist_ok=True)
 
-    def _safe_filename(name: str) -> str:
-        name = str(name).strip()
-        name = re.sub(r"[^\w\-\. ]", "_", name)   # replace unsafe chars
-        name = re.sub(r"\s+", "_", name)          # spaces -> underscores
-        return name
+    T = max(int(sol.T_future) for sol in solutions)
 
-    for i, (sol, label) in enumerate(zip(solutions, labels)):
-        fname = f"solution_{i:02d}_{_safe_filename(label)}.pkl"
-        fpath = os.path.join(plot_dir, fname)
-        with open(fpath, "wb") as f:
-            pickle.dump(sol, f, protocol=pickle.HIGHEST_PROTOCOL)
+    if benchmark_label is not None:
+        _print_cost_summary_vs_benchmark(solutions, labels, benchmark_label)
 
-    print(f"Saved {len(solutions)} solution object(s) to: {plot_dir}")
+    # ============================================================
+    # 1) Map overlay
+    # ============================================================
+    if map is not None:
+        _plot_solution_map_overlay(
+            solutions=solutions,
+            labels=labels,
+            map_obj=map,
+            T=T,
+            show=show,
+            directory=directory,
+            name="cmp_ship_pos_xy_map",
+            draw_feasibility=True,
+            draw_zones=True,
+            draw_transition_constraints=draw_transition_constraints,
+        )
 
-
-    # ===================== COMMON HORIZON =====================
-    Ts = [int(sol.T_future) for sol in solutions]
-    T = min(Ts)
-
-    t = np.arange(T)
-    t_plus_1 = np.arange(T + 1)
-
-    # ===================== SUMMARY =====================
-    print("===== Solution comparison summary =====")
-    for sol, label, Ti in zip(solutions, labels, Ts):
-        print(f"{label} estimated cost : {getattr(sol, 'estimated_cost', np.nan):.6g}")
-        print(f"{label} T_future       : {Ti}")
-        print(f"{label} Total Distance       : {getattr(sol, 'total_distance', np.nan):.6g}")
-    print(f"Common horizon used  : {T}")
-    print()
-
-    # ===================== HELPERS =====================
-    def slice_1d(arr, n):
-        arr = _as_1d(arr)
-        return arr[:n] if (arr is not None and arr.shape[0] >= n) else None
-
-    def slice_2d(arr, n):
-        if arr is None:
-            return None
-        arr = np.asarray(arr)
-        if arr.ndim == 2 and arr.shape[0] >= n and arr.shape[1] == 2:
-            return arr[:n, :]
-        return None
-
-    def total_gen_cost(sol):
-        gc = getattr(sol, "gen_costs", None)
-        if gc is None:
-            return None
-        gc = np.asarray(gc)
-        if gc.ndim == 2 and gc.shape[1] >= T:
-            return np.sum(gc[:, :T], axis=0)
-        return None
-
-    # ===================== GENERIC OVERLAY =====================
-    def _plot_1d_overlay_multi(arrs, t_axis, name, ylabel, directory = PLOTS):
-        fig, ax = plt.subplots()
-        for arr, label in zip(arrs, labels):
-            if arr is not None:
-                ax.plot(t_axis, arr, label=label)
-        ax.legend(loc="best", frameon=False)
-        _finalize_axis(ax, xlabel="Timestep", ylabel=ylabel, title=name)
-        _save_and_maybe_show(fig, f"cmp_{name}", show, directory=directory)
-
-    def _plot_2d_overlay_multi(arrs, t_axis, name, labels_comp, ylabel, directory = PLOTS):
-        fig, ax = plt.subplots()
-        for arr, label in zip(arrs, labels):
-            if arr is not None:
-                ax.plot(t_axis, arr[:, 0], label=f"{label} {labels_comp[0]}")
-                ax.plot(t_axis, arr[:, 1], linestyle="--", label=f"{label} {labels_comp[1]}")
-        ax.legend(loc="best", frameon=False)
-        _finalize_axis(ax, xlabel="Timestep", ylabel=ylabel, title=name)
-        _save_and_maybe_show(fig, f"cmp_{name}", show, directory=directory)
-
-    # ===================== 1D SIGNALS =====================
-    def collect(attr, n):
-        return [slice_1d(getattr(sol, attr, None), n) for sol in solutions]
-
-    _plot_1d_overlay_multi(collect("instant_sail", T + 1), t_plus_1, "instant_sail", "instant_sail [-]", directory = plot_dir)
-    _plot_1d_overlay_multi(collect("port_idx", T + 1), t_plus_1, "port_idx", "Port index [-]", directory = plot_dir)
-    _plot_1d_overlay_multi(collect("interval_sail_fraction", T), t, "interval_sail_fraction", "Sail fraction [-]", directory = plot_dir)
-    _plot_1d_overlay_multi(collect("speed_rel_water_mag", T), t, "speed_rel_water_mag", "Speed rel. water [m/s]", directory = plot_dir)
-    _plot_1d_overlay_multi(collect("prop_power", T), t, "prop_power", "Propulsion power [MW]", directory = plot_dir)
-    _plot_1d_overlay_multi(collect("wave_resistance", T), t, "wave_resistance", "Wave resistance [MN]", directory = plot_dir)
-    _plot_1d_overlay_multi(collect("wind_resistance", T), t, "wind_resistance", "Wind resistance [MN]", directory = plot_dir)
-    _plot_1d_overlay_multi(collect("calm_water_resistance", T), t, "calm_water_resistance", "calm_water_resistance [MN]", directory = plot_dir)
-    _plot_1d_overlay_multi(collect("total_resistance", T), t, "total_resistance", "Total resistance [MN]", directory = plot_dir)
-    _plot_1d_overlay_multi(collect("acc_force", T), t, "acc_force", "Force to accelerate [MN]", directory = plot_dir)
-    _plot_1d_overlay_multi([total_gen_cost(sol) for sol in solutions], t, "gen_costs_total", "Generation cost [currency]", directory = plot_dir)
-    _plot_1d_overlay_multi(collect("solar_power", T), t, "solar_power", "Solar power [MW]", directory = plot_dir)
-    _plot_1d_overlay_multi(collect("shore_power", T), t, "shore_power", "Shore power [MW]", directory = plot_dir)
-    _plot_1d_overlay_multi(collect("battery_charge", T), t, "battery_charge", "Battery charge power [MW]", directory = plot_dir)
-    _plot_1d_overlay_multi(collect("battery_discharge", T), t, "battery_discharge", "Battery discharge power [MW]", directory = plot_dir)
-    _plot_1d_overlay_multi(collect("SOC", T + 1), t_plus_1, "SOC", "State of charge [-]", directory = plot_dir)
-
-    # ===================== ZONE INDEX =====================
-    def extract_zone_idx(sol, n):
-        z = getattr(sol, "zone", None)
-        if z is None:
-            return None
-        z = np.asarray(z)
-        if z.ndim == 2 and z.shape[0] >= n:
-            return np.argmax(z[:n, :], axis=1)
-        return None
-
-    zone_idxs = [extract_zone_idx(sol, T + 1) for sol in solutions]
-
-    fig, ax = plt.subplots()
-    for z_idx, label in zip(zone_idxs, labels):
-        if z_idx is not None:
-            ax.step(t_plus_1, z_idx, where="post", label=label)
-
-    ax.legend(loc="best", frameon=False)
-    _finalize_axis(ax, xlabel="Timestep", ylabel="Zone index [-]", title="zone_index")
-    _save_and_maybe_show(fig, "cmp_zone_index", show, directory=plot_dir)
-
-    # ===================== TRAJECTORY =====================
-    positions = [slice_2d(getattr(sol, "ship_pos", None), T + 1) for sol in solutions]
-
-    if any(p is not None for p in positions):
-        fig, ax = plt.subplots()
-        for pos, label in zip(positions, labels):
-            if pos is not None:
-                ax.plot(pos[:, 0], pos[:, 1], marker="o", markersize=2, label=label)
-        ax.set_aspect("equal", adjustable="box")
-        ax.legend(loc="best", frameon=False)
-        _finalize_axis(ax, xlabel="x position [km]", ylabel="y position [km]", title="Ship trajectory")
-        _save_and_maybe_show(fig, "cmp_ship_pos_xy", show, directory = plot_dir)
-    else:
-        print("[WARN] ship_pos has unexpected shape in all solutions; skipping XY plot.")
-
-    # ===================== 2D TIME SERIES =====================
-    def collect_2d(attr, n):
-        return [slice_2d(getattr(sol, attr, None), n) for sol in solutions]
-
-    _plot_2d_overlay_multi(collect_2d("ship_speed", T), t, "ship_speed", ("u_east", "v_north"), "Speed [m/s]")
-    _plot_2d_overlay_multi(collect_2d("speed_rel_water", T), t, "speed_rel_water", ("u_rw", "v_rw"), "Speed rel. water [m/s]")
-
-    # ===================== GENERATORS =====================
-    fig, ax = plt.subplots()
-    any_gp = False
+    # ============================================================
+    # 2) Speed magnitude
+    # ============================================================
+    fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=150)
 
     for sol, label in zip(solutions, labels):
-        gp = getattr(sol, "generation_power", None)
-        if gp is not None:
-            gp = np.asarray(gp)
-            if gp.ndim == 2 and gp.shape[1] >= T:
-                any_gp = True
-                for g in range(gp.shape[0]):
-                    ax.plot(t, gp[g, :T], label=f"{label} Gen {g}")
+        speed_mag = _speed_mag_from_solution(sol)
+        ax.plot(_series_x(speed_mag), speed_mag, "-o", markersize=3, label=label)
 
-    if any_gp:
-        ax.legend(loc="best", frameon=False, ncols=2)
-        _finalize_axis(ax, xlabel="Timestep", ylabel="Power [MW]", title="generation_power")
-        _save_and_maybe_show(fig, "cmp_generation_power", show, directory = plot_dir)
-    else:
-        print("[WARN] generation_power missing or invalid in all solutions.")
+    ax.legend(frameon=False)
+    _finalize_axis(
+        ax,
+        xlabel="time index",
+        ylabel="speed [m/s]",
+        title="Ship speed magnitude",
+    )
+    _save_and_maybe_show(fig, "cmp_speed_mag", show, directory=directory ,font_scale = 2.0)
+
+    # ============================================================
+    # 3) Propulsion power
+    # ============================================================
+    fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=150)
+
+    for sol, label in zip(solutions, labels):
+        y = _flatten_TH(sol.prop_power)
+        ax.plot(_series_x(y), y, "-o", markersize=3, label=label)
+
+    ax.legend(frameon=False)
+    _finalize_axis(
+        ax,
+        xlabel="time index",
+        ylabel="propulsion power [MW]",
+        title="Propulsion power",
+    )
+    _save_and_maybe_show(fig, "cmp_prop_power", show, directory=directory,font_scale = 2.0)
+
+    # ============================================================
+    # 4) Resistances
+    # ============================================================
+    resistance_items = [
+        ("wave_resistance", "Wave resistance"),
+        ("wind_resistance", "Wind resistance"),
+        ("calm_water_resistance", "Calm-water resistance"),
+        ("total_resistance", "Total resistance"),
+        ("acc_force", "Acceleration force"),
+    ]
+
+    for attr, title in resistance_items:
+        fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=150)
+
+        for sol, label in zip(solutions, labels):
+            if not hasattr(sol, attr) or getattr(sol, attr) is None:
+                continue
+            y = _flatten_TH(getattr(sol, attr))
+            ax.plot(_series_x(y), y, "-o", markersize=3, label=label)
+
+        ax.legend(frameon=False)
+        _finalize_axis(
+            ax,
+            xlabel="time index",
+            ylabel="force / resistance [MN]",
+            title=title,
+        )
+        _save_and_maybe_show(fig, f"cmp_{attr}", show, directory=directory,font_scale = 2.0)
+
+    # ============================================================
+    # 5) Solar / shore / battery powers
+    # ============================================================
+    power_items = [
+        ("solar_power", "Solar power", "power [MW]"),
+        ("shore_power", "Shore power", "power [MW]"),
+        ("battery_charge", "Battery charge", "power [MW]"),
+        ("battery_discharge", "Battery discharge", "power [MW]"),
+        ("shore_power_cost", "Shore power cost", "cost rate / cost command"),
+    ]
+
+    for attr, title, ylabel in power_items:
+        fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=150)
+
+        for sol, label in zip(solutions, labels):
+            if not hasattr(sol, attr) or getattr(sol, attr) is None:
+                continue
+            y = _flatten_TH(getattr(sol, attr))
+            ax.plot(_series_x(y), y, "-o", markersize=3, label=label)
+
+        ax.legend(frameon=False)
+        _finalize_axis(
+            ax,
+            xlabel="time index",
+            ylabel=ylabel,
+            title=title,
+        )
+        _save_and_maybe_show(fig, f"cmp_{attr}", show, directory=directory,font_scale = 2.0)
+
+    # ============================================================
+    # 6) SOC
+    # ============================================================
+    fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=150)
+
+    for sol, label in zip(solutions, labels):
+        y = np.asarray(sol.SOC, dtype=float)
+        ax.plot(np.arange(len(y)), y, "-o", markersize=3, label=label)
+
+    ax.legend(frameon=False)
+    _finalize_axis(
+        ax,
+        xlabel="timestep",
+        ylabel="SOC [MWh]",
+        title="Battery state of charge",
+    )
+    _save_and_maybe_show(fig, "cmp_SOC", show, directory=directory,font_scale = 2.0)
+
+    # ============================================================
+    # 7) Total generation power
+    # ============================================================
+    fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=150)
+
+    for sol, label in zip(solutions, labels):
+        gen_power = _flatten_gen_NTH(sol.generation_power)
+
+        # gen_power shape after flattening:
+        #   old format: [nb_gen, T]
+        #   new format: [nb_gen, 2*T]
+        y = np.sum(gen_power, axis=0)
+
+        ax.plot(_series_x(y), y, "-o", markersize=3, label=label)
+
+    ax.legend(frameon=False)
+    _finalize_axis(
+        ax,
+        xlabel="time index",
+        ylabel="total generation power [MW]",
+        title="Total generation power",
+    )
+    _save_and_maybe_show(fig, "cmp_total_generation_power", show, directory=directory,font_scale = 2.0)
+
+    # ============================================================
+    # 8) Total generator cost
+    # ============================================================
+    fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=150)
+
+    for sol, label in zip(solutions, labels):
+        gen_costs = _flatten_gen_NTH(sol.gen_costs)
+
+        # gen_costs shape after flattening:
+        #   old format: [nb_gen, T]
+        #   new format: [nb_gen, 2*T]
+        y = np.sum(gen_costs, axis=0)
+
+        ax.plot(_series_x(y), y, "-o", markersize=3, label=label)
+
+    ax.legend(frameon=False)
+    _finalize_axis(
+        ax,
+        xlabel="time index",
+        ylabel="total generator cost [$ / h]",
+        title="Total generator cost",
+    )
+    _save_and_maybe_show(fig, "cmp_total_generator_cost", show, directory=directory,font_scale = 2.0)
+
+    # ============================================================
+    # 9) Zone index
+    # ============================================================
+    fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=150)
+
+    for sol, label in zip(solutions, labels):
+        zone = np.asarray(sol.zone, dtype=float)
+        zone_idx = np.argmax(zone, axis=1)
+        ax.step(np.arange(len(zone_idx)), zone_idx, where="post", label=label)
+
+    ax.legend(frameon=False)
+    _finalize_axis(
+        ax,
+        xlabel="timestep",
+        ylabel="zone index",
+        title="Selected zone",
+    )
+    _save_and_maybe_show(fig, "cmp_zone_index", show, directory=directory,font_scale = 2.0)
+
+    # ============================================================
+    # 10) Total estimated cost summary
+    # ============================================================
+    fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=150)
+
+    costs = [float(sol.estimated_cost) for sol in solutions]
+    ax.bar(np.arange(len(costs)), costs)
+    ax.set_xticks(np.arange(len(costs)))
+    ax.set_xticklabels(labels, rotation=20, ha="right")
+
+    _finalize_axis(
+        ax,
+        xlabel="solution",
+        ylabel="estimated cost [$]",
+        title="Estimated total cost",
+    )
+    _save_and_maybe_show(fig, "cmp_estimated_cost", show, directory=directory,font_scale = 2.0)
 
 from typing import List, Any
 def load_solutions_from_pkl(
@@ -429,7 +995,7 @@ def plot_weather_snapshot(map, weather, variable="current_x", t_index=0, show: b
         title=f"Weather snapshot: {variable} (t={t_index})",
     )
 
-    _save_and_maybe_show(fig, f"weather_snapshot_{variable}_t{t_index}", show)
+    _save_and_maybe_show(fig, f"weather_snapshot_{variable}_t{t_index}", show, font_scale = 2.0)
 
 def plot_zones_and_points(
     ship_pos: np.ndarray,
@@ -523,7 +1089,7 @@ def plot_zones_and_points(
     ax.set_title("Zones (filled) and ship trajectory")
     ax.legend()
 
-    _save_and_maybe_show(fig, name, show)
+    _save_and_maybe_show(fig, name, show,font_scale = 2.0)
     return in_zone
 
 def _plot_series(y, title, ylabel, xlabel="Time (s)", x=None, cmd=None, cmd_label="Command"): 
