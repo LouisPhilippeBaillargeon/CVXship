@@ -6,7 +6,7 @@ from lib.load_params import load_config
 from lib.models import PropulsionModel, BaseWaveModel, WaveModel1D, WaveModel2D, WaveModelPathAligned2D, BaseWindModel, WindModel1D, WindModel2D, WindModelPathAligned2D, GeneratorModel, CalmWaterModel, save_obj, load_obj
 from lib.paths import WIND_MODEL_1D, WIND_MODEL_2D, WIND_MODEL_PATH_ALIGNED_2D, WAVE_MODEL_1D, WAVE_MODEL_2D, WAVE_MODEL_PATH_ALIGNED_2D, PROPULSION_MODEL, GENERATOR_MODEL, CALM_MODEL
 from lib.plotting import plot_solutions, plot_zones_and_points, load_solutions_from_pkl
-from lib.optimizers import GlobalOptimizer, NaiveController, Fixed_Path_Optimizer, ShortestPath
+from lib.optimizers import GlobalOptimizer, NaiveController, Fixed_Path_Optimizer, ShortestPath, Global_Continuous
 from lib.utils import point_in_zones, dx_dy_km, classify_timesteps, _assert_finite, xy_from_path_distance
 from lib.evaluation import compute_non_convex_cost_all_timesteps
 from lib.simulation import run_simulink_model
@@ -16,7 +16,7 @@ from dataclasses import dataclass
 new_weather = False
 new_ship = False
 see_previous_sol = False
-dimensions = "2D"  # "1D", "2D" or "both"
+dimensions = "both"  # "1D", "2D" or "both"
 
 
 if __name__ == "__main__":
@@ -330,10 +330,44 @@ if __name__ == "__main__":
             plot_zones_and_points(optimizer.sol.ship_pos, optimizer.map.zone_ineq)
             n_all, global_sol, dt_h, best_pitch = compute_non_convex_cost_all_timesteps(optimizer, debug=False)
             plot_solutions([optimizer.sol, global_sol],["Convex Gloabal solution", "Non-convex Global solution"], benchmark_label="Non-convex Global solution", show=False, subfolder="Global Path", map=optimizer.map)
+            
             if dimensions == "2D":
                 plot_solutions([global_sol, naive_solution],["Global Optimizer", "Naive Controller"], benchmark_label="Naive Controller", show = True, subfolder="All sol compared", map=optimizer.map)
         if dimensions == "both":
-            plot_solutions([global_sol, fixed_path_sol, naive_solution],["Global Optimizer", "Fixed Path Optimizer", "Naive Controller"], benchmark_label="Naive Controller", show = True, subfolder="All sol compared", map=optimizer.map)
+            glob_cont_opt = Global_Continuous(
+                wave_model          = wave_model_path_2D,
+                wind_model          = wind_model_path_2D,
+                wind_model_nd       = wind_model_1D,
+                wave_model_nd       = wave_model_1D,
+                propulsion_model    = propulsion_model,
+                calm_model          = calm_model,
+                generator_models    = generatorModels,
+                map                 = map,
+                itinerary           = itinerary,
+                states              = states,
+                weather             = weather,
+                ship                = ship,
+                ref_speed           = ref_speed,
+                path_zone_ids=path.sol.zone_sequence,)
+            
+            # Plot current position and destination
+            init_pos = np.array([glob_cont_opt.states.current_x_pos, glob_cont_opt.states.current_y_pos])
+            glob_cont_opt.states.zone = point_in_zones(init_pos, glob_cont_opt.map.zone_ineq)
+            x, y, _ = dx_dy_km(glob_cont_opt.map, glob_cont_opt.itinerary.transits[-1].lat, glob_cont_opt.itinerary.transits[-1].lon)
+
+            glob_cont_opt.optimize(
+                debug=True,
+                ordered_zones = True,
+                min_timestep = True,
+                restrict_to_naive=False,
+                naive_solution=naive.sol,
+                naive_zone_radius=1,
+            )
+            plot_zones_and_points(glob_cont_opt.sol.ship_pos, glob_cont_opt.map.zone_ineq)
+            n_all, glob_cont_opt_sol, dt_h, best_pitch = compute_non_convex_cost_all_timesteps(glob_cont_opt, debug=False)
+            plot_solutions([glob_cont_opt.sol, glob_cont_opt_sol],["Convex continuous Global solution", "Non-convex Global continuous solution"], benchmark_label="Non-convex Global continuous solution", show=False, subfolder="Global continuous Path", map=optimizer.map)
+
+            plot_solutions([glob_cont_opt_sol, global_sol, fixed_path_sol, naive_solution],["Global continuous opt","Global Optimizer", "Fixed Path Optimizer", "Naive Controller"], benchmark_label="Naive Controller", show = True, subfolder="All sol compared", map=optimizer.map)
 
 
 
