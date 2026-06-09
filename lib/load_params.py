@@ -247,31 +247,6 @@ def load_map() -> Map:
     m.zone_centroids = _compute_zone_centroids(m.info, m.zone_ineq)
     return m
 
-
-@dataclass
-class FitRange:
-    min_speed       : float
-    max_speed       : float
-    min_resistance  : float
-    max_resistance  : float 
-    min_prop_power  : int
-    max_prop_power  : int
-
-def load_fit_range() -> FitRange:
-    with open(SHIP, "rb") as f:
-        data = tomllib.load(f)
-
-    fit_data = data["fit_range"]
-
-    return FitRange(
-        min_speed=float(fit_data["min_speed"]),
-        max_speed=float(fit_data["max_speed"]),
-        min_resistance=float(fit_data["min_resistance"]),
-        max_resistance=float(fit_data["max_resistance"]),
-        min_prop_power=float(fit_data["min_prop_power"]),
-        max_prop_power=float(fit_data["max_prop_power"]),
-    )
-
 #===================================================ITINERARY======================================================================================
 @dataclass
 class Transit:
@@ -376,8 +351,6 @@ def load_config():
     states = load_states(map, itinerary)
     ship = load_ship()
     weather = weather_from_nc_file(map, itinerary)
-    fit_range = load_fit_range()
-    return map, itinerary, states, ship, weather, fit_range
-
+    return map, itinerary, states, ship, weather
 
 

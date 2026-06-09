@@ -356,7 +356,6 @@ def _plot_solution_map_overlay(
     draw_zones=True,
     show_positions=False,
     show_crossing_points=False,
-    draw_transition_constraints = False,
 ):
     positions = [_get_solution_positions(sol, T + 1) for sol in solutions]
 
@@ -404,9 +403,10 @@ def _plot_solution_map_overlay(
                 ax.plot(
                     fixed_path_xy[:, 0],
                     fixed_path_xy[:, 1],
-                    "-",
-                    linewidth=2.0,
+                    "--",                  # dashed
+                    linewidth=1.2,         # thinner
                     color=color,
+                    alpha=0.8,             # slightly transparent
                     label=label,
                     zorder=10,
                 )
@@ -459,9 +459,10 @@ def _plot_solution_map_overlay(
                 ax.plot(
                     broken_x,
                     broken_y,
-                    "-",
-                    linewidth=2.0,
+                    "--",
+                    linewidth=1.2,
                     color=color,
+                    alpha=0.8,
                     label=label,
                     zorder=10,
                 )
@@ -498,9 +499,10 @@ def _plot_solution_map_overlay(
             ax.plot(
                 pos[:, 0],
                 pos[:, 1],
-                "-",
-                linewidth=2.0,
+                "--",
+                linewidth=1.2,
                 color=color,
+                alpha=0.8,
                 label=label,
                 zorder=10,
             )
@@ -587,21 +589,6 @@ def _flatten_gen_NTH(y):
     return y
 
 
-def _speed_mag_from_solution(sol):
-    v = np.asarray(sol.ship_speed, dtype=float)
-
-    if v.ndim == 2:      # [T, 2]
-        return np.linalg.norm(v, axis=1)
-
-    if v.ndim == 3:
-        if v.shape[1] == 2:   # [T, 2, H]
-            return np.linalg.norm(v, axis=1).reshape(-1)
-        if v.shape[2] == 2:   # [T, H, 2]
-            return np.linalg.norm(v, axis=2).reshape(-1)
-
-    raise ValueError(f"Unsupported ship_speed shape: {v.shape}")
-
-
 def _series_x(y):
     return np.arange(len(y))
 
@@ -674,19 +661,7 @@ def plot_solutions(
     show=False,
     subfolder=None,
     map=None,
-    draw_transition_constraints=False,
 ):
-    """
-    Plot one or more Solution objects.
-
-    Supports both:
-        old format: arrays shaped [T]
-        new format: arrays shaped [T, 2] for two half-timestep segments
-
-    Map plot supports:
-        fixed_path_waypoints
-        crossing_point
-    """
     import os
     import numpy as np
     import matplotlib.pyplot as plt
@@ -707,6 +682,69 @@ def plot_solutions(
     if benchmark_label is not None:
         _print_cost_summary_vs_benchmark(solutions, labels, benchmark_label)
 
+    def _uses_two_segments(sol):
+        arr = getattr(sol, "speed_mag", None)
+        if arr is None:
+            return False
+        arr = np.asarray(arr)
+        return arr.ndim == 2 and arr.shape[1] == 2
+
+    force_two_segments = any(_uses_two_segments(sol) for sol in solutions)
+
+    def _to_plot_series(arr):
+        arr = np.asarray(arr, dtype=float)
+
+        if arr.ndim == 1:
+            if force_two_segments:
+                arr = np.repeat(arr[:, None], 2, axis=1)
+            return arr.reshape(-1)
+
+        if arr.ndim == 2:
+            if force_two_segments and arr.shape[1] == 1:
+                arr = np.repeat(arr, 2, axis=1)
+            return arr.reshape(-1)
+
+        return arr.reshape(-1)
+
+    def _to_plot_gen(arr):
+        arr = np.asarray(arr, dtype=float)
+
+        if arr.ndim == 2:  # [nb_gen, T]
+            if force_two_segments:
+                arr = np.repeat(arr[:, :, None], 2, axis=2)
+            return arr.reshape(arr.shape[0], -1)
+
+        if arr.ndim == 3:  # [nb_gen, T, H]
+            return arr.reshape(arr.shape[0], -1)
+
+        raise ValueError(f"Generator array must be [nb_gen,T] or [nb_gen,T,H], got {arr.shape}")
+
+    def _plot_attr(attr, title, ylabel, filename):
+        fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=150)
+
+        for sol, label in zip(solutions, labels):
+            if not hasattr(sol, attr) or getattr(sol, attr) is None:
+                continue
+
+            y = _to_plot_series(getattr(sol, attr))
+            ax.plot(
+                np.arange(len(y)),
+                y,
+                "--",
+                linewidth=1.2,
+                alpha=0.8,
+                label=label
+            )
+
+        ax.legend(frameon=False)
+        _finalize_axis(
+            ax,
+            xlabel="time index",
+            ylabel=ylabel,
+            title=title,
+        )
+        _save_and_maybe_show(fig, filename, show, directory=directory, font_scale=2.0)
+
     # ============================================================
     # 1) Map overlay
     # ============================================================
@@ -721,111 +759,48 @@ def plot_solutions(
             name="cmp_ship_pos_xy_map",
             draw_feasibility=True,
             draw_zones=True,
-            draw_transition_constraints=draw_transition_constraints,
         )
 
     # ============================================================
-    # 2) Speed magnitude
+    # 2) Scalar / timestep-or-segment series
     # ============================================================
-    fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=150)
+    _plot_attr("speed_mag", "Ship speed magnitude", "speed [m/s]", "cmp_speed_mag")
+    _plot_attr("speed_rel_water_mag", "Ship water-relative speed magnitude", "speed [m/s]", "cmp_speed_rel_mag")
+    _plot_attr("prop_power", "Propulsion power", "propulsion power [MW]", "cmp_prop_power")
 
-    for sol, label in zip(solutions, labels):
-        speed_mag = _speed_mag_from_solution(sol)
-        ax.plot(_series_x(speed_mag), speed_mag, "-o", markersize=3, label=label)
-
-    ax.legend(frameon=False)
-    _finalize_axis(
-        ax,
-        xlabel="time index",
-        ylabel="speed [m/s]",
-        title="Ship speed magnitude",
-    )
-    _save_and_maybe_show(fig, "cmp_speed_mag", show, directory=directory ,font_scale = 2.0)
-
-    # ============================================================
-    # 3) Propulsion power
-    # ============================================================
-    fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=150)
-
-    for sol, label in zip(solutions, labels):
-        y = _flatten_TH(sol.prop_power)
-        ax.plot(_series_x(y), y, "-o", markersize=3, label=label)
-
-    ax.legend(frameon=False)
-    _finalize_axis(
-        ax,
-        xlabel="time index",
-        ylabel="propulsion power [MW]",
-        title="Propulsion power",
-    )
-    _save_and_maybe_show(fig, "cmp_prop_power", show, directory=directory,font_scale = 2.0)
-
-    # ============================================================
-    # 4) Resistances
-    # ============================================================
-    resistance_items = [
+    for attr, title in [
         ("wave_resistance", "Wave resistance"),
         ("wind_resistance", "Wind resistance"),
         ("calm_water_resistance", "Calm-water resistance"),
         ("total_resistance", "Total resistance"),
         ("acc_force", "Acceleration force"),
-    ]
+    ]:
+        _plot_attr(attr, title, "force / resistance [MN]", f"cmp_{attr}")
 
-    for attr, title in resistance_items:
-        fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=150)
-
-        for sol, label in zip(solutions, labels):
-            if not hasattr(sol, attr) or getattr(sol, attr) is None:
-                continue
-            y = _flatten_TH(getattr(sol, attr))
-            ax.plot(_series_x(y), y, "-o", markersize=3, label=label)
-
-        ax.legend(frameon=False)
-        _finalize_axis(
-            ax,
-            xlabel="time index",
-            ylabel="force / resistance [MN]",
-            title=title,
-        )
-        _save_and_maybe_show(fig, f"cmp_{attr}", show, directory=directory,font_scale = 2.0)
-
-    # ============================================================
-    # 5) Solar / shore / battery powers
-    # ============================================================
-    power_items = [
+    for attr, title, ylabel in [
         ("solar_power", "Solar power", "power [MW]"),
         ("shore_power", "Shore power", "power [MW]"),
         ("battery_charge", "Battery charge", "power [MW]"),
         ("battery_discharge", "Battery discharge", "power [MW]"),
         ("shore_power_cost", "Shore power cost", "cost rate / cost command"),
-    ]
-
-    for attr, title, ylabel in power_items:
-        fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=150)
-
-        for sol, label in zip(solutions, labels):
-            if not hasattr(sol, attr) or getattr(sol, attr) is None:
-                continue
-            y = _flatten_TH(getattr(sol, attr))
-            ax.plot(_series_x(y), y, "-o", markersize=3, label=label)
-
-        ax.legend(frameon=False)
-        _finalize_axis(
-            ax,
-            xlabel="time index",
-            ylabel=ylabel,
-            title=title,
-        )
-        _save_and_maybe_show(fig, f"cmp_{attr}", show, directory=directory,font_scale = 2.0)
+    ]:
+        _plot_attr(attr, title, ylabel, f"cmp_{attr}")
 
     # ============================================================
-    # 6) SOC
+    # 3) SOC
     # ============================================================
     fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=150)
 
     for sol, label in zip(solutions, labels):
         y = np.asarray(sol.SOC, dtype=float)
-        ax.plot(np.arange(len(y)), y, "-o", markersize=3, label=label)
+        ax.plot(
+            np.arange(len(y)),
+            y,
+            "--",
+            linewidth=1.2,
+            alpha=0.8,
+            label=label
+        )
 
     ax.legend(frameon=False)
     _finalize_axis(
@@ -834,22 +809,24 @@ def plot_solutions(
         ylabel="SOC [MWh]",
         title="Battery state of charge",
     )
-    _save_and_maybe_show(fig, "cmp_SOC", show, directory=directory,font_scale = 2.0)
+    _save_and_maybe_show(fig, "cmp_SOC", show, directory=directory, font_scale=2.0)
 
     # ============================================================
-    # 7) Total generation power
+    # 4) Total generation power
     # ============================================================
     fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=150)
 
     for sol, label in zip(solutions, labels):
-        gen_power = _flatten_gen_NTH(sol.generation_power)
-
-        # gen_power shape after flattening:
-        #   old format: [nb_gen, T]
-        #   new format: [nb_gen, 2*T]
+        gen_power = _to_plot_gen(sol.generation_power)
         y = np.sum(gen_power, axis=0)
-
-        ax.plot(_series_x(y), y, "-o", markersize=3, label=label)
+        ax.plot(
+            np.arange(len(y)),
+            y,
+            "--",
+            linewidth=1.2,
+            alpha=0.8,
+            label=label
+        )
 
     ax.legend(frameon=False)
     _finalize_axis(
@@ -858,22 +835,24 @@ def plot_solutions(
         ylabel="total generation power [MW]",
         title="Total generation power",
     )
-    _save_and_maybe_show(fig, "cmp_total_generation_power", show, directory=directory,font_scale = 2.0)
+    _save_and_maybe_show(fig, "cmp_total_generation_power", show, directory=directory, font_scale=2.0)
 
     # ============================================================
-    # 8) Total generator cost
+    # 5) Total generator cost
     # ============================================================
     fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=150)
 
     for sol, label in zip(solutions, labels):
-        gen_costs = _flatten_gen_NTH(sol.gen_costs)
-
-        # gen_costs shape after flattening:
-        #   old format: [nb_gen, T]
-        #   new format: [nb_gen, 2*T]
+        gen_costs = _to_plot_gen(sol.gen_costs)
         y = np.sum(gen_costs, axis=0)
-
-        ax.plot(_series_x(y), y, "-o", markersize=3, label=label)
+        ax.plot(
+            np.arange(len(y)),
+            y,
+            "--",
+            linewidth=1.2,
+            alpha=0.8,
+            label=label
+        )
 
     ax.legend(frameon=False)
     _finalize_axis(
@@ -882,29 +861,51 @@ def plot_solutions(
         ylabel="total generator cost [$ / h]",
         title="Total generator cost",
     )
-    _save_and_maybe_show(fig, "cmp_total_generator_cost", show, directory=directory,font_scale = 2.0)
+    _save_and_maybe_show(fig, "cmp_total_generator_cost", show, directory=directory, font_scale=2.0)
 
     # ============================================================
-    # 9) Zone index
+    # 6) Zone index
     # ============================================================
     fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=150)
 
     for sol, label in zip(solutions, labels):
         zone = np.asarray(sol.zone, dtype=float)
         zone_idx = np.argmax(zone, axis=1)
-        ax.step(np.arange(len(zone_idx)), zone_idx, where="post", label=label)
+
+        if force_two_segments:
+            zone_idx_plot = np.repeat(zone_idx[:-1], 2)
+            x = np.arange(len(zone_idx_plot))
+            ax.step(
+                x,
+                zone_idx_plot,
+                where="post",
+                linestyle="--",
+                linewidth=1.2,
+                alpha=0.8,
+                label=label
+            )
+        else:
+            ax.step(
+                np.arange(len(zone_idx)),
+                zone_idx,
+                where="post",
+                linestyle="--",
+                linewidth=1.2,
+                alpha=0.8,
+                label=label
+            )
 
     ax.legend(frameon=False)
     _finalize_axis(
         ax,
-        xlabel="timestep",
+        xlabel="time index",
         ylabel="zone index",
         title="Selected zone",
     )
-    _save_and_maybe_show(fig, "cmp_zone_index", show, directory=directory,font_scale = 2.0)
+    _save_and_maybe_show(fig, "cmp_zone_index", show, directory=directory, font_scale=2.0)
 
     # ============================================================
-    # 10) Total estimated cost summary
+    # 7) Total estimated cost summary
     # ============================================================
     fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=150)
 
@@ -919,7 +920,7 @@ def plot_solutions(
         ylabel="estimated cost [$]",
         title="Estimated total cost",
     )
-    _save_and_maybe_show(fig, "cmp_estimated_cost", show, directory=directory,font_scale = 2.0)
+    _save_and_maybe_show(fig, "cmp_estimated_cost", show, directory=directory, font_scale=2.0)
 
 from typing import List, Any
 def load_solutions_from_pkl(

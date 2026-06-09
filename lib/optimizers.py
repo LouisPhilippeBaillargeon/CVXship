@@ -34,6 +34,7 @@ class Solution:
     zone                    : np.ndarray #[T_future+1,nb_zone]
     ship_pos                : np.ndarray #[T_future+1,2]
     ship_speed              : np.ndarray #[T_future,2]
+    speed_mag               : np.ndarray #[T_future]
     speed_rel_water         : np.ndarray #[T_future,2]
     speed_rel_water_mag     : np.ndarray #[T_future]
 
@@ -54,12 +55,13 @@ class Solution:
     battery_discharge       : np.ndarray #[T_future]
     SOC                     : np.ndarray #[T_future+1]
 
-    path_distance           : Optional[np.ndarray] = None  # [T_future+1], cumulative km along fixed path
+    path_distance           : Optional[np.ndarray] = None
     fixed_path_waypoints    : Optional[np.ndarray] = None
-    crossing_point          : Optional[np.ndarray] = None  # [T_future, 2]
-    step_distance           : Optional[np.ndarray] = None   # [T_future], km
     path_zone_ids           : Optional[np.ndarray] = None
-    evaluation_mode         : Optional[str] = None
+
+    crossing_point          : Optional[np.ndarray] = None  # None for fixed path
+    step_distance           : Optional[np.ndarray] = None
+    segment_dt_h            : Optional[np.ndarray] = None
 
 
 @dataclass
@@ -805,6 +807,7 @@ class GlobalOptimizer:
                 zone                    = np.array(zone.value),
                 ship_pos                = np.array(ship_pos.value),
                 ship_speed              = ship_speed_out,
+                speed_mag               = np.array(speed_mag.value),
                 speed_rel_water         = speed_rel_water_out,
                 speed_rel_water_mag     = np.array(speed_rel_water_mag.value),
 
@@ -827,7 +830,6 @@ class GlobalOptimizer:
 
                 crossing_point          = np.array(crossing_point.value),
                 step_distance           = np.array(step_distance.value),
-                evaluation_mode         = "two_halfstep",
             )
             return 1
 
@@ -1105,10 +1107,11 @@ class Global_Continuous:
         ship_speed_y = cp.Variable(T_future)
         speed_mag = cp.Variable(T_future, nonneg=True)
 
-        #constraints += [-self.ship.info.max_speed<=ship_speed_x]
-        #constraints += [ship_speed_y<=self.ship.info.max_speed]
-        #constraints += [-self.ship.info.max_speed<=ship_speed_y]
-        #constraints += [speed_mag<=self.ship.info.max_speed]
+        constraints += [-self.ship.info.max_speed<=ship_speed_x]
+        constraints += [self.ship.info.max_speed>=ship_speed_x]
+        constraints += [ship_speed_y<=self.ship.info.max_speed]
+        constraints += [-self.ship.info.max_speed<=ship_speed_y]
+        constraints += [speed_mag<=self.ship.info.max_speed]
 
         half_dt_h = dt_h/2
         for t in range(T_future):
@@ -1135,8 +1138,8 @@ class Global_Continuous:
         acc_force = cp.Variable(T_future)
         dt_s = dt_h * 3600.0
 
-        #constraints += [acc<=self.ship.info.max_speed/dt_h]
-        #constraints += [acc>=-self.ship.info.max_speed/dt_h]
+        constraints += [acc<=self.ship.info.max_speed/dt_s]
+        constraints += [acc>=-self.ship.info.max_speed/dt_s]
         constraints += [acc[0] == (speed_mag[0] - self.itinerary.init_speed) / dt_s]
         for t in range(1, T_future):
             constraints += [acc[t] == (speed_mag[t] - speed_mag[t - 1]) / dt_s]
@@ -1146,13 +1149,23 @@ class Global_Continuous:
         # ================================================ RELATIVE SPEEDS =============================================
         ship_speed_x_split_rel_water = cp.Variable((T_future, 2))
         ship_speed_y_split_rel_water = cp.Variable((T_future, 2))
+        ship_speed_x_rel_water = cp.Variable(T_future) #only valid when there are no zone transitions.
+        ship_speed_y_rel_water = cp.Variable(T_future) #only valid when there are no zone transitions.
         ship_speed_rel_water_mag_split = cp.Variable((T_future, 2), nonneg=True)
         speed_rel_water_mag = cp.Variable(T_future, nonneg=True)
 
-        #constraints += [speed_rel_water_mag<=self.ship.info.max_speed+1]  #adding 1m/s to account for currents that can go up to 1m/s
-
         current_x_future = self.weather.current_x[:, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
         current_y_future = self.weather.current_y[:, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
+
+        constraints += [speed_rel_water_mag<=self.ship.info.max_speed+1]  #adding 1m/s to account for currents that can go up to 1m/s
+        for t in range(T_future):
+            constraints += [
+                ship_speed_x_rel_water[t] ==
+                ship_speed_x[t] - zone[t, :] @ current_x_future[:, t],
+
+                ship_speed_y_rel_water[t] ==
+                ship_speed_y[t] - zone[t, :] @ current_y_future[:, t],
+            ]
 
         for t in range(T_future):
             constraints += [ship_speed_x_split_rel_water[t,0]==ship_speed_x_split[t,0]-zone[t,:]@current_x_future[:,t]]
@@ -1181,9 +1194,9 @@ class Global_Continuous:
         WIND_BIG_M = 2.0
         WAVE_BIG_M = 1.0
 
-        #constraints += [wave_resistance <= WAVE_BIG_M]
-        #constraints += [wind_resistance <= WIND_BIG_M]
-        #constraints += [-WIND_BIG_M <= wind_resistance]
+        constraints += [wave_resistance <= WAVE_BIG_M]
+        constraints += [wind_resistance <= WIND_BIG_M]
+        constraints += [-WIND_BIG_M <= wind_resistance]
 
         constraints += [normalized_rel_speed == speed_rel_water_mag / self.ship.info.max_speed]
         constraints += [normalized_speed == speed_mag / self.ship.info.max_speed]
@@ -1210,6 +1223,7 @@ class Global_Continuous:
                         z_next = z
                     
                     c = wind_model_future[s, t, :]
+                    cw = wave_model_future[s, t, :]
                     cnd1 = wind_model_nd_future[s, t, :]
                     cnd2 = wind_model_nd_future[s_plus_1, t, :]
                     cw1 = wave_model_nd_future[s, t, :]
@@ -1233,13 +1247,25 @@ class Global_Continuous:
                         + c[10] * cp.power(ship_speed_y[t] / self.ship.info.max_speed, 4)
                         - WIND_BIG_M * (2 - zone[t, z] - zone[t+1, z])
                     ]
+                    constraints += [#Wave constraints applied when there is no transitions
+                        wave_resistance[t] >=
+                        cw[0]
+                        + cw[1] * normalized_rel_speed[t]
+                        + cw[2] * cp.square(normalized_rel_speed[t])
+                        + cw[3] * cp.power(normalized_rel_speed[t], 3)
+                        + cw[4] * cp.power(normalized_rel_speed[t], 4)
+                        + cw[5] * ship_speed_x_rel_water[t] / self.ship.info.max_speed
+                        + cw[6] * cp.square(ship_speed_x_rel_water[t] / self.ship.info.max_speed)
+                        + cw[7] * cp.power(ship_speed_x_rel_water[t] / self.ship.info.max_speed, 4)
+                        + cw[8] * ship_speed_y_rel_water[t] / self.ship.info.max_speed
+                        + cw[9] * cp.square(ship_speed_y_rel_water[t] / self.ship.info.max_speed)
+                        + cw[10] * cp.power(ship_speed_y_rel_water[t] / self.ship.info.max_speed, 4)
+                        - WAVE_BIG_M * (2 - zone[t, z] - zone[t+1, z])
+                    ]
 
                     # Transition to next segment in path order
                     if s < len(self.path_zone_ids) - 1:
                         z_next = self.path_zone_ids[s + 1]
-
-                        cnd1 = wind_model_nd_future[s, t, :]
-                        cnd2 = wind_model_nd_future[s + 1, t, :]
 
                         constraints += [
                             wind_resistance[t] >=
@@ -1257,21 +1283,22 @@ class Global_Continuous:
                             ) / 2
                             - WIND_BIG_M * (2 - zone[t, z] - zone[t+1, z_next])
                         ]
-
-                    constraints += [#we always use non directional models for waves because directionality is less important and harder to capture with a convex model
-                        wave_resistance[t] >=
-                        (cw1[0]
-                        + cw1[1] * normalized_rel_speed[t]
-                        + cw1[2] * cp.square(normalized_rel_speed[t])
-                        + cw1[3] * cp.power(normalized_rel_speed[t], 3)
-                        + cw1[4] * cp.power(normalized_rel_speed[t], 4)
-                        + cw2[0]
-                        + cw2[1] * normalized_rel_speed[t]
-                        + cw2[2] * cp.square(normalized_rel_speed[t])
-                        + cw2[3] * cp.power(normalized_rel_speed[t], 3)
-                        + cw2[4] * cp.power(normalized_rel_speed[t], 4))/2
-                        - WAVE_BIG_M * (1 - zone[t, z])
-                    ]
+                        constraints += [
+                            wave_resistance[t] >=
+                            (
+                                cw1[0]
+                                + cw1[1] * normalized_rel_speed[t]
+                                + cw1[2] * cp.square(normalized_rel_speed[t])
+                                + cw1[3] * cp.power(normalized_rel_speed[t], 3)
+                                + cw1[4] * cp.power(normalized_rel_speed[t], 4)
+                                + cw2[0]
+                                + cw2[1] * normalized_rel_speed[t]
+                                + cw2[2] * cp.square(normalized_rel_speed[t])
+                                + cw2[3] * cp.power(normalized_rel_speed[t], 3)
+                                + cw2[4] * cp.power(normalized_rel_speed[t], 4)
+                            ) / 2
+                            - WAVE_BIG_M * (2 - zone[t, z] - zone[t+1, z_next])
+                        ]
 
                 constraints += [
                     calm_water_resistance[t] >=
@@ -1305,7 +1332,7 @@ class Global_Continuous:
         constraints += [norm_adv_speed == advance_speed / self.propulsion_model.max_ua]
         constraints += [res_per_prop == total_resistance / self.ship.propulsion.nb_propellers]
 
-        #constraints += [prop_power <= self.ship.propulsion.max_pow*self.ship.propulsion.nb_propellers]
+        constraints += [prop_power <= self.ship.propulsion.max_pow*self.ship.propulsion.nb_propellers]
 
         for t in range(T_future):
             if instant_sail[t]:
@@ -1394,11 +1421,11 @@ class Global_Continuous:
         if unit_commitment:
             M= 1000000
             gen_on = cp.Variable((len(self.generator_models),T_future), boolean=True) #[nb_gen, nb_timesteps]
-            #constraints += [generation_power <= cp.multiply(max_p,gen_on)]
+            constraints += [generation_power <= cp.multiply(max_p,gen_on)]
             constraints += [gen_costs >=(cp.multiply(a, cp.square(generation_power)) +cp.multiply(b, generation_power) +c)*self.itinerary.fuel_price -M*(1-gen_on)] # $/h
             constraints += [gen_costs >=0]
         else:
-            #constraints += [generation_power <= max_p]
+            constraints += [generation_power <= max_p]
             gen_on_fixed = np.zeros((len(self.generator_models), T_future), dtype=float)
             gen_on_fixed[:, instant_sail[:-1].astype(bool)] = 1.0
 
@@ -1460,10 +1487,10 @@ class Global_Continuous:
                 [np.array(ship_speed_x_split_rel_water.value), np.array(ship_speed_y_split_rel_water.value)],
                 axis=1,
             )  # [T_future, 2(x,y), 2(segment)]
-            shore_power_cost = np.array(shore_power.value).astype(float) * shore_cost[:, None].astype(float)
+            shore_power_cost = np.array(shore_power.value).astype(float) * shore_cost.astype(float)
 
             self.sol = Solution(
-                estimated_cost          = problem.value,
+                estimated_cost           = problem.value,
                 T_future                = T_future,
                 instant_sail            = instant_sail,
                 port_idx                = port_idx,
@@ -1473,46 +1500,45 @@ class Global_Continuous:
                 zone                    = np.array(zone.value),
                 ship_pos                = np.array(ship_pos.value),
                 ship_speed              = ship_speed_out,
+                speed_mag               = np.array(speed_mag.value),
                 speed_rel_water         = speed_rel_water_out,
                 speed_rel_water_mag     = np.array(speed_rel_water_mag.value),
 
-                prop_power              = repeat_T_to_TH(prop_power.value),
-                wave_resistance         = repeat_T_to_TH(wave_resistance.value),
-                wind_resistance         = repeat_T_to_TH(wind_resistance.value),
-                acc_force               = repeat_T_to_TH(acc_force.value),
-                calm_water_resistance   = repeat_T_to_TH(calm_water_resistance.value),
-                total_resistance        = repeat_T_to_TH(total_resistance.value),
+                prop_power              = np.array(prop_power.value),
+                wave_resistance         = np.array(wave_resistance.value),
+                wind_resistance         = np.array(wind_resistance.value),
+                acc_force               = np.array(acc_force.value),
+                calm_water_resistance   = np.array(calm_water_resistance.value),
+                total_resistance        = np.array(total_resistance.value),
 
-                generation_power        = repeat_gen_to_NTH(generation_power.value),
-                gen_costs               = repeat_gen_to_NTH(gen_costs.value),
-                gen_on                  = repeat_gen_to_NTH(gen_on_fixed),
-                solar_power             = repeat_T_to_TH(solar_power.value),
-                shore_power             = repeat_T_to_TH(shore_power.value),
-                shore_power_cost = np.array(shore_power.value).astype(float) * shore_cost.astype(float),
-                battery_charge          = repeat_T_to_TH(battery_charge.value),
-                battery_discharge       = repeat_T_to_TH(battery_discharge.value),
+                generation_power        = np.array(generation_power.value),
+                gen_costs               = np.array(gen_costs.value),
+                gen_on                  = gen_on_fixed,
+                solar_power             = np.array(solar_power.value),
+                shore_power             = np.array(shore_power.value).astype(float),
+                shore_power_cost        = shore_power_cost,
+                battery_charge          = np.array(battery_charge.value),
+                battery_discharge       = np.array(battery_discharge.value),
                 SOC                     = np.array(SOC.value),
 
                 crossing_point          = np.array(crossing_point.value),
                 step_distance           = np.array(step_distance.value),
-                evaluation_mode         = "continuous_helper"
+                path_zone_ids           = np.array(self.path_zone_ids),
             )
             return 1
 
         else:
             print(f"Optimization status: {problem.status}")
             return 0
+        
 @dataclass
 class Fixed_Path_Optimizer:
-    # Left point indexing
-    # Convex non-linear least-squares models
     wave_model          : WaveModel1D
     wind_model          : WindModel1D
     propulsion_model    : PropulsionModel
     calm_model          : CalmWaterModel
     generator_models    : List[GeneratorModel]
 
-    # Scenario
     map                 : Map
     itinerary           : Itinerary
     states              : States
@@ -1520,10 +1546,8 @@ class Fixed_Path_Optimizer:
     ship                : Ship
     ref_speed           : float
 
-    # Fixed path
     waypoints           : np.ndarray
     path_zone_ids       : List[int]
-    
 
     sol: Optional[Solution] = field(default=None, init=False)
 
@@ -1545,27 +1569,25 @@ class Fixed_Path_Optimizer:
             raise ValueError("No timesteps left to optimize; trip is finished.")
 
         T_future = self.itinerary.nb_timesteps - self.states.timesteps_completed
-        H = 2
-
         dt_h = float(self.itinerary.timestep)
-        half_dt_h = 0.5 * dt_h
-        half_dt_s = half_dt_h * 3600.0
+        dt_s = dt_h * 3600.0
 
         instant_sail, port_idx, interval_sail_fraction = classify_timesteps(self.itinerary)
         instant_sail = instant_sail[self.states.timesteps_completed:]
         port_idx = port_idx[self.states.timesteps_completed:]
         interval_sail_fraction = interval_sail_fraction[self.states.timesteps_completed:]
 
-        # ================================= PATH GEOMETRY FROM WAYPOINTS =================================
+        # ================================= PATH GEOMETRY =================================
         waypoints = np.asarray(self.waypoints, dtype=float)
+        path_zone_ids = np.asarray(self.path_zone_ids, dtype=int)
+        nb_path_zones = len(path_zone_ids)
 
         if waypoints.ndim != 2 or waypoints.shape[1] != 2:
             raise ValueError("self.waypoints must have shape (N, 2).")
         if waypoints.shape[0] < 2:
             raise ValueError("self.waypoints must contain at least 2 points.")
-
-        path_zone_ids = np.asarray(self.path_zone_ids, dtype=int)
-        nb_path_zones = len(path_zone_ids)
+        if len(path_zone_ids) != waypoints.shape[0] - 1:
+            raise ValueError("path_zone_ids must have one zone id per path segment.")
 
         segment_vecs = waypoints[1:] - waypoints[:-1]
         segment_lengths = np.linalg.norm(segment_vecs, axis=1)
@@ -1581,7 +1603,7 @@ class Fixed_Path_Optimizer:
         cos_seg = np.cos(theta_seg)
         sin_seg = np.sin(theta_seg)
 
-        # ====================================== NAIVE SEGMENT REFERENCE ======================================
+        # ================================= NAIVE RESTRICTION REF =================================
         naive_seg_idx = None
         if restrict_to_naive:
             if naive_solution is None:
@@ -1600,32 +1622,27 @@ class Fixed_Path_Optimizer:
                     f"but expected {T_future + 1}."
                 )
 
-        # ================================================ DISTANCE VARIABLES ================================================
+        # ================================= DISTANCE VARIABLES =================================
         d = cp.Variable(T_future + 1, nonneg=True)
-        d_mid = cp.Variable(T_future, nonneg=True)
 
         d0 = float(getattr(self.states, "current_d", 0.0))
 
         constraints += [d[0] == d0]
         constraints += [d >= d0]
         constraints += [d <= total_path_length]
-        constraints += [d[-1] == total_path_length]
         constraints += [d[1:] >= d[:-1]]
-
-        constraints += [d_mid >= d[:-1]]
-        constraints += [d_mid <= d[1:]]
-        constraints += [d_mid <= total_path_length]
 
         for t in range(T_future + 1):
             if instant_sail[t] == 0:
                 p = int(port_idx[t])
                 assert p >= 0
+
                 if p == 0:
                     constraints += [d[t] == 0]
                 else:
                     constraints += [d[t] == total_path_length]
 
-        # ======================================================= SEGMENTS ====================================================
+        # ================================= NODE SEGMENTS =================================
         seg = cp.Variable((T_future + 1, nb_path_zones), boolean=True)
 
         for t in range(T_future + 1):
@@ -1633,6 +1650,7 @@ class Fixed_Path_Optimizer:
 
             lower_expr = 0
             upper_expr = 0
+
             for s in range(nb_path_zones):
                 lower_expr += D_breaks[s] * seg[t, s]
                 upper_expr += D_breaks[s + 1] * seg[t, s]
@@ -1640,9 +1658,7 @@ class Fixed_Path_Optimizer:
             constraints += [d[t] >= lower_expr]
             constraints += [d[t] <= upper_expr]
 
-        # Optional but strongly recommended:
-        # fixed path can stay in same segment or advance by one segment per timestep.
-        # This makes the two-half-step model physically consistent.
+        # Monotone path progress: stay in same segment or advance by one
         for t in range(T_future):
             for s_next in range(nb_path_zones):
                 if s_next == 0:
@@ -1652,7 +1668,7 @@ class Fixed_Path_Optimizer:
                         seg[t + 1, s_next] <= seg[t, s_next] + seg[t, s_next - 1]
                     ]
 
-        # ========================================== RESTRICT TO NAIVE +/- R SEGMENTS ==========================================
+        # ================================= RESTRICT TO NAIVE +/- R SEGMENTS =================================
         if restrict_to_naive:
             allowed_seg_mask = _one_hot_window_from_indices(
                 naive_seg_idx,
@@ -1668,298 +1684,383 @@ class Fixed_Path_Optimizer:
             if debug:
                 print(f"Restricted Fixed_Path_Optimizer segments to naive +/- {naive_segment_radius}.")
 
-        # ================================================ SPEEDS ====================================================
-        step_distance = cp.Variable((T_future, H), nonneg=True)
-        speed_mag = cp.Variable((T_future, H), nonneg=True)
+        # ================================= SPEEDS =================================
+        step_distance = cp.Variable(T_future, nonneg=True)
+        speed_mag = cp.Variable(T_future, nonneg=True)
 
-        constraints += [step_distance[:, 0] == d_mid - d[:-1]]
-        constraints += [step_distance[:, 1] == d[1:] - d_mid]
-
-        constraints += [
-            speed_mag == (step_distance / half_dt_h) * 1000.0 / 3600.0
-        ]
-
-        speed_seg = cp.Variable((T_future, H, nb_path_zones))
-        ship_speed_x = cp.Variable((T_future, H))
-        ship_speed_y = cp.Variable((T_future, H))
-
-        constraints += [ship_speed_x <= self.ship.info.max_speed]
-        constraints += [ship_speed_x >= -self.ship.info.max_speed]
-        constraints += [ship_speed_y <= self.ship.info.max_speed]
-        constraints += [ship_speed_y >= -self.ship.info.max_speed]
+        constraints += [step_distance == d[1:] - d[:-1]]
+        constraints += [speed_mag == (step_distance / dt_h) * 1000.0 / 3600.0]
         constraints += [speed_mag <= self.ship.info.max_speed]
 
+        speed_seg = cp.Variable((T_future, nb_path_zones))
+        ship_speed_x = cp.Variable(T_future)
+        ship_speed_y = cp.Variable(T_future)
+
         constraints += [speed_seg >= 0]
-        constraints += [speed_mag == cp.sum(speed_seg, axis=2)]
+        constraints += [speed_mag == cp.sum(speed_seg, axis=1)]
 
         for t in range(T_future):
             for s in range(nb_path_zones):
                 constraints += [
-                    speed_seg[t, 0, s] <= self.ship.info.max_speed * seg[t, s],
-                    speed_seg[t, 1, s] <= self.ship.info.max_speed * seg[t + 1, s],
+                    speed_seg[t, s] <= self.ship.info.max_speed * seg[t, s]
                 ]
 
-        constraints += [
-            ship_speed_x == cp.sum(cp.multiply(speed_seg, cos_seg[None, None, :]), axis=2),
-            ship_speed_y == cp.sum(cp.multiply(speed_seg, sin_seg[None, None, :]), axis=2),
-        ]
+        # Optional redundant bounds to help B&B / presolve
+        constraints += [step_distance <= self.ship.info.max_speed*dt_h*3600.0/1000.0]
+        constraints += [ship_speed_x <= self.ship.info.max_speed]
+        constraints += [ship_speed_y <= self.ship.info.max_speed]
+        constraints += [ship_speed_x >= -self.ship.info.max_speed]
+        constraints += [ship_speed_y >= -self.ship.info.max_speed]
 
-        # ================================================ ACCELERATION ================================================
-        acc = cp.Variable((T_future, H))
-        acc_force = cp.Variable((T_future, H))
+        # ================================= ACCELERATION =================================
+        acc = cp.Variable(T_future)
+        acc_force = cp.Variable(T_future)
 
-        constraints += [acc <= self.ship.info.max_speed / half_dt_s]
-        constraints += [acc >= -self.ship.info.max_speed / half_dt_s]
+        init_speed = float(getattr(self.itinerary, "init_speed", 0.0))
 
-        constraints += [
-            acc[0, 0] == (speed_mag[0, 0] - self.itinerary.init_speed) / half_dt_s,
-            acc[0, 1] == (speed_mag[0, 1] - speed_mag[0, 0]) / half_dt_s,
-        ]
+        constraints += [acc <= self.ship.info.max_speed / dt_s]
+        constraints += [acc >= -self.ship.info.max_speed / dt_s]
+
+        constraints += [acc[0] == (speed_mag[0] - init_speed) / dt_s]
 
         for t in range(1, T_future):
-            constraints += [
-                acc[t, 0] == (speed_mag[t, 0] - speed_mag[t - 1, 1]) / half_dt_s,
-                acc[t, 1] == (speed_mag[t, 1] - speed_mag[t, 0]) / half_dt_s,
-            ]
+            constraints += [acc[t] == (speed_mag[t] - speed_mag[t - 1]) / dt_s]
 
         constraints += [acc_force >= 0]
         constraints += [acc_force >= acc * self.ship.info.weight / 1_000_000]
+        constraints += [acc_force <= (self.ship.info.max_speed / dt_s) * self.ship.info.weight / 1_000_000]
 
-        # ================================================== WEATHER ===================================================
-        current_x_seg = self.weather.current_x[path_zone_ids, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
-        current_y_seg = self.weather.current_y[path_zone_ids, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
-        wind_x_seg    = self.weather.wind_x[path_zone_ids, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
-        wind_y_seg    = self.weather.wind_y[path_zone_ids, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
-        irr_seg       = self.weather.irradiance[path_zone_ids, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
+        # ================================= SPLIT SPEEDS FOR WATER-RELATIVE MAGNITUDE =================================
+        # Same scalar speed over the timestep, but direction evaluated at the start and end path segments.
+        ship_speed_x_split = cp.Variable((T_future, 2))
+        ship_speed_y_split = cp.Variable((T_future, 2))
 
-        current_x = cp.Variable((T_future, H))
-        current_y = cp.Variable((T_future, H))
-        wind_x = cp.Variable((T_future, H))
-        wind_y = cp.Variable((T_future, H))
-        irr = cp.Variable((T_future, H), nonneg=True)
+        speed_seg_start = cp.Variable((T_future, nb_path_zones))
+        speed_seg_end = cp.Variable((T_future, nb_path_zones))
+
+        constraints += [speed_seg_start >= 0]
+        constraints += [speed_seg_end >= 0]
+        constraints += [speed_seg_start <= self.ship.info.max_speed]
+        constraints += [speed_seg_end <= self.ship.info.max_speed]
+        constraints += [ship_speed_x_split >= -self.ship.info.max_speed]
+        constraints += [ship_speed_x_split >= -self.ship.info.max_speed]
+        constraints += [ship_speed_y_split <= self.ship.info.max_speed]
+        constraints += [ship_speed_y_split <= self.ship.info.max_speed]
+
+        for t in range(T_future):
+            constraints += [cp.sum(speed_seg_start[t, :]) == speed_mag[t]]
+            constraints += [cp.sum(speed_seg_end[t, :]) == speed_mag[t]]
+
+            for s in range(nb_path_zones):
+                constraints += [
+                    speed_seg_start[t, s] <= self.ship.info.max_speed * seg[t, s],
+                    speed_seg_end[t, s] <= self.ship.info.max_speed * seg[t + 1, s],
+                ]
+
+        constraints += [
+            ship_speed_x_split[:, 0] == cp.sum(
+                cp.multiply(speed_seg_start, cos_seg[None, :]),
+                axis=1,
+            ),
+            ship_speed_y_split[:, 0] == cp.sum(
+                cp.multiply(speed_seg_start, sin_seg[None, :]),
+                axis=1,
+            ),
+            ship_speed_x_split[:, 1] == cp.sum(
+                cp.multiply(speed_seg_end, cos_seg[None, :]),
+                axis=1,
+            ),
+            ship_speed_y_split[:, 1] == cp.sum(
+                cp.multiply(speed_seg_end, sin_seg[None, :]),
+                axis=1,
+            ),
+        ]
+        # ================================= WATER-RELATIVE SPEED =================================
+        ship_speed_x_split_rel_water = cp.Variable((T_future, 2))
+        ship_speed_y_split_rel_water = cp.Variable((T_future, 2))
+        ship_speed_rel_water_mag_split = cp.Variable((T_future, 2), nonneg=True)
+        speed_rel_water_mag = cp.Variable(T_future, nonneg=True)
+
+        constraints += [ship_speed_rel_water_mag_split <= self.ship.info.max_speed+1] #adding 1 m/s to account for current
+        constraints += [speed_rel_water_mag <= self.ship.info.max_speed+1]
+        constraints += [ship_speed_x_split_rel_water >= -self.ship.info.max_speed-1]
+        constraints += [ship_speed_x_split_rel_water >= -self.ship.info.max_speed-1]
+        constraints += [ship_speed_y_split_rel_water <= self.ship.info.max_speed+1]
+        constraints += [ship_speed_y_split_rel_water <= self.ship.info.max_speed+1]
+
+        current_x_future = self.weather.current_x[
+            :,
+            self.states.timesteps_completed : self.states.timesteps_completed + T_future,
+        ]
+        current_y_future = self.weather.current_y[
+            :,
+            self.states.timesteps_completed : self.states.timesteps_completed + T_future,
+        ]
+
+        current_x_path = current_x_future[path_zone_ids, :]
+        current_y_path = current_y_future[path_zone_ids, :]
 
         for t in range(T_future):
             constraints += [
-                current_x[t, 0] == seg[t, :] @ current_x_seg[:, t],
-                current_y[t, 0] == seg[t, :] @ current_y_seg[:, t],
-                wind_x[t, 0] == seg[t, :] @ wind_x_seg[:, t],
-                wind_y[t, 0] == seg[t, :] @ wind_y_seg[:, t],
-                irr[t, 0] == seg[t, :] @ irr_seg[:, t],
+                ship_speed_x_split_rel_water[t, 0]
+                == ship_speed_x_split[t, 0] - seg[t, :] @ current_x_path[:, t],
 
-                current_x[t, 1] == seg[t + 1, :] @ current_x_seg[:, t],
-                current_y[t, 1] == seg[t + 1, :] @ current_y_seg[:, t],
-                wind_x[t, 1] == seg[t + 1, :] @ wind_x_seg[:, t],
-                wind_y[t, 1] == seg[t + 1, :] @ wind_y_seg[:, t],
-                irr[t, 1] == seg[t + 1, :] @ irr_seg[:, t],
+                ship_speed_y_split_rel_water[t, 0]
+                == ship_speed_y_split[t, 0] - seg[t, :] @ current_y_path[:, t],
+
+                ship_speed_x_split_rel_water[t, 1]
+                == ship_speed_x_split[t, 1] - seg[t + 1, :] @ current_x_path[:, t],
+
+                ship_speed_y_split_rel_water[t, 1]
+                == ship_speed_y_split[t, 1] - seg[t + 1, :] @ current_y_path[:, t],
             ]
 
-        # ================================================== RELATIVE SPEED ===================================================
-        speed_rel_water_x = cp.Variable((T_future, H))
-        speed_rel_water_y = cp.Variable((T_future, H))
-        speed_rel_water_mag = cp.Variable((T_future, H), nonneg=True)
-
-        constraints += [speed_rel_water_mag<=self.ship.info.max_speed+1]  #adding 1m/s to account for currents that can go up to 1m/s
-
-        constraints += [
-            speed_rel_water_x == ship_speed_x - current_x,
-            speed_rel_water_y == ship_speed_y - current_y,
-        ]
-
-        for t in range(T_future):
-            for h in range(H):
+            for j in range(2):
                 constraints += [
-                    speed_rel_water_mag[t, h] >= cp.norm(
-                        cp.hstack([speed_rel_water_x[t, h], speed_rel_water_y[t, h]]),
+                    ship_speed_rel_water_mag_split[t, j] >= cp.norm(
+                        cp.hstack([
+                            ship_speed_x_split_rel_water[t, j],
+                            ship_speed_y_split_rel_water[t, j],
+                        ]),
                         2,
                     )
                 ]
 
-        # ================================================== RESISTANCE ===================================================
-        wave_resistance = cp.Variable((T_future, H), nonneg=True)
-        wind_resistance = cp.Variable((T_future, H))
-        calm_water_resistance = cp.Variable((T_future, H), nonneg=True)
-        total_resistance = cp.Variable((T_future, H), nonneg=True)
-        normalized_rel_speed = cp.Variable((T_future, H), nonneg=True)
-        normalized_speed = cp.Variable((T_future, H), nonneg=True)
-
-        WIND_BIG_M = 2.0
-        WAVE_BIG_M = 1.0
-        constraints += [wave_resistance <= WAVE_BIG_M]
-        constraints += [wind_resistance <= WIND_BIG_M]
-        constraints += [wind_resistance >= -WIND_BIG_M]
-
-        constraints += [normalized_rel_speed == speed_rel_water_mag / self.ship.info.max_speed]
-        constraints += [normalized_speed == speed_mag / self.ship.info.max_speed]
-
-        wind_model_future = self.wind_model.thrust_coeffs[:, self.states.timesteps_completed : self.states.timesteps_completed + T_future, :]
-        wave_model_future = self.wave_model.thrust_coeffs[:, self.states.timesteps_completed : self.states.timesteps_completed + T_future, :]
+        constraints += [
+            speed_rel_water_mag >= cp.sum(ship_speed_rel_water_mag_split, axis=1) / 2
+        ]
+        # ================================= RESISTANCE =================================
+        wave_resistance = cp.Variable(T_future, nonneg=True)
+        wind_resistance = cp.Variable(T_future)
+        calm_water_resistance = cp.Variable(T_future, nonneg=True)
+        total_resistance = cp.Variable(T_future, nonneg=True)
+        normalized_speed = cp.Variable(T_future)
+        normalized_rel_speed = cp.Variable(T_future)
 
         
+        WIND_BIG_M = 2.0
+        WAVE_BIG_M = 1.0
+
+        constraints += [wind_resistance <= WIND_BIG_M]
+        constraints += [wind_resistance >= -WIND_BIG_M]
+        constraints += [wave_resistance <= WAVE_BIG_M]
+
+        constraints += [normalized_speed == speed_mag / self.ship.info.max_speed]
+        constraints += [normalized_rel_speed == speed_rel_water_mag / self.ship.info.max_speed]
+
+        wind_model_future = self.wind_model.thrust_coeffs[
+            :, self.states.timesteps_completed : self.states.timesteps_completed + T_future, :
+        ]
+        wave_model_future = self.wave_model.thrust_coeffs[
+            :, self.states.timesteps_completed : self.states.timesteps_completed + T_future, :
+        ]
 
         for t in range(T_future):
-            for h in range(H):
-                active_seg = seg[t + h, :]
+            if interval_sail_fraction[t] > 0.01:
+                for s in range(nb_path_zones):
+                    c1 = wind_model_future[s, t, :]
+                    cw1 = wave_model_future[s, t, :]
 
-                if interval_sail_fraction[t] > 0.01:
-                    for z in range(nb_path_zones):
-                        c = wind_model_future[z, t, :]
-                        wind_fit_expr = (
-                            c[0]
-                            + c[1] * normalized_speed[t, h]
-                            + c[2] * cp.square(normalized_speed[t, h])
-                            + c[3] * cp.power(normalized_speed[t, h], 3)
-                            + c[4] * cp.power(normalized_speed[t, h], 4)
-                        )
-                        constraints += [
-                            wind_resistance[t, h] >= wind_fit_expr - WIND_BIG_M * (1 - active_seg[z])
-                        ]
-
-                        c = wave_model_future[z, t, :]
-                        wave_fit_expr = (
-                            c[0]
-                            + c[1] * normalized_rel_speed[t, h]
-                            + c[2] * cp.square(normalized_rel_speed[t, h])
-                            + c[3] * cp.power(normalized_rel_speed[t, h], 3)
-                            + c[4] * cp.power(normalized_rel_speed[t, h], 4)
-                        )
-                        constraints += [
-                            wave_resistance[t, h] >= wave_fit_expr - WAVE_BIG_M * (1 - active_seg[z])
-                        ]
+                    # Same-segment case: s at t and s at t+1
+                    constraints += [
+                        wind_resistance[t] >=
+                        c1[0]
+                        + c1[1] * normalized_speed[t]
+                        + c1[2] * cp.square(normalized_speed[t])
+                        + c1[3] * cp.power(normalized_speed[t], 3)
+                        + c1[4] * cp.power(normalized_speed[t], 4)
+                        - WIND_BIG_M * (2 - seg[t, s] - seg[t + 1, s])
+                    ]
 
                     constraints += [
-                        calm_water_resistance[t, h] >=
-                        self.calm_model.res_coeffs[0]
-                        + self.calm_model.res_coeffs[1] * normalized_rel_speed[t, h]
-                        + self.calm_model.res_coeffs[2] * cp.square(normalized_rel_speed[t, h])
-                        + self.calm_model.res_coeffs[3] * cp.power(normalized_rel_speed[t, h], 3)
-                        + self.calm_model.res_coeffs[4] * cp.power(normalized_rel_speed[t, h], 4)
+                        wave_resistance[t] >=
+                        cw1[0]
+                        + cw1[1] * normalized_rel_speed[t]
+                        + cw1[2] * cp.square(normalized_rel_speed[t])
+                        + cw1[3] * cp.power(normalized_rel_speed[t], 3)
+                        + cw1[4] * cp.power(normalized_rel_speed[t], 4)
+                        - WAVE_BIG_M * (2 - seg[t, s] - seg[t + 1, s])
                     ]
-                else:
-                    constraints += [
-                        wave_resistance[t, h] == 0,
-                        wind_resistance[t, h] == 0,
-                        calm_water_resistance[t, h] == 0,
-                        total_resistance[t, h] == 0,
-                    ]
+
+                    # Transition case: s -> s+1
+                    if s < nb_path_zones - 1:
+                        c2 = wind_model_future[s + 1, t, :]
+                        cw2 = wave_model_future[s + 1, t, :]
+
+                        constraints += [
+                            wind_resistance[t] >=
+                            0.5 * (
+                                c1[0]
+                                + c1[1] * normalized_speed[t]
+                                + c1[2] * cp.square(normalized_speed[t])
+                                + c1[3] * cp.power(normalized_speed[t], 3)
+                                + c1[4] * cp.power(normalized_speed[t], 4)
+                                + c2[0]
+                                + c2[1] * normalized_speed[t]
+                                + c2[2] * cp.square(normalized_speed[t])
+                                + c2[3] * cp.power(normalized_speed[t], 3)
+                                + c2[4] * cp.power(normalized_speed[t], 4)
+                            )
+                            - WIND_BIG_M * (2 - seg[t, s] - seg[t + 1, s + 1])
+                        ]
+
+                        constraints += [
+                            wave_resistance[t] >=
+                            0.5 * (
+                                cw1[0]
+                                + cw1[1] * normalized_rel_speed[t]
+                                + cw1[2] * cp.square(normalized_rel_speed[t])
+                                + cw1[3] * cp.power(normalized_rel_speed[t], 3)
+                                + cw1[4] * cp.power(normalized_rel_speed[t], 4)
+                                + cw2[0]
+                                + cw2[1] * normalized_rel_speed[t]
+                                + cw2[2] * cp.square(normalized_rel_speed[t])
+                                + cw2[3] * cp.power(normalized_rel_speed[t], 3)
+                                + cw2[4] * cp.power(normalized_rel_speed[t], 4)
+                            )
+                            - WAVE_BIG_M * (2 - seg[t, s] - seg[t + 1, s + 1])
+                        ]
+
+                constraints += [
+                    calm_water_resistance[t] >=
+                    self.calm_model.res_coeffs[0]
+                    + self.calm_model.res_coeffs[1] * normalized_rel_speed[t]
+                    + self.calm_model.res_coeffs[2] * cp.square(normalized_rel_speed[t])
+                    + self.calm_model.res_coeffs[3] * cp.power(normalized_rel_speed[t], 3)
+                    + self.calm_model.res_coeffs[4] * cp.power(normalized_rel_speed[t], 4)
+                ]
+            else:
+                constraints += [
+                    wind_resistance[t] == 0,
+                    wave_resistance[t] == 0,
+                    calm_water_resistance[t] == 0,
+                    total_resistance[t] == 0,
+                ]
 
         constraints += [
             total_resistance >= wave_resistance + wind_resistance + calm_water_resistance + acc_force
         ]
 
-        # ================================================== PROPULSION ===================================================
-        res_per_prop = cp.Variable((T_future, H), nonneg=True)
-        prop_power = cp.Variable((T_future, H), nonneg=True)
-        advance_speed = cp.Variable((T_future, H), nonneg=True)
-        norm_adv_speed = cp.Variable((T_future, H), nonneg=True)
+        # ================================= PROPULSION =================================
+        res_per_prop = cp.Variable(T_future, nonneg=True)
+        prop_power = cp.Variable(T_future, nonneg=True)
+        advance_speed = cp.Variable(T_future, nonneg=True)
+        norm_adv_speed = cp.Variable(T_future, nonneg=True)
+
+        constraints += [prop_power <= self.ship.propulsion.max_pow * self.ship.propulsion.nb_propellers]
+        constraints += [res_per_prop <= self.ship.propulsion.max_pow]
 
         constraints += [advance_speed == speed_rel_water_mag * (1 - self.ship.propulsion.wake_fraction)]
         constraints += [norm_adv_speed == advance_speed / self.propulsion_model.max_ua]
         constraints += [res_per_prop == total_resistance / self.ship.propulsion.nb_propellers]
 
-        constraints += [prop_power<= self.ship.propulsion.max_pow * self.ship.propulsion.nb_propellers]
-
         for t in range(T_future):
-            for h in range(H):
-                if instant_sail[t]:
-                    constraints += [
-                        prop_power[t, h] >= self.ship.propulsion.nb_propellers * (
-                            self.propulsion_model.power_coeffs[0]
-                            + self.propulsion_model.power_coeffs[1] * res_per_prop[t, h] / self.propulsion_model.max_thrust
-                            + self.propulsion_model.power_coeffs[2] * cp.square(res_per_prop[t, h] / self.propulsion_model.max_thrust)
-                            + self.propulsion_model.power_coeffs[3] * cp.power(res_per_prop[t, h] / self.propulsion_model.max_thrust, 3)
-                            + self.propulsion_model.power_coeffs[4] * norm_adv_speed[t, h]
-                            + self.propulsion_model.power_coeffs[5] * cp.square(norm_adv_speed[t, h])
-                            + self.propulsion_model.power_coeffs[6] * cp.power(norm_adv_speed[t, h], 3)
-                        )
-                    ]
-                else:
-                    constraints += [prop_power[t, h] == 0]
+            if instant_sail[t]:
+                constraints += [
+                    prop_power[t] >= self.ship.propulsion.nb_propellers * (
+                        self.propulsion_model.power_coeffs[0]
+                        + self.propulsion_model.power_coeffs[1] * res_per_prop[t] / self.propulsion_model.max_thrust
+                        + self.propulsion_model.power_coeffs[2] * cp.square(res_per_prop[t] / self.propulsion_model.max_thrust)
+                        + self.propulsion_model.power_coeffs[3] * cp.power(res_per_prop[t] / self.propulsion_model.max_thrust, 3)
+                        + self.propulsion_model.power_coeffs[4] * norm_adv_speed[t]
+                        + self.propulsion_model.power_coeffs[5] * cp.square(norm_adv_speed[t])
+                        + self.propulsion_model.power_coeffs[6] * cp.power(norm_adv_speed[t], 3)
+                    )
+                ]
+            else:
+                constraints += [prop_power[t] == 0]
 
-        # ================================================== SOLAR / SHORE ===================================================
-        solar_power = cp.Variable((T_future, H), nonneg=True)
+        # ================================= SOLAR POWER =================================
+        solar_power = cp.Variable(T_future, nonneg=True)
+        irr_seg = self.weather.irradiance[
+            path_zone_ids,
+            self.states.timesteps_completed : self.states.timesteps_completed + T_future,
+        ]
 
-        for t in range(T_future):
-            constraints += [
-                solar_power[t, 0] <= self.ship.solarPannels.area * self.ship.solarPannels.efficiency * irr[t, 0],
-                solar_power[t, 1] <= self.ship.solarPannels.area * self.ship.solarPannels.efficiency * irr[t, 1],
-            ]
+        irr_avg = 0.5 * (
+            cp.sum(cp.multiply(seg[:-1, :], irr_seg.T), axis=1)
+            + cp.sum(cp.multiply(seg[1:, :], irr_seg.T), axis=1)
+        )
 
-        shore_power = cp.Variable((T_future, H), nonneg=True)
+        constraints += [solar_power <= self.ship.solarPannels.area * self.ship.solarPannels.efficiency * irr_avg]
+        
+        # ================================= SHORE POWER =================================
+        shore_power = cp.Variable(T_future)
         shore_cost = np.zeros(T_future)
 
         for t in range(T_future):
             if instant_sail[t]:
-                constraints += [shore_power[t, :] == 0]
+                constraints += [shore_power[t] == 0]
             else:
                 p = int(port_idx[t])
                 shore_cost[t] = self.itinerary.transits[p].power_cost
-                constraints += [shore_power[t, :] <= self.itinerary.transits[p].max_charge_power]
+                constraints += [shore_power[t] >= 0]
+                constraints += [shore_power[t] <= self.itinerary.transits[p].max_charge_power]
 
-        # ================================================== BATTERY ===================================================
-        battery_charge = cp.Variable((T_future, H), nonneg=True)
-        battery_discharge = cp.Variable((T_future, H), nonneg=True)
-        SOC = cp.Variable(T_future + 1, nonneg=True)
-        SOC_mid = cp.Variable(T_future, nonneg=True)
+        # ================================= BATTERY =================================
+        battery_charge = cp.Variable(T_future)
+        battery_discharge = cp.Variable(T_future)
+        SOC = cp.Variable(T_future + 1)
 
+        constraints += [SOC >= 0]
         constraints += [SOC <= self.ship.battery.capacity]
-        constraints += [SOC_mid <= self.ship.battery.capacity]
+
+        constraints += [battery_charge >= 0]
+        constraints += [battery_discharge >= 0]
         constraints += [battery_charge <= self.ship.battery.max_charge_pow]
         constraints += [battery_discharge <= self.ship.battery.max_discharge_pow]
 
-        adjusted_leak_half = self.ship.battery.leak ** half_dt_h
+        adjusted_leak = self.ship.battery.leak ** dt_h
 
         for t in range(T_future):
             constraints += [
-                SOC_mid[t] == adjusted_leak_half * SOC[t]
-                - half_dt_h * battery_discharge[t, 0] / self.ship.battery.discharge_eff
-                + half_dt_h * self.ship.battery.charge_eff * battery_charge[t, 0]
-            ]
-
-            constraints += [
-                SOC[t + 1] == adjusted_leak_half * SOC_mid[t]
-                - half_dt_h * battery_discharge[t, 1] / self.ship.battery.discharge_eff
-                + half_dt_h * self.ship.battery.charge_eff * battery_charge[t, 1]
+                SOC[t + 1] == adjusted_leak * SOC[t]
+                - dt_h * battery_discharge[t] / self.ship.battery.discharge_eff
+                + dt_h * self.ship.battery.charge_eff * battery_charge[t]
             ]
 
         constraints += [SOC[0] == self.states.soc]
         constraints += [SOC[-1] >= self.itinerary.soc_f]
 
-        # ================================================== GENERATORS ===================================================
+        # ================================= GENERATORS =================================
         nb_gen = len(self.generator_models)
 
-        generation_power = cp.Variable((nb_gen, 2 * T_future), nonneg=True)
-        gen_costs = cp.Variable((nb_gen, 2 * T_future), nonneg=True)
-
-        coeffs = np.array([gm.power_coeffs for gm in self.generator_models])
-        c = coeffs[:, 0][:, None]
-        b = coeffs[:, 1][:, None]
-        a = coeffs[:, 2][:, None]
-
-        c = np.repeat(c, 2 * T_future, axis=1)
-        b = np.repeat(b, 2 * T_future, axis=1)
-        a = np.repeat(a, 2 * T_future, axis=1)
+        generation_power = cp.Variable((nb_gen, T_future))
+        gen_costs = cp.Variable((nb_gen, T_future))
 
         max_p = np.array([g.max_power for g in self.ship.generators])[:, None]
-        max_p = np.repeat(max_p, 2 * T_future, axis=1)
+        max_p = np.repeat(max_p, T_future, axis=1)
+
+        coeffs = np.array([gm.power_coeffs for gm in self.generator_models])
+        c = np.repeat(coeffs[:, 0][:, None], T_future, axis=1)
+        b = np.repeat(coeffs[:, 1][:, None], T_future, axis=1)
+        a = np.repeat(coeffs[:, 2][:, None], T_future, axis=1)
+
+        constraints += [generation_power >= 0]
 
         if unit_commitment:
-            M = 1000000
-            gen_on = cp.Variable((nb_gen, 2 * T_future), boolean=True)
+            M = 1_000_000
+            gen_on = cp.Variable((nb_gen, T_future), boolean=True)
+
             constraints += [generation_power <= cp.multiply(max_p, gen_on)]
             constraints += [
                 gen_costs >= (
                     cp.multiply(a, cp.square(generation_power))
                     + cp.multiply(b, generation_power)
                     + c
-                ) * self.itinerary.fuel_price - M * (1 - gen_on)
+                ) * self.itinerary.fuel_price
+                - M * (1 - gen_on)
             ]
+            constraints += [gen_costs >= 0]
+
         else:
-            gen_on_fixed = np.zeros((nb_gen, 2 * T_future), dtype=float)
+            gen_on_fixed = np.zeros((nb_gen, T_future), dtype=float)
 
             for t in range(T_future):
                 if instant_sail[t]:
-                    gen_on_fixed[:, 2 * t] = 1.0
-                    gen_on_fixed[:, 2 * t + 1] = 1.0
+                    gen_on_fixed[:, t] = 1.0
+
+            constraints += [generation_power <= cp.multiply(max_p, gen_on_fixed)]
 
             constraints += [
                 gen_costs >= (
@@ -1968,108 +2069,87 @@ class Fixed_Path_Optimizer:
                     + cp.multiply(c, gen_on_fixed)
                 ) * self.itinerary.fuel_price
             ]
-            constraints += [generation_power <= cp.multiply(max_p, gen_on_fixed)]
+            constraints += [gen_costs >= 0]
 
-        # ================================================== POWER BALANCE ===================================================
+        # ================================= POWER BALANCE =================================
         for t in range(T_future):
-            for h in range(H):
-                k = 2 * t + h
-                constraints += [
-                    cp.sum(generation_power[:, k], axis=0)
-                    == prop_power[t, h]
-                    - solar_power[t, h]
-                    - battery_discharge[t, h]
-                    + battery_charge[t, h]
-                    - shore_power[t, h]
-                ]
+            constraints += [
+                cp.sum(generation_power[:, t], axis=0)
+                == prop_power[t]
+                - solar_power[t]
+                - battery_discharge[t]
+                + battery_charge[t]
+                - shore_power[t]
+            ]
 
-        # ================================================== OBJECTIVE ===================================================
-        shore_cost_half = np.repeat(shore_cost, 2)
-        shore_power_flat = cp.reshape(shore_power, (2 * T_future,), order="C")
-
+        # ================================= OBJECTIVE =================================
         objective = cp.Minimize(
-            half_dt_h * (
+            dt_h * (
                 cp.sum(gen_costs)
-                + cp.sum(cp.multiply(shore_power_flat, shore_cost_half))
+                + cp.sum(cp.multiply(shore_power, shore_cost))
             )
         )
 
-        # ================================================== SOLVE ===================================================
+        # ================================= SOLVE =================================
         problem = cp.Problem(objective, constraints)
-        problem.solve(solver="MOSEK", verbose=debug)
+
+        start_solve = time.time()
+
+        problem.solve(
+            solver=cp.MOSEK,
+            verbose=debug,
+        )
+
+        solve_time = time.time() - start_solve
 
         print("AFTER SOLVE: status =", problem.status, "value =", problem.value)
+        print(f"Fixed path solve time (wall clock): {solve_time:.2f} seconds")
+        print("MOSEK reported solve time:", problem.solver_stats.solve_time, "seconds")
 
         if problem.status in ["infeasible", "unbounded"]:
             print(f"Optimization status: {problem.status}")
             return 0
 
-        # ============================== RECONSTRUCT 2D POSITIONS ===============================
-        d_opt = np.asarray(d.value, dtype=float).reshape(-1)
-        d_mid_opt = np.asarray(d_mid.value, dtype=float).reshape(-1)
-
-        def xy_from_d_values(d_values):
-            d_values = np.asarray(d_values, dtype=float).reshape(-1)
-            xy = np.zeros((len(d_values), 2), dtype=float)
-
-            for i, dist in enumerate(d_values):
-                dist = min(max(dist, 0.0), D_breaks[-1])
-
-                if dist >= D_breaks[-1]:
-                    xy[i] = waypoints[-1]
-                    continue
-
-                seg_idx = np.searchsorted(D_breaks, dist, side="right") - 1
-                seg_idx = max(0, min(seg_idx, len(segment_lengths) - 1))
-
-                local_dist = dist - D_breaks[seg_idx]
-                xy[i] = waypoints[seg_idx] + local_dist * segment_dirs[seg_idx]
-
-            return xy
-
-        ship_pos_2d = xy_from_d_values(d_opt)
-        crossing_point_2d = xy_from_d_values(d_mid_opt)
-
+        # ================================= RESULTS =================================
+        d_opt = np.asarray(d.value, dtype=float)
         seg_value = np.asarray(seg.value, dtype=float)
 
         zone_full = np.zeros((T_future + 1, self.map.nb_zones), dtype=float)
         for s, actual_zone_id in enumerate(path_zone_ids):
             zone_full[:, int(actual_zone_id)] = seg_value[:, s]
 
-        if unit_commitment:
-            gen_on_flat = np.array(gen_on.value)
-        else:
-            gen_on_flat = gen_on_fixed
+        def _xy_from_distance(d_abs):
+            s = np.searchsorted(D_breaks, d_abs, side="right") - 1
+            s = int(np.clip(s, 0, len(segment_dirs) - 1))
+            return waypoints[s] + (d_abs - D_breaks[s]) * segment_dirs[s]
 
-        gen_power_out = np.zeros((nb_gen, T_future, H), dtype=float)
-        gen_costs_out = np.zeros((nb_gen, T_future, H), dtype=float)
-        gen_on_out = np.zeros((nb_gen, T_future, H), dtype=float)
-
-        for t in range(T_future):
-            for h in range(H):
-                k = 2 * t + h
-                gen_power_out[:, t, h] = generation_power.value[:, k]
-                gen_costs_out[:, t, h] = gen_costs.value[:, k]
-                gen_on_out[:, t, h] = gen_on_flat[:, k]
+        ship_pos_2d = np.vstack([_xy_from_distance(x) for x in d_opt])
 
         ship_speed_out = np.stack(
-            [np.array(ship_speed_x.value), np.array(ship_speed_y.value)],
+            [np.asarray(ship_speed_x.value), np.asarray(ship_speed_y.value)],
             axis=1,
         )
 
         speed_rel_water_out = np.stack(
-            [np.array(speed_rel_water_x.value), np.array(speed_rel_water_y.value)],
+            [
+                0.5 * (
+                    np.asarray(ship_speed_x_split_rel_water.value)[:, 0]
+                    + np.asarray(ship_speed_x_split_rel_water.value)[:, 1]
+                ),
+                0.5 * (
+                    np.asarray(ship_speed_y_split_rel_water.value)[:, 0]
+                    + np.asarray(ship_speed_y_split_rel_water.value)[:, 1]
+                ),
+            ],
             axis=1,
         )
 
-        shore_power_cost = np.array(shore_power.value).astype(float) * shore_cost[:, None].astype(float)
+        if unit_commitment:
+            gen_on_out = np.asarray(gen_on.value)
+        else:
+            gen_on_out = gen_on_fixed
 
-        print("\n[Fixed_Path_Optimizer debug]")
-        print("self.waypoints:")
-        print(self.waypoints)
-        print("d_opt first/last:", d_opt[0], d_opt[-1])
-        print("ship_pos_2d first/last:", ship_pos_2d[0], ship_pos_2d[-1])
-        print("crossing_point_2d first/last:", crossing_point_2d[0], crossing_point_2d[-1])
+        shore_power_cost = np.asarray(shore_power.value).astype(float) * shore_cost.astype(float)
 
         self.sol = Solution(
             estimated_cost=problem.value,
@@ -2082,31 +2162,34 @@ class Fixed_Path_Optimizer:
 
             ship_pos=ship_pos_2d,
             ship_speed=ship_speed_out,
+            speed_mag=np.asarray(speed_mag.value),
             speed_rel_water=speed_rel_water_out,
-            speed_rel_water_mag=np.array(speed_rel_water_mag.value),
+            speed_rel_water_mag=np.asarray(speed_rel_water_mag.value),
 
-            prop_power=np.array(prop_power.value),
-            wave_resistance=np.array(wave_resistance.value),
-            wind_resistance=np.array(wind_resistance.value),
-            calm_water_resistance=np.array(calm_water_resistance.value),
-            acc_force=np.array(acc_force.value),
-            total_resistance=np.array(total_resistance.value),
+            prop_power=np.asarray(prop_power.value),
+            wave_resistance=np.asarray(wave_resistance.value),
+            wind_resistance=np.asarray(wind_resistance.value),
+            calm_water_resistance=np.asarray(calm_water_resistance.value),
+            acc_force=np.asarray(acc_force.value),
+            total_resistance=np.asarray(total_resistance.value),
 
-            generation_power=gen_power_out,
-            gen_costs=gen_costs_out,
+            generation_power=np.asarray(generation_power.value),
+            gen_costs=np.asarray(gen_costs.value),
             gen_on=gen_on_out,
-            solar_power=np.array(solar_power.value),
-            shore_power=np.array(shore_power.value).astype(float),
+            solar_power=np.asarray(solar_power.value),
+            shore_power=np.asarray(shore_power.value).astype(float),
             shore_power_cost=shore_power_cost,
-            battery_charge=np.array(battery_charge.value),
-            battery_discharge=np.array(battery_discharge.value),
-            SOC=np.array(SOC.value),
+            battery_charge=np.asarray(battery_charge.value),
+            battery_discharge=np.asarray(battery_discharge.value),
+            SOC=np.asarray(SOC.value),
 
             path_distance=d_opt,
             fixed_path_waypoints=np.asarray(self.waypoints, dtype=float),
-            crossing_point=crossing_point_2d,
-            step_distance=np.array(step_distance.value),
-            path_zone_ids=np.array(self.path_zone_ids),
+            path_zone_ids=np.asarray(self.path_zone_ids, dtype=int),
+
+            crossing_point=None,
+            step_distance=np.asarray(step_distance.value),
+            segment_dt_h=None,
         )
 
         return 1
@@ -2134,7 +2217,6 @@ class NaiveController:
             raise ValueError("No timesteps left to compute; trip is finished.")
 
         T_future = self.itinerary.nb_timesteps - self.states.timesteps_completed
-        H = 2
 
         instant_sail, port_idx, interval_sail_fraction = classify_timesteps(self.itinerary)
         instant_sail = instant_sail[self.states.timesteps_completed:]
@@ -2143,13 +2225,6 @@ class NaiveController:
 
         waypoints = np.asarray(self.path_sol.waypoints, dtype=float)
         path_zone_ids = np.asarray(self.path_sol.zone_sequence, dtype=int)
-
-        if waypoints.ndim != 2 or waypoints.shape[1] != 2:
-            raise ValueError("path_sol.waypoints must have shape (N, 2).")
-        if len(waypoints) < 2:
-            raise ValueError("path_sol.waypoints must contain at least 2 points.")
-        if len(path_zone_ids) != len(waypoints) - 1:
-            raise ValueError("path_sol.zone_sequence must have one zone id per path segment.")
 
         segment_vecs = waypoints[1:] - waypoints[:-1]
         segment_lengths_km = np.linalg.norm(segment_vecs, axis=1)
@@ -2162,9 +2237,6 @@ class NaiveController:
         total_distance_km = float(distance_breaks_km[-1])
 
         sailing_time_h = float(np.sum(interval_sail_fraction) * self.itinerary.timestep)
-        if sailing_time_h <= 0.0 and total_distance_km > 1e-9:
-            raise ValueError("No sailing time is available, but the path distance is nonzero.")
-
         constant_speed_kmh = total_distance_km / sailing_time_h if sailing_time_h > 0.0 else 0.0
         constant_speed_mps = constant_speed_kmh * 1000.0 / 3600.0
 
@@ -2176,127 +2248,104 @@ class NaiveController:
             )
 
         # ============================================================
-        # Distance at full timesteps and half timesteps
+        # Distance at full timesteps only
         # ============================================================
-        distance_at_instant_km = np.zeros(T_future + 1, dtype=float)
+        path_distance = np.zeros(T_future + 1, dtype=float)
 
         for t in range(T_future):
-            distance_at_instant_km[t + 1] = (
-                distance_at_instant_km[t]
-                + constant_speed_kmh * self.itinerary.timestep * float(interval_sail_fraction[t])
+            path_distance[t + 1] = (
+                path_distance[t]
+                + constant_speed_kmh
+                * self.itinerary.timestep
+                * float(interval_sail_fraction[t])
             )
 
-        distance_at_instant_km = np.clip(distance_at_instant_km, 0.0, total_distance_km)
-        distance_at_instant_km[-1] = total_distance_km
+        path_distance = np.clip(path_distance, 0.0, total_distance_km)
+        path_distance[-1] = total_distance_km
 
-        distance_mid_km = 0.5 * (distance_at_instant_km[:-1] + distance_at_instant_km[1:])
-
-        step_distance = np.zeros((T_future, H), dtype=float)
-        step_distance[:, 0] = distance_mid_km - distance_at_instant_km[:-1]
-        step_distance[:, 1] = distance_at_instant_km[1:] - distance_mid_km
-
-        step_distance = np.maximum(step_distance, 0.0)
-
-        # ============================================================
-        # Reconstruct positions and zones
-        # ============================================================
         ship_pos = self._xy_from_distance_array(
-            distance_at_instant_km,
+            path_distance,
             waypoints,
             segment_dirs,
             segment_lengths_km,
             distance_breaks_km,
         )
 
-        crossing_point = self._xy_from_distance_array(
-            distance_mid_km,
-            waypoints,
-            segment_dirs,
-            segment_lengths_km,
-            distance_breaks_km,
-        )
-
+        # ============================================================
+        # Zone at nodes
+        # ============================================================
         zone = np.zeros((T_future + 1, self.map.nb_zones), dtype=float)
-        zone_mid = np.zeros((T_future, H, self.map.nb_zones), dtype=float)
 
-        for t, distance_km in enumerate(distance_at_instant_km):
-            segment_id = self._segment_index_from_distance(distance_km, distance_breaks_km)
-            actual_zone_id = int(path_zone_ids[segment_id])
-            zone[t, actual_zone_id] = 1.0
-
-        for t in range(T_future):
-            s0 = self._segment_index_from_distance(distance_at_instant_km[t], distance_breaks_km)
-            s1 = self._segment_index_from_distance(distance_mid_km[t], distance_breaks_km)
-
-            z0 = int(path_zone_ids[s0])
-            z1 = int(path_zone_ids[s1])
-
-            zone_mid[t, 0, z0] = 1.0
-            zone_mid[t, 1, z1] = 1.0
-
-        # Force second half to use the arrival zone when the midpoint lands exactly on a boundary.
-        for t in range(T_future):
-            if abs(distance_mid_km[t] - distance_breaks_km).min() < 1e-9:
-                s1 = self._segment_index_from_distance(distance_at_instant_km[t + 1], distance_breaks_km)
-                z1 = int(path_zone_ids[s1])
-                zone_mid[t, 1, :] = 0.0
-                zone_mid[t, 1, z1] = 1.0
+        for t, d_km in enumerate(path_distance):
+            s = self._segment_index_from_distance(d_km, distance_breaks_km)
+            z = int(path_zone_ids[s])
+            zone[t, z] = 1.0
 
         # ============================================================
-        # Segment speeds
-        # Shape: [T_future, 2(x,y), 2(segment)]
+        # One scalar speed command per timestep
         # ============================================================
-        ship_speed = np.zeros((T_future, 2, H), dtype=float)
-
-        half_dt_h = 0.5 * float(self.itinerary.timestep)
+        # IMPORTANT:
+        # The naive strategy is defined as a constant path-speed policy:
+        #     total path distance / total sailing time.
+        #
+        # Do NOT compute speed_mag as norm(mean velocity vector) over the
+        # timestep. If a timestep crosses a path corner / zone transition,
+        # the average vector can be shorter because directions cancel, even
+        # though the commanded speed along the path is still constant.
+        #
+        # Evaluators that need sub-timestep headings should use path_distance
+        # and fixed_path_waypoints to split the timestep geometrically. The
+        # scalar command stored here should remain the constant path speed.
+        # ============================================================
+        ship_speed = np.zeros((T_future, 2), dtype=float)
+        speed_mag = np.zeros(T_future, dtype=float)
 
         for t in range(T_future):
             if interval_sail_fraction[t] <= 1e-9:
                 continue
 
-            ship_speed[t, :, 0] = self._velocity_from_path_interval(
-            distance_at_instant_km[t],
-            distance_mid_km[t],
-            distance_breaks_km,
-            segment_dirs,
-            half_dt_h,
-        )
+            d0 = float(path_distance[t])
+            d1 = float(path_distance[t + 1])
 
-        ship_speed[t, :, 1] = self._velocity_from_path_interval(
-            distance_mid_km[t],
-            distance_at_instant_km[t + 1],
-            distance_breaks_km,
-            segment_dirs,
-            half_dt_h,
-)
+            if d1 <= d0 + 1e-12:
+                continue
+
+            speed_mag[t] = constant_speed_mps
+
+            # Store a representative vector for legacy plotting/diagnostics.
+            # Use the path tangent at the middle of the travelled path interval.
+            # This preserves ||ship_speed[t]|| = speed_mag[t] and avoids the
+            # artificial dips caused by averaging vectors across path corners.
+            d_mid = 0.5 * (d0 + d1)
+            s_mid = self._segment_index_from_distance(d_mid, distance_breaks_km)
+            ship_speed[t, :] = constant_speed_mps * segment_dirs[s_mid]
 
         # ============================================================
-        # Relative speed with segment-specific weather
+        # Approximate water-relative speed at timestep level
+        # Evaluator will recompute the true split-zone values later.
         # ============================================================
-        speed_rel_water = np.zeros((T_future, 2, H), dtype=float)
-        speed_rel_water_mag = np.zeros((T_future, H), dtype=float)
+        speed_rel_water = np.zeros((T_future, 2), dtype=float)
+        speed_rel_water_mag = np.zeros(T_future, dtype=float)
 
         for t in range(T_future):
             if interval_sail_fraction[t] <= 1e-9:
                 continue
 
             global_t = self.states.timesteps_completed + t
+            z = int(np.argmax(zone[t, :]))
 
-            for h in range(H):
-                zone_weights = zone_mid[t, h, :]
+            current_x = float(self.weather.current_x[z, global_t])
+            current_y = float(self.weather.current_y[z, global_t])
 
-                current_x = float(zone_weights @ self.weather.current_x[:, global_t])
-                current_y = float(zone_weights @ self.weather.current_y[:, global_t])
-
-                speed_rel_water[t, 0, h] = ship_speed[t, 0, h] - current_x
-                speed_rel_water[t, 1, h] = ship_speed[t, 1, h] - current_y
-                speed_rel_water_mag[t, h] = float(np.linalg.norm(speed_rel_water[t, :, h]))
+            speed_rel_water[t, 0] = ship_speed[t, 0] - current_x
+            speed_rel_water[t, 1] = ship_speed[t, 1] - current_y
+            speed_rel_water_mag[t] = float(np.linalg.norm(speed_rel_water[t, :]))
 
         # ============================================================
-        # Solar availability per half-step
+        # Solar / battery schedule: one value per timestep
         # ============================================================
-        solar_power_available = self._compute_solar_power_available_halfstep(
-            zone_mid=zone_mid,
+        solar_power_available = self._compute_solar_power_available(
+            zone=zone,
             T_future=T_future,
         )
 
@@ -2321,19 +2370,19 @@ class NaiveController:
         )
 
         # ============================================================
-        # Generators
-        # Shape: [nb_gen, T_future, 2]
+        # Generator placeholders
+        # Evaluator will recompute actual generator dispatch.
         # ============================================================
         nb_gen = len(self.ship.generators)
-        generation_power = np.zeros((nb_gen, T_future, H), dtype=float)
-        gen_on = np.zeros((nb_gen, T_future, H), dtype=float)
+        generation_power = np.zeros((nb_gen, T_future), dtype=float)
+        gen_on = np.zeros((nb_gen, T_future), dtype=float)
 
         sailing_intervals = interval_sail_fraction > 1e-9
         if nb_gen > 0:
-            generation_power[:, sailing_intervals, :] = 1.0 / nb_gen
-            gen_on[:, sailing_intervals, :] = 1.0
+            generation_power[:, sailing_intervals] = 1.0 / nb_gen
+            gen_on[:, sailing_intervals] = 1.0
 
-        zeros = np.zeros((T_future, H), dtype=float)
+        zeros = np.zeros(T_future, dtype=float)
 
         self.sol = Solution(
             estimated_cost=0.0,
@@ -2346,6 +2395,7 @@ class NaiveController:
             zone=zone,
             ship_pos=ship_pos,
             ship_speed=ship_speed,
+            speed_mag=speed_mag,
             speed_rel_water=speed_rel_water,
             speed_rel_water_mag=speed_rel_water_mag,
 
@@ -2357,7 +2407,7 @@ class NaiveController:
             total_resistance=zeros.copy(),
 
             generation_power=generation_power,
-            gen_costs=np.zeros((nb_gen, T_future, H), dtype=float),
+            gen_costs=np.zeros((nb_gen, T_future), dtype=float),
             gen_on=gen_on,
             solar_power=solar_power,
             shore_power=shore_power,
@@ -2366,11 +2416,13 @@ class NaiveController:
             battery_discharge=battery_discharge,
             SOC=SOC,
 
-            path_distance=distance_at_instant_km,
+            path_distance=path_distance,
             fixed_path_waypoints=np.asarray(self.path_sol.waypoints, dtype=float),
-            crossing_point=crossing_point,
-            step_distance=step_distance,
-            path_zone_ids=np.array(self.path_sol.zone_sequence),
+            path_zone_ids=np.asarray(self.path_sol.zone_sequence, dtype=int),
+
+            crossing_point=None,
+            step_distance=np.maximum(path_distance[1:] - path_distance[:-1], 0.0),
+            segment_dt_h=None,
         )
 
         if debug:
@@ -2454,24 +2506,25 @@ class NaiveController:
 
         return xy
 
-    def _compute_solar_power_available_halfstep(
+    def _compute_solar_power_available(
         self,
-        zone_mid: np.ndarray,
+        zone: np.ndarray,
         T_future: int,
     ) -> np.ndarray:
-        solar_power_available = np.zeros((T_future, 2), dtype=float)
+        solar_power_available = np.zeros(T_future, dtype=float)
 
         for t in range(T_future):
             global_t = self.states.timesteps_completed + t
 
-            for h in range(2):
-                irradiance = float(zone_mid[t, h, :] @ self.weather.irradiance[:, global_t])
-                solar_power_available[t, h] = max(
-                    0.0,
-                    self.ship.solarPannels.area
-                    * self.ship.solarPannels.efficiency
-                    * irradiance,
-                )
+            # Use node zone at t. Evaluator will recompute true split-zone solar later.
+            irradiance = float(zone[t, :] @ self.weather.irradiance[:, global_t])
+
+            solar_power_available[t] = max(
+                0.0,
+                self.ship.solarPannels.area
+                * self.ship.solarPannels.efficiency
+                * irradiance,
+            )
 
         return solar_power_available
 
@@ -2524,96 +2577,90 @@ class NaiveController:
         enforce_available_energy: bool = True,
     ):
         T_future = len(interval_sail_fraction)
-        H = 2
 
         solar_power_available = np.asarray(solar_power_available, dtype=float)
 
-        if solar_power_available.shape != (T_future, H):
+        if solar_power_available.shape != (T_future,):
             raise ValueError(
-                f"solar_power_available must have shape {(T_future, H)}, "
+                f"solar_power_available must have shape {(T_future,)}, "
                 f"got {solar_power_available.shape}."
             )
 
         solar_power = solar_power_available.copy()
-        shore_power = np.zeros((T_future, H), dtype=float)
-        shore_power_cost = np.zeros((T_future, H), dtype=float)
-        battery_charge = np.zeros((T_future, H), dtype=float)
-        battery_discharge = np.zeros((T_future, H), dtype=float)
+        shore_power = np.zeros(T_future, dtype=float)
+        shore_power_cost = np.zeros(T_future, dtype=float)
+        battery_charge = np.zeros(T_future, dtype=float)
+        battery_discharge = np.zeros(T_future, dtype=float)
         SOC = np.zeros(T_future + 1, dtype=float)
 
         SOC[0] = float(self.states.soc)
 
-        half_dt_h = 0.5 * float(self.itinerary.timestep)
+        dt_h = float(self.itinerary.timestep)
         capacity = float(self.ship.battery.capacity)
         max_charge_pow = float(self.ship.battery.max_charge_pow)
         max_discharge_pow = float(self.ship.battery.max_discharge_pow)
         charge_eff = float(self.ship.battery.charge_eff)
         discharge_eff = float(self.ship.battery.discharge_eff)
-        adjusted_leak_half = float(self.ship.battery.leak) ** half_dt_h
+        adjusted_leak = float(self.ship.battery.leak) ** dt_h
 
         for t in range(T_future):
-            soc_now = SOC[t]
+            soc_after_leak = adjusted_leak * SOC[t]
+            sail_frac = float(interval_sail_fraction[t])
 
-            for h in range(H):
-                soc_after_leak = adjusted_leak_half * soc_now
-                sail_frac = float(interval_sail_fraction[t])
+            if sail_frac > 1e-9:
+                requested_discharge = float(constant_discharge_power) * sail_frac
+                requested_discharge = min(requested_discharge, max_discharge_pow)
 
-                if sail_frac > 1e-9:
-                    requested_discharge = float(constant_discharge_power) * sail_frac
-                    requested_discharge = min(requested_discharge, max_discharge_pow)
-
-                    if enforce_available_energy:
-                        max_discharge_from_soc = soc_after_leak * discharge_eff / half_dt_h
-                        battery_discharge[t, h] = min(requested_discharge, max_discharge_from_soc)
-                    else:
-                        battery_discharge[t, h] = requested_discharge
-
-                    battery_charge[t, h] = 0.0
-
+                if enforce_available_energy:
+                    max_discharge_from_soc = soc_after_leak * discharge_eff / dt_h
+                    battery_discharge[t] = min(requested_discharge, max_discharge_from_soc)
                 else:
-                    p = int(port_idx[t])
-                    if p < 0:
-                        raise ValueError(f"Invalid port_idx[{t}]={p} during non-sailing interval.")
+                    battery_discharge[t] = requested_discharge
 
-                    remaining_charge_power_by_soc = max(
-                        0.0,
-                        (capacity - soc_after_leak) / (charge_eff * half_dt_h),
-                    )
+                battery_charge[t] = 0.0
 
-                    solar_charge = min(
-                        max(0.0, float(solar_power[t, h])),
-                        max_charge_pow,
-                        remaining_charge_power_by_soc,
-                    )
+            else:
+                p = int(port_idx[t])
+                if p < 0:
+                    raise ValueError(f"Invalid port_idx[{t}]={p} during non-sailing interval.")
 
-                    remaining_charge_power_by_soc -= solar_charge
-                    remaining_ship_charge_power = max_charge_pow - solar_charge
-
-                    shore_power[t, h] = min(
-                        float(self.itinerary.transits[p].max_charge_power),
-                        remaining_ship_charge_power,
-                        remaining_charge_power_by_soc,
-                    )
-
-                    shore_power_cost[t, h] = (
-                        shore_power[t, h] * float(self.itinerary.transits[p].power_cost)
-                    )
-
-                    battery_charge[t, h] = solar_charge + shore_power[t, h]
-                    battery_discharge[t, h] = 0.0
-
-                soc_now = (
-                    soc_after_leak
-                    - half_dt_h * battery_discharge[t, h] / discharge_eff
-                    + half_dt_h * charge_eff * battery_charge[t, h]
+                remaining_charge_power_by_soc = max(
+                    0.0,
+                    (capacity - soc_after_leak) / (charge_eff * dt_h),
                 )
 
-                if abs(soc_now) < 1e-9:
-                    soc_now = 0.0
-                if abs(soc_now - capacity) < 1e-9:
-                    soc_now = capacity
+                solar_charge = min(
+                    max(0.0, float(solar_power[t])),
+                    max_charge_pow,
+                    remaining_charge_power_by_soc,
+                )
 
-            SOC[t + 1] = soc_now
+                remaining_charge_power_by_soc -= solar_charge
+                remaining_ship_charge_power = max_charge_pow - solar_charge
+
+                shore_power[t] = min(
+                    float(self.itinerary.transits[p].max_charge_power),
+                    remaining_ship_charge_power,
+                    remaining_charge_power_by_soc,
+                )
+
+                shore_power_cost[t] = (
+                    shore_power[t] * float(self.itinerary.transits[p].power_cost)
+                )
+
+                battery_charge[t] = solar_charge + shore_power[t]
+                battery_discharge[t] = 0.0
+
+            SOC[t + 1] = (
+                soc_after_leak
+                - dt_h * battery_discharge[t] / discharge_eff
+                + dt_h * charge_eff * battery_charge[t]
+            )
+
+            if abs(SOC[t + 1]) < 1e-9:
+                SOC[t + 1] = 0.0
+            if abs(SOC[t + 1] - capacity) < 1e-9:
+                SOC[t + 1] = capacity
 
         return solar_power, shore_power, shore_power_cost, battery_charge, battery_discharge, SOC
 

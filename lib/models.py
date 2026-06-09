@@ -11,7 +11,7 @@ import math
 import os
 
 
-from lib.load_params import Ship, Generator, FitRange
+from lib.load_params import Ship, Generator
 from lib.paths import B_SERIES_CQ, B_SERIES_CT, PLOTS
 from lib.utils import bisection
 from lib.plotting import (
@@ -22,6 +22,87 @@ from lib.plotting import (
 
 
 eps = 1e-6
+
+@dataclass
+class FitRange:
+    min_speed: float
+    max_speed: float
+    min_resistance: float
+    max_resistance: float
+    min_prop_power: float
+    max_prop_power: float
+
+    @classmethod
+    def initial_from_ship(cls, ship: Ship) -> "FitRange":
+        max_prop_pow = ship.propulsion.max_pow * ship.propulsion.nb_propellers
+        min_prop_pow = ship.propulsion.min_pow * ship.propulsion.nb_propellers
+
+        return cls(
+            min_speed=1.0,
+            max_speed=float(ship.info.max_speed),
+            min_resistance=0.0,
+            max_resistance=float(max_prop_pow),
+            min_prop_power=float(min_prop_pow),
+            max_prop_power=float(max_prop_pow),
+        )
+
+    @classmethod
+    def from_solution(
+        cls,
+        sol,
+        ship: Ship,
+        lower_factor: float = 0.8,
+        upper_factor: float = 1.2,
+        eps: float = 1e-9,
+    ) -> "FitRange":
+        seg_dt_h = np.asarray(sol.segment_dt_h, dtype=float)
+        mask = seg_dt_h > eps
+
+        speed_rel = np.asarray(sol.speed_rel_water_mag, dtype=float)
+        speed_ship = np.asarray(sol.speed_mag, dtype=float)
+        resistance = np.asarray(sol.total_resistance, dtype=float)
+        prop_power = np.asarray(sol.prop_power, dtype=float)
+
+        valid_speed_rel = speed_rel[mask]
+        valid_speed_ship = speed_ship[mask]
+        valid_resistance = resistance[mask]
+        valid_prop_power = prop_power[mask]
+
+        if valid_speed_rel.size == 0:
+            raise ValueError("Cannot build FitRange: no sailing segment found in evaluated solution.")
+
+        speed_max_source = max(
+            np.nanmax(valid_speed_rel),
+            np.nanmax(valid_speed_ship),
+        )
+
+        max_prop_pow_physical = ship.propulsion.max_pow * ship.propulsion.nb_propellers
+        min_prop_pow_physical = ship.propulsion.min_pow * ship.propulsion.nb_propellers
+
+        return cls(
+            min_speed=max(1.0, lower_factor * float(np.nanmax(valid_speed_rel))),
+            max_speed=min(
+                float(ship.info.max_speed),
+                upper_factor * float(speed_max_source),
+            ),
+            min_resistance=min(
+                eps,
+                lower_factor * float(np.nanmax(valid_resistance)),
+            ),
+            max_resistance=max(
+                eps,
+                upper_factor * float(np.nanmax(valid_resistance)),
+            ),
+            min_prop_power=max(
+                0.0,
+                lower_factor * float(np.nanmax(valid_prop_power)),
+                float(min_prop_pow_physical),
+            ),
+            max_prop_power=min(
+                float(max_prop_pow_physical),
+                upper_factor * float(np.nanmax(valid_prop_power)),
+            ),
+        )
 
 
 def save_obj(path, obj):
