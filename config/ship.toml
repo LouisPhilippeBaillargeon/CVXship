@@ -6,7 +6,6 @@
 # displacement  : Volume of water displaced by the ship (m^3)
 # rho_air       : Air density (kg/m^3)
 # g             : Gravitational constant
-# vessel_no     : Only for MSS simulation, vessel type map in MSS doc
 # ============================
 [info]
 max_speed       = 14
@@ -15,7 +14,6 @@ rho_water       = 1025
 displacement    = 24009.38537
 rho_air         = 1.224
 g               = 9.81
-vessel_no       = 4
 min_depth       = 15.525
 
 # ============================

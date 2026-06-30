@@ -16,15 +16,26 @@ def compute_non_convex_cost_all_timesteps(runner, eps=1e-9, debug=False):
     propulsion_model = runner.propulsion_model
     generator_models = runner.generator_models
 
-    base_dt_h = float(itinerary.timestep)
-    base_dt_s = base_dt_h * 3600.0
     t0 = int(getattr(runner.states, "timesteps_completed", 0))
 
     P = np.asarray(sol.ship_pos, dtype=float)
     T = P.shape[0] - 1
     nb_gen = len(generator_models)
 
-    mask_sail = np.asarray(sol.instant_sail[:-1], dtype=bool)
+    dt_source = getattr(sol, "timestep_dt_h", None)
+    if dt_source is None:
+        itinerary_dt = getattr(itinerary, "timestep_dt_h", None)
+        if itinerary_dt is not None and len(itinerary_dt) > 0:
+            dt_vec = np.asarray(itinerary_dt, dtype=float)[t0 : t0 + T]
+        else:
+            dt_vec = np.full(T, float(itinerary.timestep), dtype=float)
+    else:
+        dt_vec = np.asarray(dt_source, dtype=float).reshape(-1)
+    if dt_vec.shape != (T,):
+        raise ValueError(f"Expected timestep_dt_h shape {(T,)}, got {dt_vec.shape}.")
+    dt_s_vec = dt_vec * 3600.0
+
+    mask_sail = np.asarray(sol.interval_sail_fraction, dtype=float).reshape(-1) > 0.5
     zone_mat = np.asarray(sol.zone, dtype=float)
 
     speed_cmd = np.asarray(sol.speed_mag, dtype=float)
@@ -470,6 +481,8 @@ def compute_non_convex_cost_all_timesteps(runner, eps=1e-9, debug=False):
         crossing_point=getattr(sol, "crossing_point", None),
         step_distance=step_distance,
         segment_dt_h=segment_dt_h,
+        timestep_dt_h=dt_vec,
+        interval_port_idx=getattr(sol, "interval_port_idx", None),
     )
 
     return n_all, non_conv_sol, segment_dt_h, best_pitch
@@ -477,6 +490,12 @@ def compute_non_convex_cost_all_timesteps(runner, eps=1e-9, debug=False):
 
 
 def compute_non_convex_cost_all_timesteps(runner, eps=1e-9, debug=False):
+    return compute_non_convex_cost_all_timesteps_nc_interpolated(
+        runner,
+        eps=eps,
+        debug=debug,
+    )
+
     sol = runner.sol
     if sol is None:
         raise ValueError("runner.sol is None. Did you run optimize()/compute()?")
@@ -944,6 +963,8 @@ def compute_non_convex_cost_all_timesteps(runner, eps=1e-9, debug=False):
         crossing_point=getattr(sol, "crossing_point", None),
         step_distance=step_distance,
         segment_dt_h=segment_dt_h,
+        timestep_dt_h=dt_vec,
+        interval_port_idx=getattr(sol, "interval_port_idx", None),
     )
 
     return n_all, non_conv_sol, segment_dt_h, best_pitch
@@ -1216,6 +1237,13 @@ def _path_pos_at_distance(waypoints, d_abs):
     return waypoints[s] + alpha * seg_vecs[s]
 
 
+from lib.weather_interpolation import (
+    prepare_nc_interp_source as _prepare_nc_interp_source,
+    interpolated_weather_at as _interpolated_weather_at,
+    query_time_for_segment as _query_time_for_segment,
+)
+
+
 def compute_non_convex_cost_all_timesteps_nc_interpolated(runner, eps=1e-9, debug=False, nc_sources=None):
     """
     Evaluate a solution with raw NetCDF weather interpolated in space and time.
@@ -1249,14 +1277,25 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(runner, eps=1e-9, debu
     if nc_sources is None:
         nc_sources = _prepare_nc_interp_source(runner.map, itinerary)
 
-    base_dt_h = float(itinerary.timestep)
-    base_dt_s = base_dt_h * 3600.0
-
     P = np.asarray(sol.ship_pos, dtype=float)
     T = P.shape[0] - 1
     nb_gen = len(generator_models)
 
-    mask_sail = np.asarray(sol.instant_sail[:-1], dtype=bool)
+    dt_source = getattr(sol, "timestep_dt_h", None)
+    if dt_source is None:
+        itinerary_dt = getattr(itinerary, "timestep_dt_h", None)
+        if itinerary_dt is not None and len(itinerary_dt) > 0:
+            t0 = int(getattr(runner.states, "timesteps_completed", 0))
+            dt_vec = np.asarray(itinerary_dt, dtype=float)[t0 : t0 + T]
+        else:
+            dt_vec = np.full(T, float(itinerary.timestep), dtype=float)
+    else:
+        dt_vec = np.asarray(dt_source, dtype=float).reshape(-1)
+    if dt_vec.shape != (T,):
+        raise ValueError(f"Expected timestep_dt_h shape {(T,)}, got {dt_vec.shape}.")
+    dt_s_vec = dt_vec * 3600.0
+
+    mask_sail = np.asarray(sol.interval_sail_fraction, dtype=float).reshape(-1) > 0.5
     zone_mat = np.asarray(sol.zone, dtype=float)
 
     speed_cmd = np.asarray(sol.speed_mag, dtype=float)
@@ -1346,7 +1385,7 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(runner, eps=1e-9, debu
             total_d = max(0.0, d_end - d_start)
 
             if (not mask_sail[t]) or total_d <= eps:
-                _add_segment(segments_by_t, t, base_dt_h, 0.0, np.zeros(2), 0, P[t, :], 0.5 * base_dt_h, "port")
+                _add_segment(segments_by_t, t, dt_vec[t], 0.0, np.zeros(2), 0, P[t, :], 0.5 * dt_vec[t], "port")
                 continue
 
             if uses_two_setpoints:
@@ -1354,15 +1393,15 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(runner, eps=1e-9, debu
                 # the distance reached after half the timestep if the two commanded magnitudes are used.
                 v0_cmd = float(max(0.0, speed_cmd[t, 0]))
                 v1_cmd = float(max(0.0, speed_cmd[t, 1]))
-                d0_cmd = v0_cmd * (0.5 * base_dt_h) * 3600.0 / 1000.0
+                d0_cmd = v0_cmd * (0.5 * dt_vec[t]) * 3600.0 / 1000.0
                 d_mid = min(d_end, d_start + d0_cmd)
                 # If numerical inconsistencies leave no distance for one half, fall back to half distance.
                 if d_mid <= d_start + eps or d_mid >= d_end - eps:
                     d_mid = 0.5 * (d_start + d_end)
 
                 pieces = [
-                    (d_start, d_mid, 0, 0.5 * base_dt_h, 0.25 * base_dt_h),
-                    (d_mid, d_end, 1, 0.5 * base_dt_h, 0.75 * base_dt_h),
+                    (d_start, d_mid, 0, 0.5 * dt_vec[t], 0.25 * dt_vec[t]),
+                    (d_mid, d_end, 1, 0.5 * dt_vec[t], 0.75 * dt_vec[t]),
                 ]
                 for a_d, b_d, h_cmd, dt_seg_h, mid_off in pieces:
                     dist = max(0.0, b_d - a_d)
@@ -1394,7 +1433,7 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(runner, eps=1e-9, debu
                     pa = _path_pos_at_distance(waypoints, a_d)
                     pb = _path_pos_at_distance(waypoints, b_d)
                     direction, _ = _safe_unit(pb - pa)
-                    dt_seg_h = _speed_to_dt_h(dist, speed_mps, base_dt_h * dist / max(total_d, eps))
+                    dt_seg_h = _speed_to_dt_h(dist, speed_mps, dt_vec[t] * dist / max(total_d, eps))
                     speed_vec = speed_mps * direction
                     mid_pos = _path_pos_at_distance(waypoints, 0.5 * (a_d + b_d))
                     _add_segment(
@@ -1415,14 +1454,14 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(runner, eps=1e-9, debu
 
         for t in range(T):
             if not mask_sail[t]:
-                _add_segment(segments_by_t, t, base_dt_h, 0.0, np.zeros(2), 0, P[t, :], 0.5 * base_dt_h, "port")
+                _add_segment(segments_by_t, t, dt_vec[t], 0.0, np.zeros(2), 0, P[t, :], 0.5 * dt_vec[t], "port")
                 continue
 
             pieces_geom = [(P[t, :], Q[t, :]), (Q[t, :], P[t + 1, :])]
             dists = [float(np.linalg.norm(b - a)) for a, b in pieces_geom]
             total_d = dists[0] + dists[1]
             if total_d <= eps:
-                _add_segment(segments_by_t, t, base_dt_h, 0.0, np.zeros(2), 0, P[t, :], 0.5 * base_dt_h, "zero")
+                _add_segment(segments_by_t, t, dt_vec[t], 0.0, np.zeros(2), 0, P[t, :], 0.5 * dt_vec[t], "zero")
                 continue
 
             if uses_two_setpoints:
@@ -1431,8 +1470,8 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(runner, eps=1e-9, debu
                         continue
                     direction, _ = _safe_unit(b - a)
                     speed_mps = float(max(0.0, speed_cmd[t, h_cmd]))
-                    dt_seg_h = 0.5 * base_dt_h
-                    mid_off = (0.25 if h_cmd == 0 else 0.75) * base_dt_h
+                    dt_seg_h = 0.5 * dt_vec[t]
+                    mid_off = (0.25 if h_cmd == 0 else 0.75) * dt_vec[t]
                     _add_segment(
                         segments_by_t,
                         t,
@@ -1451,7 +1490,7 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(runner, eps=1e-9, debu
                     if dist <= eps:
                         continue
                     direction, _ = _safe_unit(b - a)
-                    dt_seg_h = _speed_to_dt_h(dist, speed_mps, base_dt_h * dist / max(total_d, eps))
+                    dt_seg_h = _speed_to_dt_h(dist, speed_mps, dt_vec[t] * dist / max(total_d, eps))
                     _add_segment(
                         segments_by_t,
                         t,
@@ -1469,26 +1508,26 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(runner, eps=1e-9, debu
         # Straight-line fallback. Split only if there are already two command sets.
         for t in range(T):
             if not mask_sail[t]:
-                _add_segment(segments_by_t, t, base_dt_h, 0.0, np.zeros(2), 0, P[t, :], 0.5 * base_dt_h, "port")
+                _add_segment(segments_by_t, t, dt_vec[t], 0.0, np.zeros(2), 0, P[t, :], 0.5 * dt_vec[t], "port")
                 continue
 
             vec = P[t + 1, :] - P[t, :]
             direction, total_d = _safe_unit(vec)
             if total_d <= eps:
-                _add_segment(segments_by_t, t, base_dt_h, 0.0, np.zeros(2), 0, P[t, :], 0.5 * base_dt_h, "zero")
+                _add_segment(segments_by_t, t, dt_vec[t], 0.0, np.zeros(2), 0, P[t, :], 0.5 * dt_vec[t], "zero")
                 continue
 
             if uses_two_setpoints:
                 pmid = 0.5 * (P[t, :] + P[t + 1, :])
                 for h_cmd, a, b, mid_off in [
-                    (0, P[t, :], pmid, 0.25 * base_dt_h),
-                    (1, pmid, P[t + 1, :], 0.75 * base_dt_h),
+                    (0, P[t, :], pmid, 0.25 * dt_vec[t]),
+                    (1, pmid, P[t + 1, :], 0.75 * dt_vec[t]),
                 ]:
                     dist = float(np.linalg.norm(b - a))
                     _add_segment(
                         segments_by_t,
                         t,
-                        0.5 * base_dt_h,
+                        0.5 * dt_vec[t],
                         dist,
                         float(max(0.0, speed_cmd[t, h_cmd])) * direction,
                         h_cmd,
@@ -1498,7 +1537,7 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(runner, eps=1e-9, debu
                     )
             else:
                 speed_mps = float(max(0.0, speed_cmd[t]))
-                dt_seg_h = _speed_to_dt_h(total_d, speed_mps, base_dt_h)
+                dt_seg_h = _speed_to_dt_h(total_d, speed_mps, dt_vec[t])
                 _add_segment(
                     segments_by_t,
                     t,
@@ -1569,7 +1608,7 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(runner, eps=1e-9, debu
             denom_s = max(float(dt_h) * 3600.0, eps)
             return (_cmd_speed_for_acc(t, h_cmd) - _previous_cmd_speed_for_acc(t, h_cmd)) / denom_s
 
-        return (_cmd_speed_for_acc(t, 0) - _previous_cmd_speed_for_acc(t, 0)) / base_dt_s
+        return (_cmd_speed_for_acc(t, 0) - _previous_cmd_speed_for_acc(t, 0)) / dt_s_vec[t]
 
     for t in range(T):
         for h, seg in enumerate(segments_by_t[t]):
@@ -1752,6 +1791,8 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(runner, eps=1e-9, debu
         crossing_point=getattr(sol, "crossing_point", None),
         step_distance=step_distance,
         segment_dt_h=segment_dt_h,
+        timestep_dt_h=dt_vec,
+        interval_port_idx=getattr(sol, "interval_port_idx", None),
     )
 
     return n_all, non_conv_sol, segment_dt_h, best_pitch

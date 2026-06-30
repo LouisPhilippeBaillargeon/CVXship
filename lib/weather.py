@@ -251,6 +251,44 @@ def resample_time_average(
     return out
 
 
+def resample_time_average_to_edges(
+    x_zone_src: np.ndarray,
+    times_src,
+    interval_edges,
+) -> np.ndarray:
+    """
+    Resample a weather variable to explicit interval edges by time averaging.
+    """
+    x_zone_src = np.asarray(x_zone_src, dtype=float)
+    nb_zones, _ = x_zone_src.shape
+
+    times_src = pd.to_datetime(times_src).to_numpy()
+    edges = pd.to_datetime(interval_edges).to_numpy()
+    start_time = edges[0]
+
+    t_src_s = (times_src - start_time) / np.timedelta64(1, "s")
+    edges_s = (edges - start_time) / np.timedelta64(1, "s")
+
+    out = np.zeros((nb_zones, len(edges_s) - 1), dtype=float)
+
+    order = np.argsort(t_src_s)
+    t_src_s = t_src_s[order]
+    x_zone_src = x_zone_src[:, order]
+
+    for k in range(len(edges_s) - 1):
+        a = float(edges_s[k])
+        b = float(edges_s[k + 1])
+        inside = (t_src_s > a) & (t_src_s < b)
+        pts = np.concatenate(([a], t_src_s[inside], [b]))
+
+        for z in range(nb_zones):
+            y = _interp1d_piecewise_linear(t_src_s, x_zone_src[z, :], pts)
+            integral = np.trapezoid(y, pts)
+            out[z, k] = integral / (b - a)
+
+    return out
+
+
 def resample_circular_time_average(
     theta_zone_src: np.ndarray,
     times_src,
@@ -285,6 +323,27 @@ def resample_circular_time_average(
     # Wrap to [0, period)
     theta_avg = theta_avg % period
     return theta_avg
+
+
+def resample_circular_time_average_to_edges(
+    theta_zone_src: np.ndarray,
+    times_src,
+    interval_edges,
+    *,
+    period: float = 2 * np.pi,
+) -> np.ndarray:
+    theta_zone_src = np.asarray(theta_zone_src, dtype=float)
+    theta = ((theta_zone_src + 0.5 * period) % period) - 0.5 * period
+
+    c = np.cos(2 * np.pi * theta / period)
+    s = np.sin(2 * np.pi * theta / period)
+
+    c_avg = resample_time_average_to_edges(c, times_src, interval_edges)
+    s_avg = resample_time_average_to_edges(s, times_src, interval_edges)
+
+    ang = np.arctan2(s_avg, c_avg)
+    theta_avg = (period / (2 * np.pi)) * ang
+    return theta_avg % period
 
 def weather_from_nc_file(map, itinerary):
     currents = xr.open_dataset(CURRENTS)
@@ -331,7 +390,7 @@ def weather_from_nc_file(map, itinerary):
     times_sun  = pd.to_datetime(sun["valid_time"].values)
 
     def print_time_range(name, times):
-        print(f"{name}: {times.min()}  →  {times.max()}  (n={len(times)})")
+        print(f"{name}: {times.min()}  ->  {times.max()}  (n={len(times)})")
 
     print_time_range("currents", times_curr)
     print_time_range("atmo",     times_atmo)
@@ -356,22 +415,38 @@ def weather_from_nc_file(map, itinerary):
 
 
     # --- Resample all to itinerary.nb_timesteps (interval averages) ---
-    t0 = itinerary.transits[0].arrival_datetime
-    dt = itinerary.timestep
-    T  = itinerary.nb_timesteps
+    edges = getattr(itinerary, "time_points", None)
 
-    irradiance  = resample_time_average(irradiance,  times_sun,  t0, dt, T)
-    temperature = resample_time_average(temperature, times_atmo, t0, dt, T)
-    wind_x      = resample_time_average(wind_x,      times_atmo, t0, dt, T)
-    wind_y      = resample_time_average(wind_y,      times_atmo, t0, dt, T)
-    current_x   = resample_time_average(current_x,   times_curr, t0, dt, T)
-    current_y   = resample_time_average(current_y,   times_curr, t0, dt, T)
+    if edges is None or len(edges) == 0:
+        t0 = itinerary.transits[0].arrival_datetime
+        dt = itinerary.timestep
+        T = itinerary.nb_timesteps
 
-    wave_amp    = resample_time_average(mean_wave_amplitude,    times_wav,  t0, dt, T)
-    mwf         = resample_time_average(mwf,         times_wav,  t0, dt, T)
-    pwf         = resample_time_average(pwf,         times_wav,  t0, dt, T)
-    mwl         = resample_time_average(mwl,         times_wav,  t0, dt, T)
-    wave_dir_deg = resample_circular_time_average(mean_wave_direction, times_wav, t0, dt, T, period=360.0)
+        irradiance  = resample_time_average(irradiance,  times_sun,  t0, dt, T)
+        temperature = resample_time_average(temperature, times_atmo, t0, dt, T)
+        wind_x      = resample_time_average(wind_x,      times_atmo, t0, dt, T)
+        wind_y      = resample_time_average(wind_y,      times_atmo, t0, dt, T)
+        current_x   = resample_time_average(current_x,   times_curr, t0, dt, T)
+        current_y   = resample_time_average(current_y,   times_curr, t0, dt, T)
+
+        wave_amp    = resample_time_average(mean_wave_amplitude, times_wav, t0, dt, T)
+        mwf         = resample_time_average(mwf, times_wav, t0, dt, T)
+        pwf         = resample_time_average(pwf, times_wav, t0, dt, T)
+        mwl         = resample_time_average(mwl, times_wav, t0, dt, T)
+        wave_dir_deg = resample_circular_time_average(mean_wave_direction, times_wav, t0, dt, T, period=360.0)
+    else:
+        irradiance  = resample_time_average_to_edges(irradiance,  times_sun,  edges)
+        temperature = resample_time_average_to_edges(temperature, times_atmo, edges)
+        wind_x      = resample_time_average_to_edges(wind_x,      times_atmo, edges)
+        wind_y      = resample_time_average_to_edges(wind_y,      times_atmo, edges)
+        current_x   = resample_time_average_to_edges(current_x,   times_curr, edges)
+        current_y   = resample_time_average_to_edges(current_y,   times_curr, edges)
+
+        wave_amp    = resample_time_average_to_edges(mean_wave_amplitude, times_wav, edges)
+        mwf         = resample_time_average_to_edges(mwf, times_wav, edges)
+        pwf         = resample_time_average_to_edges(pwf, times_wav, edges)
+        mwl         = resample_time_average_to_edges(mwl, times_wav, edges)
+        wave_dir_deg = resample_circular_time_average_to_edges(mean_wave_direction, times_wav, edges, period=360.0)
 
     return Weather(
         irradiance=irradiance,
