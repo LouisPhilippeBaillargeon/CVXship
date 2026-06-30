@@ -607,6 +607,135 @@ def bisection(f, a, b, tol=1e-6, max_iter=60):
 
 
 
+def build_constant_speed_path_reference(
+    waypoints,
+    path_zone_ids,
+    itinerary,
+    states,
+    map_obj,
+    *,
+    ship=None,
+    eps=1e-12,
+):
+    """
+    Build the constant-path-speed reference trajectory on the current time grid.
 
+    Returns a dict with:
+        path_distance        [T_future+1]
+        ship_pos             [T_future+1, 2]
+        zone                 [T_future+1, nb_zones]
+        ship_speed           [T_future, 2]
+        speed_mag            [T_future]
+        segment_dirs         [n_segments, 2]
+        segment_lengths_km   [n_segments]
+        distance_breaks_km   [n_segments+1]
+        total_distance_km    float
+        constant_speed_kmh   float
+        constant_speed_mps   float
+    """
+    waypoints = np.asarray(waypoints, dtype=float)
+    path_zone_ids = np.asarray(path_zone_ids, dtype=int)
+
+    T_future = itinerary.nb_timesteps - states.timesteps_completed
+    if T_future <= 0:
+        raise ValueError("No timesteps left; trip is finished.")
+
+    instant_sail, port_idx, interval_sail_fraction = classify_timesteps(itinerary)
+    instant_sail = instant_sail[states.timesteps_completed:]
+    port_idx = port_idx[states.timesteps_completed:]
+    interval_sail_fraction = interval_sail_fraction[states.timesteps_completed:]
+
+    segment_vecs = waypoints[1:] - waypoints[:-1]
+    segment_lengths_km = np.linalg.norm(segment_vecs, axis=1)
+
+    if np.any(segment_lengths_km <= eps):
+        raise ValueError("Consecutive shortest-path waypoints must be distinct.")
+
+    if len(path_zone_ids) != len(segment_lengths_km):
+        raise ValueError(
+            f"path_zone_ids length must match number of path segments. "
+            f"Got {len(path_zone_ids)} and {len(segment_lengths_km)}."
+        )
+
+    segment_dirs = segment_vecs / segment_lengths_km[:, None]
+    distance_breaks_km = np.concatenate(([0.0], np.cumsum(segment_lengths_km)))
+    total_distance_km = float(distance_breaks_km[-1])
+
+    sailing_time_h = float(np.sum(interval_sail_fraction) * itinerary.timestep)
+    constant_speed_kmh = total_distance_km / sailing_time_h if sailing_time_h > eps else 0.0
+    constant_speed_mps = constant_speed_kmh * 1000.0 / 3600.0
+
+    if ship is not None and constant_speed_mps > ship.info.max_speed + 1e-9:
+        print(
+            "WARNING: required constant speed "
+            f"{constant_speed_mps:.3f} m/s exceeds ship.info.max_speed "
+            f"{ship.info.max_speed:.3f} m/s."
+        )
+
+    path_distance = np.zeros(T_future + 1, dtype=float)
+    for t in range(T_future):
+        path_distance[t + 1] = (
+            path_distance[t]
+            + constant_speed_kmh
+            * itinerary.timestep
+            * float(interval_sail_fraction[t])
+        )
+
+    path_distance = np.clip(path_distance, 0.0, total_distance_km)
+    path_distance[-1] = total_distance_km
+
+    ship_pos = np.zeros((T_future + 1, 2), dtype=float)
+    for i, d_km in enumerate(path_distance):
+        ship_pos[i, :] = xy_from_path_distance(waypoints, d_km)
+
+    zone = np.zeros((T_future + 1, map_obj.nb_zones), dtype=float)
+    for t, d_km in enumerate(path_distance):
+        if d_km >= distance_breaks_km[-1]:
+            s = len(distance_breaks_km) - 2
+        else:
+            s = np.searchsorted(distance_breaks_km, d_km, side="right") - 1
+            s = int(np.clip(s, 0, len(segment_lengths_km) - 1))
+
+        zone[t, int(path_zone_ids[s])] = 1.0
+
+    ship_speed = np.zeros((T_future, 2), dtype=float)
+    speed_mag = np.zeros(T_future, dtype=float)
+
+    for t in range(T_future):
+        if interval_sail_fraction[t] <= eps:
+            continue
+
+        d0 = float(path_distance[t])
+        d1 = float(path_distance[t + 1])
+        if d1 <= d0 + eps:
+            continue
+
+        speed_mag[t] = constant_speed_mps
+
+        d_mid = 0.5 * (d0 + d1)
+        if d_mid >= distance_breaks_km[-1]:
+            s = len(distance_breaks_km) - 2
+        else:
+            s = np.searchsorted(distance_breaks_km, d_mid, side="right") - 1
+            s = int(np.clip(s, 0, len(segment_dirs) - 1))
+
+        ship_speed[t, :] = constant_speed_mps * segment_dirs[s, :]
+
+    return {
+        "instant_sail": instant_sail,
+        "port_idx": port_idx,
+        "interval_sail_fraction": interval_sail_fraction,
+        "path_distance": path_distance,
+        "ship_pos": ship_pos,
+        "zone": zone,
+        "ship_speed": ship_speed,
+        "speed_mag": speed_mag,
+        "segment_dirs": segment_dirs,
+        "segment_lengths_km": segment_lengths_km,
+        "distance_breaks_km": distance_breaks_km,
+        "total_distance_km": total_distance_km,
+        "constant_speed_kmh": constant_speed_kmh,
+        "constant_speed_mps": constant_speed_mps,
+    }
 
 

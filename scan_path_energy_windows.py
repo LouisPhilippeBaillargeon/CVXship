@@ -33,8 +33,7 @@ from lib.utils import dx_dy_km, point_in_zones
 
 
 ZONE_ID = 5
-TRIP_HOURS = 5.0
-TOP_N = 10
+TRIP_HOURS = 7.0
 
 def plot_candidate_paths(map_obj, paths, out_dir=None, show=True):
     if out_dir is None:
