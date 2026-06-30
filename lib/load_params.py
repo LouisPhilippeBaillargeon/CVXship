@@ -96,7 +96,6 @@ class ShipInfo:
     displacement	: float
     rho_air         : float
     g               : float
-    vessel_no       : int
     min_depth       : float
 
 @dataclass

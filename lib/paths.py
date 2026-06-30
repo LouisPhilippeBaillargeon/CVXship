@@ -42,10 +42,6 @@ PROPULSION_MODEL = CACHE / "PropulsionModel.pkl"
 GENERATOR_MODEL = CACHE / "GeneratorModel.pkl"
 CALM_MODEL = CACHE / "CalmModel.pkl"
 
-SIMULATION = ROOT / "simulation"
-SHIP_MAT = SIMULATION / "ship.mat"
-SHIP_ABC_MAT = SIMULATION / "shipABC.mat"
-
 PLOTS = ROOT / "results"
 
 
