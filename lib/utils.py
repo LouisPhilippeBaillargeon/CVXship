@@ -2,15 +2,7 @@ import math
 import numpy as np
 import pandas as pd
 from pyproj import Geod
-import cvxpy as cp
-import matplotlib.pyplot as plt
 GEOD = Geod(ellps="WGS84")
-from lib.paths import ADJ, ZONES
-
-
-#===========================Check if points are in zones=======================================================================================
-import numpy as np
-import matplotlib.pyplot as plt
 
 def _assert_finite(name, arr):
     arr = np.asarray(arr)
@@ -87,64 +79,6 @@ def _compute_tight_big_M_zone(map_obj, zone_ineq, safety_margin=1.0):
         big_M[z] = min_val - safety_margin
 
     return big_M
-
-def _compute_tight_big_M_transition(map_obj, trans_ineq, safety_margin=1.0):
-    """
-    Compute tight Big-M values for transition inequalities:
-        a_y*y + a_x*x + a_c >= M[z, iz] * (2 - zone[t,z] - zone[t+1,iz])
-
-    Parameters
-    ----------
-    map_obj : Map
-        Map object with span_km_east, span_km_north, nb_zones.
-    trans_ineq : np.ndarray
-        Shape (n_ineq, 3, nb_zones, nb_zones)
-        trans_ineq[k,0,z,iz] = Ay
-        trans_ineq[k,1,z,iz] = Ax
-        trans_ineq[k,2,z,iz] = Ac
-    safety_margin : float
-        Extra negative slack added to guarantee deactivation.
-
-    Returns
-    -------
-    np.ndarray
-        Shape (nb_zones, nb_zones)
-        Entry [z, iz] is the tightest valid disabling Big-M for all inequalities
-        associated with transition z -> iz.
-        If there are no inequalities for a pair, returns 0 for that pair.
-    """
-    nb_zones = map_obj.nb_zones
-    x_max = map_obj.info.span_km_east
-    y_max = map_obj.info.span_km_north
-
-    corners = np.array([
-        [0.0,   0.0],    # bottom-left
-        [x_max, 0.0],    # bottom-right
-        [0.0,   y_max],  # top-left
-        [x_max, y_max],  # top-right
-    ])
-
-    n_ineq = trans_ineq.shape[0]
-    big_M = np.zeros((nb_zones, nb_zones))
-
-    for z in range(nb_zones):
-        for iz in range(nb_zones):
-            coeffs = trans_ineq[:, :, z, iz]   # shape (n_ineq, 3)
-
-            # Skip empty transition blocks
-            if not np.any(coeffs):
-                big_M[z, iz] = 0.0
-                continue
-
-            min_val = np.inf
-            for x, y in corners:
-                vals = coeffs[:, 0] * y + coeffs[:, 1] * x + coeffs[:, 2]
-                min_val = min(min_val, np.min(vals))
-
-            big_M[z, iz] = min_val - safety_margin
-
-    return big_M
-
 
 
 def _ordered_zone_corner_ids(zone_corners_df: pd.DataFrame) -> dict[int, list[int]]:
@@ -334,8 +268,7 @@ def _compute_min_crossing_distance_per_zone(corners_path, zone_corners_path) -> 
 
 def _compute_min_zone_timesteps(corners_path, zone_corners_path, ship_max_speed_mps: float, timestep_h: float) -> dict[int, int]:
     """
-    Convert min crossing distance [km] into minimum required number of timesteps. 
-    Re-factor needed : Corners should be stored in the map object and this function should use it.
+    Convert min crossing distance [km] into minimum required number of timesteps.
     """
     if ship_max_speed_mps <= 0:
         raise ValueError("ship_max_speed_mps must be > 0.")
@@ -418,62 +351,6 @@ def dx_dy_km(map, lat, lon):
     dx = s_km * math.sin(th)  # East
     dy = s_km * math.cos(th)  # North
     return dx, dy, s_km
-
-def build_or_load_adjacency_matrix(n_zones=None, cache=True):
-    """
-    Return a (Z,Z) adjacency matrix Adj with 1 if transition z->z' is allowed.
-    Zones are adjacent iff they share at least 2 corner_id values.
-    Diagonal is 1 (stay).
-    """
-    zones_csv  = ZONES
-    cache_path = ADJ
-    
-
-    # Try cache first
-    if cache and cache_path.exists():
-        adj = np.load(cache_path)
-        if n_zones is None or adj.shape[0] == n_zones:
-            return adj
-
-    # Load CSV
-    df = pd.read_csv(zones_csv)
-    df = df.rename(columns={c: c.strip() for c in df.columns})
-    required = {"zone_id", "corner_id"}
-    if not required.issubset(df.columns):
-        raise ValueError(f"zones CSV missing columns: {required - set(df.columns)}")
-
-    df[["zone_id", "corner_id"]] = df[["zone_id", "corner_id"]].astype(int)
-
-    # Collect corners per zone_id
-    corners_per_zone = {
-        zid: set(grp["corner_id"].to_list())
-        for zid, grp in df.groupby("zone_id")
-    }
-
-    # Determine Z (number of zones to output)
-    Z = n_zones if n_zones is not None else (max(corners_per_zone) if corners_per_zone else 0)
-    adj = np.zeros((Z, Z), dtype=int)
-    np.fill_diagonal(adj, 1)  # staying in same zone is allowed
-
-    # Check pairwise intersections
-    for zid1, c1 in corners_per_zone.items():
-        for zid2, c2 in corners_per_zone.items():
-            if zid2 <= zid1:
-                continue
-            if len(c1 & c2) >= 2:
-                i, j = zid1, zid2
-                if i < Z and j < Z:
-                    adj[i, j] = 1
-                    adj[j, i] = 1
-
-    if cache:
-        try:
-            np.save(cache_path, adj)
-        except Exception:
-            pass
-
-    return adj
-
 
 def classify_timesteps(itinerary):
     """
@@ -686,8 +563,6 @@ def build_variable_timestep_grid(itinerary, states=None, eps=1e-9):
         "base_dt_h": base_dt_h,
     }
 
-
-    
 
 def compute_port_zone_indices(map, itinerary):
     nb_zones = map.nb_zones

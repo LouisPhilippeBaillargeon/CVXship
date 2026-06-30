@@ -10,17 +10,10 @@ faulthandler.enable()
 from lib.load_params import Ship, Map, Itinerary, States
 from lib.models import BaseWaveModel, WaveModel1D, WaveModel2D, WaveModelPathAligned2D, BaseWindModel, WindModel1D, WindModel2D, WindModelPathAligned2D, PropulsionModel, GeneratorModel, CalmWaterModel
 from lib.weather import Weather
-from lib.utils import classify_timesteps, dx_dy_km, compute_port_zone_indices, point_in_zones, _compute_tight_big_M_zone, _compute_min_zone_timesteps, _compute_min_crossing_distance_per_zone, build_constant_speed_path_reference, xy_from_path_distance
+from lib.utils import classify_timesteps, dx_dy_km, compute_port_zone_indices, point_in_zones, _compute_tight_big_M_zone, _compute_min_zone_timesteps, _compute_min_crossing_distance_per_zone, build_constant_speed_path_reference, xy_from_path_distance, _ordered_zone_corner_ids, _zone_edges_from_corner_ids
 from lib.weather_interpolation import prepare_nc_interp_source, interpolated_weather_at, query_time_for_segment
 from lib.paths import CORNERS, ZONES
 
-def repeat_T_to_TH(x):
-    x = np.asarray(x, dtype=float)
-    return np.repeat(x[:, None], 2, axis=1)
-
-def repeat_gen_to_NTH(x):
-    x = np.asarray(x, dtype=float)
-    return np.repeat(x[:, :, None], 2, axis=2)
 
 @dataclass
 class Solution:
@@ -80,34 +73,6 @@ class ShortestPathSolution:
     total_distance: float
     status: str
 
-
-def _ordered_zone_corner_ids(zone_corners_df: pd.DataFrame) -> Dict[int, List[int]]:
-    """
-    Returns {zone_id: [corner_id_1, corner_id_2, ...]} ordered by the 'order' column.
-    """
-    out = {}
-    for zone_id, g in zone_corners_df.groupby("zone_id"):
-        g = g.sort_values("order")
-        out[int(zone_id)] = g["corner_id"].astype(int).tolist()
-    return out
-
-
-def _zone_edges_from_corner_ids(zone_corner_ids: Dict[int, List[int]]) -> Dict[int, set[frozenset[int]]]:
-    """
-    Returns unordered polygon edges for each zone.
-    Each edge is represented as frozenset({corner_i, corner_j}).
-    """
-    zone_edges = {}
-    for zone_id, corners in zone_corner_ids.items():
-        edges = set()
-        n = len(corners)
-        for i in range(n):
-            c1 = int(corners[i])
-            c2 = int(corners[(i + 1) % n])
-            edges.add(frozenset((c1, c2)))
-        zone_edges[zone_id] = edges
-    return zone_edges
-
 def _one_hot_window_from_indices(indices: np.ndarray, nb_choices: int, radius: int = 1) -> np.ndarray:
     """
     Returns mask[t, i] = 1 if choice i is allowed at time t.
@@ -165,7 +130,7 @@ def _future_interval_port_idx(itinerary, states, T_future: int, port_idx: np.nda
 
 
 @dataclass
-class GlobalOptimizer:
+class DJPE_TSO:
     # Left point indexing
     # Convex non-linear least-squares models
     wave_model          : WaveModel2D
@@ -240,9 +205,6 @@ class GlobalOptimizer:
                 assert p >= 0
                 constraints += [ship_pos[t, 0] == port_x[p]]
                 constraints += [ship_pos[t, 1] == port_y[p]]
-                if debug:
-                    print("ship is in port", p, " at instant ", t)
-
         # ================================================== ZONES ====================================================
         zone = cp.Variable((T_future + 1, self.map.nb_zones), boolean=True)
         big_M = _compute_tight_big_M_zone(self.map, self.map.zone_ineq)
@@ -429,7 +391,7 @@ class GlobalOptimizer:
                         constraints += [zone[t, z] == 0]
 
             if debug:
-                print(f"Restricted GlobalOptimizer zones to naive +/- {naive_zone_radius}.")
+                print(f"Restricted DJPE_TSO zones to naive +/- {naive_zone_radius}.")
 
         # ================================================ EARTH-FIXED SPEED ==========================================
         ship_speed_x = cp.Variable((T_future, H))
@@ -525,8 +487,8 @@ class GlobalOptimizer:
         normalized_rel_speed = cp.Variable((T_future, H))
         normalized_speed = cp.Variable((T_future, H))
 
-        WIND_BIG_M = 2.0
-        WAVE_BIG_M = 1.0
+        WIND_BIG_M = float(self.wind_model.big_m_resistance)
+        WAVE_BIG_M = float(self.wave_model.big_m_resistance)
 
 
         constraints += [wave_resistance <= WAVE_BIG_M]
@@ -874,7 +836,7 @@ class GlobalOptimizer:
             return 0
 
 @dataclass
-class Global_Continuous:
+class CJPE_TSO:
     wave_model          : WaveModel2D
     wind_model          : WindModel2D
     wind_model_nd       : WindModel1D
@@ -947,8 +909,6 @@ class Global_Continuous:
                 assert p >= 0
                 constraints += [ship_pos[t, 0] == port_x[p]]
                 constraints += [ship_pos[t, 1] == port_y[p]]
-                if debug:
-                    print("ship is in port", p, " at instant ", t)
 
         # ================================================== ZONES ====================================================
         zone = cp.Variable((T_future + 1, self.map.nb_zones), boolean=True)
@@ -1136,7 +1096,7 @@ class Global_Continuous:
                         constraints += [zone[t, z] == 0]
 
             if debug:
-                print(f"Restricted GlobalOptimizer zones to naive +/- {naive_zone_radius}.")
+                print(f"Restricted DJPE_TSO zones to naive +/- {naive_zone_radius}.")
 
         # ================================================ EARTH-FIXED SPEED ==========================================
         speed_mag_split = cp.Variable((T_future, 2), nonneg=True)
@@ -1228,8 +1188,8 @@ class Global_Continuous:
         normalized_rel_speed = cp.Variable(T_future)
         normalized_speed = cp.Variable(T_future)
 
-        WIND_BIG_M = 2.0
-        WAVE_BIG_M = 1.0
+        WIND_BIG_M = float(self.wind_model.big_m_resistance)
+        WAVE_BIG_M = float(self.wave_model.big_m_resistance)
 
         constraints += [wave_resistance <= WAVE_BIG_M]
         constraints += [wind_resistance <= WIND_BIG_M]
@@ -1572,7 +1532,7 @@ class Global_Continuous:
             return 0
         
 @dataclass
-class Fixed_Path_Optimizer:
+class FR_TSO:
     wave_model          : WaveModel1D
     wind_model          : WindModel1D
     propulsion_model    : PropulsionModel
@@ -1590,10 +1550,6 @@ class Fixed_Path_Optimizer:
     path_zone_ids       : List[int]
 
     sol: Optional[Solution] = field(default=None, init=False)
-
-    def segment_from_distance(D_breaks, d_abs):
-        s = np.searchsorted(D_breaks, d_abs, side="right") - 1
-        return int(np.clip(s, 0, len(D_breaks) - 2))
 
     def optimize(
         self,
@@ -1724,7 +1680,7 @@ class Fixed_Path_Optimizer:
                         constraints += [seg[t, s] == 0]
 
             if debug:
-                print(f"Restricted Fixed_Path_Optimizer segments to naive +/- {naive_segment_radius}.")
+                print(f"Restricted FR_TSO segments to naive +/- {naive_segment_radius}.")
 
         # ================================= SPEED =================================
         step_distance = cp.Variable(T_future, nonneg=True)
@@ -1858,8 +1814,8 @@ class Fixed_Path_Optimizer:
         normalized_rel_speed = cp.Variable(T_future)
 
         
-        WIND_BIG_M = 2.0
-        WAVE_BIG_M = 1.0
+        WIND_BIG_M = float(self.wind_model.big_m_resistance)
+        WAVE_BIG_M = float(self.wave_model.big_m_resistance)
 
         constraints += [wind_resistance <= WIND_BIG_M]
         constraints += [wind_resistance >= -WIND_BIG_M]
@@ -2218,9 +2174,9 @@ class Fixed_Path_Optimizer:
     
 
 @dataclass
-class Fixed_Path_TimeSampled_Optimizer:
+class FR_O:
     """
-    Fixed-path optimizer without segment binaries.
+    Fixed-path without segment binaries.
 
     Weather and heading are frozen from a one-shot constant-speed
     reference trajectory. The optimization still chooses path distance
@@ -2351,10 +2307,6 @@ class Fixed_Path_TimeSampled_Optimizer:
             print("[TimeSampled] current_x:", current_x_ts[:5])
             print("[TimeSampled] irradiance:", irradiance_ts[:5])
 
-    def segment_from_distance(D_breaks, d_abs):
-        s = np.searchsorted(D_breaks, d_abs, side="right") - 1
-        return int(np.clip(s, 0, len(D_breaks) - 2))
-
     def optimize(
         self,
         debug=False,
@@ -2482,8 +2434,8 @@ class Fixed_Path_TimeSampled_Optimizer:
         normalized_rel_speed = cp.Variable(T_future)
 
         
-        WIND_BIG_M = 2.0
-        WAVE_BIG_M = 1.0
+        WIND_BIG_M = float(self.wind_model_ts.big_m_resistance)
+        WAVE_BIG_M = float(self.wave_model_ts.big_m_resistance)
 
         constraints += [wind_resistance <= WIND_BIG_M]
         constraints += [wind_resistance >= -WIND_BIG_M]
@@ -2939,76 +2891,6 @@ class NaiveController:
             print("NaiveController generation_power shape:", generation_power.shape)
 
         return 1
-
-    @staticmethod
-    def _segment_index_from_distance(distance_km: float, distance_breaks_km: np.ndarray) -> int:
-        if distance_km >= distance_breaks_km[-1]:
-            return len(distance_breaks_km) - 2
-
-        segment_id = np.searchsorted(distance_breaks_km, distance_km, side="right") - 1
-        return int(np.clip(segment_id, 0, len(distance_breaks_km) - 2))
-
-    @staticmethod
-    def _velocity_from_path_interval(
-    d_start,
-    d_end,
-    distance_breaks_km,
-    segment_dirs,
-    dt_h,
-    ):
-        """
-        Returns average velocity vector [m/s] over a path-distance interval.
-
-        Uses the true polyline distance contribution in each crossed segment,
-        not the straight chord between xy(d_start) and xy(d_end).
-        """
-        v = np.zeros(2, dtype=float)
-
-        if d_end <= d_start + 1e-12:
-            return v
-
-        s = np.searchsorted(distance_breaks_km, d_start, side="right") - 1
-        s = int(np.clip(s, 0, len(segment_dirs) - 1))
-
-        d = float(d_start)
-
-        while d < d_end - 1e-12:
-            seg_end = min(float(distance_breaks_km[s + 1]), float(d_end))
-            ds = max(0.0, seg_end - d)
-
-            v += ds * segment_dirs[s]
-
-            d = seg_end
-
-            if d >= distance_breaks_km[s + 1] - 1e-12:
-                s = min(s + 1, len(segment_dirs) - 1)
-
-        return v / dt_h * 1000.0 / 3600.0
-    @staticmethod
-    def _xy_from_distance_array(
-        d_values: np.ndarray,
-        waypoints: np.ndarray,
-        segment_dirs: np.ndarray,
-        segment_lengths_km: np.ndarray,
-        distance_breaks_km: np.ndarray,
-    ) -> np.ndarray:
-        d_values = np.asarray(d_values, dtype=float).reshape(-1)
-        xy = np.zeros((len(d_values), 2), dtype=float)
-
-        for i, distance_km in enumerate(d_values):
-            distance_km = min(max(distance_km, 0.0), distance_breaks_km[-1])
-
-            if distance_km >= distance_breaks_km[-1]:
-                xy[i, :] = waypoints[-1]
-                continue
-
-            segment_id = np.searchsorted(distance_breaks_km, distance_km, side="right") - 1
-            segment_id = int(np.clip(segment_id, 0, len(segment_lengths_km) - 1))
-
-            local_distance_km = distance_km - distance_breaks_km[segment_id]
-            xy[i, :] = waypoints[segment_id] + local_distance_km * segment_dirs[segment_id]
-
-        return xy
 
     def _compute_solar_power_available(
         self,

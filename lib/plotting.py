@@ -1,10 +1,7 @@
 import os
-from typing import Optional
-
+from typing import Optional,List, Any
 import matplotlib.pyplot as plt
 import numpy as np
-import os
-import re
 import pickle
 
 from lib.paths import PLOTS, NAVIGABILITY_MAP
@@ -53,10 +50,6 @@ def _finalize_axis(ax, xlabel: str, ylabel: str, title: Optional[str] = None):
     ax.figure.tight_layout()
 
 
-def _ensure_plots_dir():
-    os.makedirs(PLOTS, exist_ok=True)
-
-
 def _save_and_maybe_show(
     fig,
     name: str,
@@ -64,9 +57,6 @@ def _save_and_maybe_show(
     directory=PLOTS,
     font_scale: float = 1.0,
 ):
-    import os
-    import matplotlib.pyplot as plt
-
     os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, f"{name}.png")
 
@@ -98,53 +88,6 @@ def _save_and_maybe_show(
         plt.show()
     else:
         plt.close(fig)
-
-def _as_1d(arr):
-    if arr is None:
-        return None
-    return np.asarray(arr).ravel()
-
-def _plot_xy(
-    x,
-    y,
-    name: str,
-    xlabel: str,
-    ylabel: str,
-    show: bool = False,
-    marker: Optional[str] = None,
-    label: Optional[str] = None,
-    directory = PLOTS,
-):
-    x = _as_1d(x)
-    y = _as_1d(y)
-
-    if x is None or y is None:
-        return
-
-    m = np.isfinite(x) & np.isfinite(y)
-    x = x[m]
-    y = y[m]
-
-    if x.size == 0:
-        print(f"[WARN] {name}: no finite data to plot.")
-        return
-
-    fig, ax = plt.subplots(figsize=(4.0, 4.0), dpi=150)
-    ax.plot(x, y, marker=marker, markersize=2 if marker else None, label=label)
-
-    xmin, xmax = x.min(), x.max()
-    ymin, ymax = y.min(), y.max()
-    dx = max(xmax - xmin, 1e-9)
-    dy = max(ymax - ymin, 1e-9)
-    ax.set_xlim(xmin - 0.05 * dx, xmax + 0.05 * dx)
-    ax.set_ylim(ymin - 0.05 * dy, ymax + 0.05 * dy)
-
-    ax.set_aspect("equal", adjustable="box")
-    if label is not None:
-        ax.legend(loc="best", frameon=False)
-
-    _finalize_axis(ax, xlabel=xlabel, ylabel=ylabel, title=name)
-    _save_and_maybe_show(fig, name, show, directory=directory,font_scale = 2.0)
 
 def _get_solution_positions(sol, n_expected=None):
     if not hasattr(sol, "ship_pos") or sol.ship_pos is None:
@@ -241,107 +184,6 @@ def _draw_colored_zones(ax, zone_ineq, alpha=0.25, eps_poly=1e-9, label_zones=Tr
             )
 
     return all_verts
-
-
-def _draw_transition_constraints(
-    ax,
-    map_obj,
-    alpha=0.55,
-    linewidth=1.1,
-    linestyle="--",
-):
-    """
-    Draw transition constraint boundaries from map_obj.trans_ineq_to/from.
-
-    Assumes inequalities are stored as:
-        [Ay, Ax, Ac]
-    meaning:
-        Ay*y + Ax*x + Ac >= 0
-
-    This only draws the boundary line Ay*y + Ax*x + Ac = 0.
-    """
-    if not hasattr(map_obj, "trans_ineq_to") or not hasattr(map_obj, "trans_ineq_from"):
-        print("[WARN] map_obj has no trans_ineq_to/trans_ineq_from; skipping transition constraints.")
-        return []
-
-    x_min = 0.0
-    x_max = float(map_obj.info.span_km_east)
-    y_min = 0.0
-    y_max = float(map_obj.info.span_km_north)
-
-    xs = np.linspace(x_min, x_max, 300)
-    drawn_xy = []
-
-    def draw_one_family(trans_ineq, label_prefix):
-        nonlocal drawn_xy
-
-        if trans_ineq is None:
-            return
-
-        trans_ineq = np.asarray(trans_ineq, dtype=float)
-
-        # Expected shape: [2, 3, nb_zones, nb_zones]
-        if trans_ineq.ndim != 4 or trans_ineq.shape[1] != 3:
-            print(f"[WARN] Unexpected {label_prefix} shape: {trans_ineq.shape}")
-            return
-
-        nb_i = trans_ineq.shape[2]
-        nb_j = trans_ineq.shape[3]
-
-        first_label = True
-
-        for z_from in range(nb_i):
-            for z_to in range(nb_j):
-                block = trans_ineq[:, :, z_from, z_to]
-
-                if np.all(np.abs(block) < 1e-12):
-                    continue
-
-                for k in range(block.shape[0]):
-                    Ay, Ax, Ac = block[k, :]
-
-                    if abs(Ay) < 1e-12 and abs(Ax) < 1e-12:
-                        continue
-
-                    # Boundary: Ay*y + Ax*x + Ac = 0
-                    if abs(Ay) > 1e-12:
-                        ys = -(Ax * xs + Ac) / Ay
-                        mask = np.isfinite(ys) & (ys >= y_min) & (ys <= y_max)
-
-                        if np.count_nonzero(mask) < 2:
-                            continue
-
-                        x_plot = xs[mask]
-                        y_plot = ys[mask]
-
-                    else:
-                        # Vertical line: Ax*x + Ac = 0
-                        x0 = -Ac / Ax
-                        if not (x_min <= x0 <= x_max):
-                            continue
-
-                        y_plot = np.linspace(y_min, y_max, 300)
-                        x_plot = np.full_like(y_plot, x0)
-
-                    label = "Transition constraints" if first_label else None
-                    first_label = False
-
-                    ax.plot(
-                        x_plot,
-                        y_plot,
-                        linestyle=linestyle,
-                        linewidth=linewidth,
-                        alpha=alpha,
-                        label=label,
-                        zorder=8,
-                    )
-
-                    drawn_xy.append(np.column_stack([x_plot, y_plot]))
-
-    draw_one_family(map_obj.trans_ineq_to, "trans_ineq_to")
-    draw_one_family(map_obj.trans_ineq_from, "trans_ineq_from")
-
-    return drawn_xy
 
 
 def _plot_solution_map_overlay(
@@ -571,28 +413,6 @@ def _plot_solution_map_overlay(
     _save_and_maybe_show(fig, name, show, directory=directory ,font_scale = 2.0)
 
 # ====================== MAIN SUMMARY / PLOTTING FUNCTIONS ======================
-def _flatten_TH(y):
-    y = np.asarray(y, dtype=float)
-    if y.ndim == 1:
-        return y
-    if y.ndim == 2:  # [T, H]
-        return y.reshape(-1)
-    return y
-
-
-def _flatten_gen_NTH(y):
-    y = np.asarray(y, dtype=float)
-    if y.ndim == 2:  # [nb_gen, T]
-        return y
-    if y.ndim == 3:  # [nb_gen, T, H]
-        return y.reshape(y.shape[0], -1)
-    return y
-
-
-def _series_x(y):
-    return np.arange(len(y))
-
-
 def _print_cost_summary_vs_benchmark(solutions, labels, benchmark_label):
     """
     Print absolute costs and percentage difference relative to a benchmark.
@@ -603,8 +423,6 @@ def _print_cost_summary_vs_benchmark(solutions, labels, benchmark_label):
     Negative percentage  -> cheaper than benchmark
     Positive percentage  -> more expensive than benchmark
     """
-
-    import numpy as np
 
     costs = np.array(
         [float(sol.estimated_cost) for sol in solutions],
@@ -666,9 +484,6 @@ def plot_solutions(
     subfolder=None,
     map=None,
 ):
-    import os
-    import numpy as np
-    import matplotlib.pyplot as plt
 
     if labels is None:
         labels = [f"Solution {i}" for i in range(len(solutions))]
@@ -926,7 +741,7 @@ def plot_solutions(
     )
     _save_and_maybe_show(fig, "cmp_estimated_cost", show, directory=directory, font_scale=2.0)
 
-from typing import List, Any
+
 def load_solutions_from_pkl(
     filenames: List[str],
     subfolder: str | None = None,
@@ -1096,24 +911,3 @@ def plot_zones_and_points(
 
     _save_and_maybe_show(fig, name, show,font_scale = 2.0)
     return in_zone
-
-def _plot_series(y, title, ylabel, xlabel="Time (s)", x=None, cmd=None, cmd_label="Command"): 
-    y = np.asarray(y).ravel() 
-    if x is None: 
-        x = np.arange(y.size) 
-        xlabel = "Sample index" 
-
-    fig, ax = plt.subplots(figsize=(6.0, 3.2), dpi=150) 
-    ax.plot(x, y, linewidth=1.2, label="Sim") 
-
-    if cmd is not None: 
-        ax.plot( x, np.full_like(x, cmd, dtype=float), linewidth=1.2, linestyle="--", label=cmd_label, ) 
-
-    ax.set_title(title, fontsize=10) 
-    ax.set_xlabel(xlabel, fontsize=9) 
-    ax.set_ylabel(ylabel, fontsize=9) 
-    _ieee_axes(ax) 
-    if cmd is not None: 
-        ax.legend(frameon=False, fontsize=8, loc="best") 
-    fig.tight_layout() 
-    plt.show()

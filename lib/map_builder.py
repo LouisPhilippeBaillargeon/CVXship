@@ -1,18 +1,11 @@
 # lib/map_builder.py
 from __future__ import annotations
-
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-
-import io
 import numpy as np
 import pandas as pd
 import requests
-import rasterio
-from rasterio.warp import reproject, Resampling
-from rasterio.transform import from_origin
-from rasterio.io import MemoryFile
 from pyproj import CRS, Transformer
 
 import matplotlib.pyplot as plt

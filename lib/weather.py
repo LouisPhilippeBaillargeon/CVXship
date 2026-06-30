@@ -157,15 +157,6 @@ def latlon_to_zone_circular(weather_ds, var_name, time_name, map, *, period=360.
 
     return var_zone
 
-def _to_seconds(t: np.ndarray) -> np.ndarray:
-    """
-    Convert datetime-like array to float seconds (relative to t[0]).
-    Accepts numpy datetime64 or pandas datetime.
-    """
-    t = pd.to_datetime(t).to_numpy()
-    t0 = t[0]
-    return (t - t0) / np.timedelta64(1, "s")
-
 
 def _interp1d_piecewise_linear(t_src_s: np.ndarray,
                               y_src: np.ndarray,

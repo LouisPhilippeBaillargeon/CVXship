@@ -5,7 +5,7 @@ from typing import List
 import tomllib
 import math
 
-from lib.utils import build_or_load_adjacency_matrix, build_variable_timestep_grid, dx_dy_km, point_in_zones
+from lib.utils import build_variable_timestep_grid, dx_dy_km, point_in_zones
 from lib.paths import SHIP, MAP_TOML, ITINERARY, ZONE_INEQ, TRANSITION_INEQ, ADJ
 from lib.weather import weather_from_nc_file
 
@@ -167,10 +167,8 @@ class Map:
 
 def _compute_zone_centroids(info: MapInfo, zone_ineq: np.ndarray) -> np.ndarray:
     """
-    This should be computed at the same time as zone ineq instead. With corners.csv it would be easier. Could just average the 4 corners.
-
     Compute a simple centroid (in km) for each convex zone defined by zone_ineq.
-
+    
     We sample a regular grid over the map in km, assign grid points to zones
     using the inequalities, and take the mean (x, y) of the points in each zone.
     """
@@ -184,7 +182,6 @@ def _compute_zone_centroids(info: MapInfo, zone_ineq: np.ndarray) -> np.ndarray:
     ys = np.arange(dy / 2.0, max(info.span_km_north, dy / 2.0 + 1e-9), dy)
 
     X, Y = np.meshgrid(xs, ys)  # shapes (Ny, Nx)
-    Ny, Nx = X.shape
 
     # zone_ineq: shape (3, 4, nb_zones)
     #   zone_ineq[0, j, z] = coeff on y
