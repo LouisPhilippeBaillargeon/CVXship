@@ -1564,10 +1564,6 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(runner, eps=1e-9, debu
             return speed_before
         return float(speed_cmd[t - 1])
 
-    # Acceleration is based on command changes, not heading splits. For single-command timesteps,
-    # apply it only once on the first real substep to avoid double-counting acceleration force.
-    acc_applied_single = np.zeros(T, dtype=bool)
-
     def _acc_for(t, h_cmd, dt_h):
         if uses_two_setpoints:
             denom_s = max(float(dt_h) * 3600.0, eps)
@@ -1723,6 +1719,7 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(runner, eps=1e-9, debu
 
     non_conv_sol = Solution(
         estimated_cost=float(np.sum(total_cost_all)),
+        solve_time= sol.solve_time,
         T_future=sol.T_future,
         instant_sail=sol.instant_sail,
         port_idx=sol.port_idx,

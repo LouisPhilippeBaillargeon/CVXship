@@ -1262,7 +1262,7 @@ class BaseWaveModel:
     def compute_wave_relative_angle_encounter(
         ship_speed_vector,      # [vx, vy] m/s, speed through water
         mean_wave_direction,    # ERA5 convention, degrees, "from" direction
-        eps: float = 1e-12,
+        eps: float = 1e-9,
     ):
         """
         Compute wave encounter angle in radians in [0, pi].

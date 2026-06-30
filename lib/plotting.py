@@ -627,7 +627,9 @@ def _print_cost_summary_vs_benchmark(solutions, labels, benchmark_label):
     print(f"Benchmark: {benchmark_label}")
     print("-" * 80)
 
-    for label, cost in zip(labels, costs):
+    for label, sol, cost in zip(labels, solutions, costs):
+
+        solve_time = getattr(sol, "solve_time", np.nan)
 
         if abs(benchmark_cost) < 1e-12:
             percent_diff = np.nan
@@ -642,12 +644,14 @@ def _print_cost_summary_vs_benchmark(solutions, labels, benchmark_label):
             print(
                 f"{label:<35s}: "
                 f"{cost:>12,.6f} $   "
+                f"{solve_time:>8.2f} s   "
                 f"(benchmark)"
             )
         else:
             print(
                 f"{label:<35s}: "
                 f"{cost:>12,.6f} $   "
+                f"{solve_time:>8.2f} s   "
                 f"{percent_diff:>10.4f}%   "
                 f"(Δ = {delta:,.6f} $)"
             )

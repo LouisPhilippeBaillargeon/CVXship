@@ -31,7 +31,7 @@ from lib.paths import (
     CALM_MODEL
 )
 from lib.plotting import plot_solutions, plot_zones_and_points, load_solutions_from_pkl
-from lib.optimizers import GlobalOptimizer, NaiveController, Fixed_Path_Optimizer, ShortestPath, Global_Continuous
+from lib.optimizers import GlobalOptimizer, NaiveController, Fixed_Path_Optimizer, ShortestPath, Global_Continuous, Fixed_Path_TimeSampled_Optimizer
 from lib.utils import point_in_zones, dx_dy_km, classify_timesteps, _assert_finite, xy_from_path_distance
 from lib.evaluation import compute_non_convex_cost_all_timesteps_nc_interpolated
 from lib.simulation import run_simulink_model
@@ -293,26 +293,26 @@ if __name__ == "__main__":
 
         if dimensions == "1D" or dimensions == "both":
             optimizer = Fixed_Path_Optimizer(
-                wave_model=wave_model_1D,
-                wind_model=wind_model_1D,
-                propulsion_model=propulsion_model,
-                calm_model=calm_model,
-                generator_models=generatorModels,
-                map=map,
-                itinerary=itinerary,
-                states=states,
-                weather=weather,
-                ship=ship,
-                waypoints=path.sol.waypoints,
-                path_zone_ids=path.sol.zone_sequence,
-                ref_speed = ref_speed
+                wave_model          = wave_model_1D,
+                wind_model          = wind_model_1D,
+                propulsion_model    = propulsion_model,
+                calm_model          = calm_model,
+                generator_models    = generatorModels,
+                map                 = map,
+                itinerary           = itinerary,
+                states              = states,
+                weather             = weather,
+                ship                = ship,
+                waypoints           = path.sol.waypoints,
+                path_zone_ids       = path.sol.zone_sequence,
+                ref_speed           = ref_speed
             )
 
             ok = optimizer.optimize(
-                unit_commitment=False,
-                debug=True,
-                restrict_to_naive=True,
-                naive_solution=naive.sol,
+                unit_commitment     = False,
+                debug               = True,
+                restrict_to_naive   = True,
+                naive_solution      = naive.sol,
                 naive_segment_radius=1,
             )
             if ok:
@@ -368,11 +368,38 @@ if __name__ == "__main__":
             else:
                 print("Optimization failed.")
 
-            if dimensions == "1D":
-                plot_solutions([fixed_path_sol, naive_nonconv_sol],["Global Optimizer", "Naive Controller"], benchmark_label="Naive Controller", show = True, subfolder="All sol compared", map=optimizer.map)
-                
+            # ============================================================
+            # Fixed path, time-sampled weather benchmark
+            # ============================================================
+            remaining_sail_time_h = np.sum(classify_timesteps(itinerary)[2][states.timesteps_completed:]) * itinerary.timestep
+            ref_speed = path.sol.total_distance / remaining_sail_time_h * 1000 / 3600
 
-            
+            fixed_path_ts = Fixed_Path_TimeSampled_Optimizer(
+                wind_model=wind_model_1D,
+                wave_model=wave_model_1D,
+                propulsion_model=propulsion_model,
+                calm_model=calm_model,
+                generator_models=generatorModels,
+                map=map,
+                itinerary=itinerary,
+                states=states,
+                weather=weather,
+                ship=ship,
+                ref_speed=ref_speed,
+                waypoints=path.sol.waypoints,
+                path_zone_ids=path.sol.zone_sequence,
+            )
+            fixed_path_ts.optimize(
+                debug=False,
+            )
+            _, fixed_path_ts_nonconv_sol, _, _ = compute_non_convex_cost_all_timesteps_nc_interpolated(
+                fixed_path_ts,
+                debug=False,
+            )
+
+            if dimensions == "1D":
+                plot_solutions([fixed_path_sol, naive_nonconv_sol, fixed_path_ts_nonconv_sol],["Fixed Path", "Naive Controller", "Fixed Path frozen path"], benchmark_label="Naive Controller", show = False, subfolder="All sol compared", map=optimizer.map)
+                
        
         
         if dimensions == "2D" or dimensions == "both":
@@ -388,7 +415,7 @@ if __name__ == "__main__":
                 weather             = weather,
                 ship                = ship,
                 ref_speed           = ref_speed,
-                path_zone_ids=path.sol.zone_sequence,)
+                path_zone_ids       = path.sol.zone_sequence,)
 
             # Plot current position and destination
             init_pos = np.array([optimizer.states.current_x_pos, optimizer.states.current_y_pos])
@@ -424,7 +451,7 @@ if __name__ == "__main__":
                 weather             = weather,
                 ship                = ship,
                 ref_speed           = ref_speed,
-                path_zone_ids=path.sol.zone_sequence,)
+                path_zone_ids       = path.sol.zone_sequence,)
             
             # Plot current position and destination
             init_pos = np.array([glob_cont_opt.states.current_x_pos, glob_cont_opt.states.current_y_pos])
@@ -455,7 +482,7 @@ if __name__ == "__main__":
                 print("  evaluator:", np.asarray(glob_cont_opt_sol.__dict__[name]).shape)
             plot_solutions([glob_cont_opt.sol, glob_cont_opt_sol],["Convex continuous Global solution", "Non-convex Global continuous solution"], benchmark_label="Non-convex Global continuous solution", show=False, subfolder="Global continuous Path", map=optimizer.map)
 
-            plot_solutions([glob_cont_opt_sol, global_sol, fixed_path_sol, naive_nonconv_sol],["Global continuous opt","Global Optimizer", "Fixed Path Optimizer", "Naive Controller"], benchmark_label="Naive Controller", show = True, subfolder="All sol compared", map=optimizer.map)
+            plot_solutions([glob_cont_opt_sol, global_sol, fixed_path_sol, naive_nonconv_sol, fixed_path_ts_nonconv_sol],["Global continuous opt","Global Optimizer", "Fixed Path Optimizer", "Naive Controller", "Fixed Path frozen path"], benchmark_label="Naive Controller", show = True, subfolder="All sol compared", map=optimizer.map)
 
 
 
