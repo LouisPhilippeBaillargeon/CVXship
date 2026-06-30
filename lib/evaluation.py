@@ -1,6 +1,6 @@
 import numpy as np
 
-from lib.optimizers import Solution
+from lib.optimizers import Solution, _future_auxiliary_power
 from lib.weather_interpolation import (
     prepare_nc_interp_source,
     interpolated_weather_at,
@@ -63,6 +63,14 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(runner, eps=1e-9, debu
 
     if dt_vec.shape != (T,):
         raise ValueError(f"Expected timestep_dt_h shape {(T,)}, got {dt_vec.shape}.")
+
+    aux_source = getattr(sol, "auxiliary_power", None)
+    if aux_source is None or len(aux_source) == 0:
+        auxiliary_power = _future_auxiliary_power(itinerary, runner.states, T)
+    else:
+        auxiliary_power = np.asarray(aux_source, dtype=float).reshape(-1)
+        if auxiliary_power.shape != (T,):
+            raise ValueError(f"Expected auxiliary_power shape {(T,)}, got {auxiliary_power.shape}.")
 
     dt_s_vec = dt_vec * 3600.0
     mask_sail = np.asarray(sol.interval_sail_fraction, dtype=float).reshape(-1) > 0.5
@@ -429,7 +437,14 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(runner, eps=1e-9, debu
                         "prop", prop_power[t, h],
                     )
 
-            total_gen_power = prop_power[t, h] - solar_power[t, h] + battery_charge[t, h] - battery_discharge[t, h] - shore_power[t, h]
+            total_gen_power = (
+                prop_power[t, h]
+                + auxiliary_power[t]
+                - solar_power[t, h]
+                + battery_charge[t, h]
+                - battery_discharge[t, h]
+                - shore_power[t, h]
+            )
             total_gen_power = max(0.0, total_gen_power)
 
             sched = np.asarray(gen_sched, dtype=float).copy()
@@ -499,6 +514,7 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(runner, eps=1e-9, debu
         speed_rel_water=speed_rel_water,
         speed_rel_water_mag=speed_rel_water_mag,
         prop_power=prop_power,
+        auxiliary_power=auxiliary_power,
         wave_resistance=wave_resistance,
         wind_resistance=wind_resistance,
         calm_water_resistance=calm_water_resistance,

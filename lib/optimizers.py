@@ -34,6 +34,7 @@ class Solution:
     speed_rel_water_mag     : np.ndarray #[T_future]
 
     prop_power              : np.ndarray #[T_future]
+    auxiliary_power         : np.ndarray #[T_future]
     wave_resistance         : np.ndarray #[T_future]
     wind_resistance         : np.ndarray #[T_future]
     calm_water_resistance      : np.ndarray #[T_future]
@@ -118,6 +119,18 @@ def _future_dt_h(itinerary, states, T_future: int) -> np.ndarray:
     return out
 
 
+def _future_auxiliary_power(itinerary, states, T_future: int) -> np.ndarray:
+    aux = getattr(itinerary, "auxiliary_power", None)
+    if aux is None or len(aux) == 0:
+        return np.zeros(T_future, dtype=float)
+
+    t0 = int(getattr(states, "timesteps_completed", 0))
+    out = np.asarray(aux, dtype=float)[t0 : t0 + T_future]
+    if out.shape != (T_future,):
+        raise ValueError(f"Expected {T_future} future auxiliary power values, got {out.shape}.")
+    return out
+
+
 def _future_interval_port_idx(itinerary, states, T_future: int, port_idx: np.ndarray) -> np.ndarray:
     p = getattr(itinerary, "interval_port_idx", None)
     if p is not None and len(p) > 0:
@@ -127,6 +140,68 @@ def _future_interval_port_idx(itinerary, states, T_future: int, port_idx: np.nda
             return out
 
     return np.asarray(port_idx[:-1], dtype=int)
+
+
+def _future_timestep_midpoints(itinerary, states, T_future: int) -> List[pd.Timestamp]:
+    t0 = int(getattr(states, "timesteps_completed", 0))
+    times = getattr(itinerary, "time_points", None)
+    if times is not None and len(times) >= t0 + T_future + 1:
+        out = []
+        for t in range(T_future):
+            start = pd.to_datetime(times[t0 + t])
+            end = pd.to_datetime(times[t0 + t + 1])
+            out.append(start + (end - start) / 2)
+        return out
+
+    if not getattr(itinerary, "transits", None):
+        raise ValueError("Cannot build time-varying speed limits without itinerary times.")
+
+    start = pd.to_datetime(itinerary.transits[0].arrival_datetime)
+    offsets = getattr(itinerary, "timestep_mid_offset_h", None)
+    if offsets is not None and len(offsets) >= t0 + T_future:
+        return [
+            start + pd.to_timedelta(float(offsets[t0 + t]), unit="h")
+            for t in range(T_future)
+        ]
+
+    dt = _future_dt_h(itinerary, states, T_future)
+    completed_dt = np.asarray(getattr(itinerary, "timestep_dt_h", []), dtype=float)[:t0]
+    elapsed_h = float(np.sum(completed_dt)) if completed_dt.size else t0 * float(itinerary.timestep)
+    out = []
+    for t in range(T_future):
+        out.append(start + pd.to_timedelta(elapsed_h + 0.5 * float(dt[t]), unit="h"))
+        elapsed_h += float(dt[t])
+    return out
+
+
+def _ship_speed_limit_matrix(map_obj, itinerary, states, ship, T_future: int) -> np.ndarray:
+    """
+    Return speed limits in m/s with shape [nb_zones, T_future].
+    Undefined zones/times default to the ship max speed.
+    """
+    nb_zones = int(map_obj.nb_zones)
+    ship_max_speed = float(ship.info.max_speed)
+    limits = np.full((nb_zones, T_future), ship_max_speed, dtype=float)
+    bands = getattr(map_obj, "speed_limit_bands", None) or []
+    if not bands:
+        return limits
+
+    midpoints = _future_timestep_midpoints(itinerary, states, T_future)
+    for band in bands:
+        start = band.get("start")
+        end = band.get("end")
+        active_t = [
+            t for t, midpoint in enumerate(midpoints)
+            if (start is None or midpoint >= start) and (end is None or midpoint < end)
+        ]
+        if not active_t:
+            continue
+
+        limit = min(float(band["speed"]), ship_max_speed)
+        for z in band["zones"]:
+            limits[int(z), active_t] = limit
+
+    return limits
 
 
 @dataclass
@@ -169,8 +244,12 @@ class DJPE_TSO:
         H = 2  # two half-timestep segments
 
         timestep_dt_h = _future_dt_h(self.itinerary, self.states, T_future)
+        auxiliary_power = _future_auxiliary_power(self.itinerary, self.states, T_future)
         half_dt_h = 0.5 * timestep_dt_h
         half_dt_s = half_dt_h * 3600.0
+        ship_speed_limit = _ship_speed_limit_matrix(
+            self.map, self.itinerary, self.states, self.ship, T_future
+        )
 
         instant_sail, port_idx, interval_sail_fraction = classify_timesteps(self.itinerary)
         instant_sail = instant_sail[self.states.timesteps_completed:]
@@ -415,6 +494,8 @@ class DJPE_TSO:
 
                 ship_speed_x[t, 1] == ((ship_pos[t + 1, 0] - q[0]) / half_dt_h[t]) * 1000 / 3600,
                 ship_speed_y[t, 1] == ((ship_pos[t + 1, 1] - q[1]) / half_dt_h[t]) * 1000 / 3600,
+                speed_mag[t, 0] <= zone[t, :] @ ship_speed_limit[:, t],
+                speed_mag[t, 1] <= zone[t + 1, :] @ ship_speed_limit[:, t],
             ]
 
             for h in range(H):
@@ -727,6 +808,7 @@ class DJPE_TSO:
                 constraints += [
                     cp.sum(generation_power[:, k], axis=0)
                     == prop_power[t, h]
+                    + auxiliary_power[t]
                     - solar_power[t, h]
                     - battery_discharge[t, h]
                     + battery_charge[t, h]
@@ -808,6 +890,7 @@ class DJPE_TSO:
                 speed_rel_water_mag     = np.array(speed_rel_water_mag.value),
 
                 prop_power              = np.array(prop_power.value),
+                auxiliary_power         = auxiliary_power,
                 wave_resistance         = np.array(wave_resistance.value),
                 wind_resistance         = np.array(wind_resistance.value),
                 acc_force               = np.array(acc_force.value),
@@ -873,8 +956,12 @@ class CJPE_TSO:
 
         T_future = self.itinerary.nb_timesteps - self.states.timesteps_completed
         timestep_dt_h = _future_dt_h(self.itinerary, self.states, T_future)
+        auxiliary_power = _future_auxiliary_power(self.itinerary, self.states, T_future)
         timestep_dt_s = timestep_dt_h * 3600.0
         half_dt_h = 0.5 * timestep_dt_h
+        ship_speed_limit = _ship_speed_limit_matrix(
+            self.map, self.itinerary, self.states, self.ship, T_future
+        )
 
         instant_sail, port_idx, interval_sail_fraction = classify_timesteps(self.itinerary)
         instant_sail = instant_sail[self.states.timesteps_completed:]
@@ -1121,6 +1208,8 @@ class CJPE_TSO:
                 ship_speed_y_split[t, 1] == ((ship_pos[t + 1, 1] - q[1]) / half_dt_h[t]) * 1000 / 3600,
                 ship_speed_x[t] == ((ship_pos[t + 1, 0] - ship_pos[t, 0]) / timestep_dt_h[t]) * 1000 / 3600,
                 ship_speed_y[t] == ((ship_pos[t + 1, 1] - ship_pos[t, 1]) / timestep_dt_h[t]) * 1000 / 3600,
+                speed_mag_split[t, 0] <= zone[t, :] @ ship_speed_limit[:, t],
+                speed_mag_split[t, 1] <= zone[t + 1, :] @ ship_speed_limit[:, t],
             ]
             for h in range(2):
                 constraints += [
@@ -1440,6 +1529,7 @@ class CJPE_TSO:
             constraints += [
                 cp.sum(generation_power[:, t], axis=0)
                 == prop_power[t]
+                + auxiliary_power[t]
                 - solar_power[t]
                 - battery_discharge[t]
                 + battery_charge[t]
@@ -1503,6 +1593,7 @@ class CJPE_TSO:
                 speed_rel_water_mag     = np.array(speed_rel_water_mag.value),
 
                 prop_power              = np.array(prop_power.value),
+                auxiliary_power         = auxiliary_power,
                 wave_resistance         = np.array(wave_resistance.value),
                 wind_resistance         = np.array(wind_resistance.value),
                 acc_force               = np.array(acc_force.value),
@@ -1566,7 +1657,11 @@ class FR_TSO:
 
         T_future = self.itinerary.nb_timesteps - self.states.timesteps_completed
         timestep_dt_h = _future_dt_h(self.itinerary, self.states, T_future)
+        auxiliary_power = _future_auxiliary_power(self.itinerary, self.states, T_future)
         timestep_dt_s = timestep_dt_h * 3600.0
+        ship_speed_limit = _ship_speed_limit_matrix(
+            self.map, self.itinerary, self.states, self.ship, T_future
+        )
 
         instant_sail, port_idx, interval_sail_fraction = classify_timesteps(self.itinerary)
         instant_sail = instant_sail[self.states.timesteps_completed:]
@@ -1579,6 +1674,7 @@ class FR_TSO:
         waypoints = np.asarray(self.waypoints, dtype=float)
         path_zone_ids = np.asarray(self.path_zone_ids, dtype=int)
         nb_path_zones = len(path_zone_ids)
+        path_speed_limit = ship_speed_limit[path_zone_ids, :]
 
         if waypoints.ndim != 2 or waypoints.shape[1] != 2:
             raise ValueError("self.waypoints must have shape (N, 2).")
@@ -1701,8 +1797,8 @@ class FR_TSO:
 
             for s in range(nb_path_zones):
                 constraints += [
-                    speed_seg_start[t, s] <= self.ship.info.max_speed * seg[t, s],
-                    speed_seg_end[t, s] <= self.ship.info.max_speed * seg[t + 1, s],
+                    speed_seg_start[t, s] <= path_speed_limit[s, t] * seg[t, s],
+                    speed_seg_end[t, s] <= path_speed_limit[s, t] * seg[t + 1, s],
                 ]
 
         constraints += [
@@ -1725,7 +1821,9 @@ class FR_TSO:
         ]
 
         # Optional redundant bounds to help B&B / presolve
-        constraints += [step_distance <= self.ship.info.max_speed * timestep_dt_h * 3600.0 / 1000.0]
+        constraints += [
+            step_distance <= np.max(path_speed_limit, axis=0) * timestep_dt_h * 3600.0 / 1000.0
+        ]
         constraints += [speed_seg_start <= self.ship.info.max_speed]
         constraints += [speed_seg_end <= self.ship.info.max_speed]
         constraints += [ship_speed_x_split <= self.ship.info.max_speed]
@@ -2052,6 +2150,7 @@ class FR_TSO:
             constraints += [
                 cp.sum(generation_power[:, t], axis=0)
                 == prop_power[t]
+                + auxiliary_power[t]
                 - solar_power[t]
                 - battery_discharge[t]
                 + battery_charge[t]
@@ -2143,6 +2242,7 @@ class FR_TSO:
             speed_rel_water_mag=np.asarray(speed_rel_water_mag.value),
 
             prop_power=np.asarray(prop_power.value),
+            auxiliary_power=auxiliary_power,
             wave_resistance=np.asarray(wave_resistance.value),
             wind_resistance=np.asarray(wind_resistance.value),
             calm_water_resistance=np.asarray(calm_water_resistance.value),
@@ -2319,6 +2419,7 @@ class FR_O:
         T_future = self.itinerary.nb_timesteps - self.states.timesteps_completed
         self._precompute_timesampled_weather_models(debug=debug)
         timestep_dt_h = _future_dt_h(self.itinerary, self.states, T_future)
+        auxiliary_power = _future_auxiliary_power(self.itinerary, self.states, T_future)
         timestep_dt_s = timestep_dt_h * 3600.0
 
         instant_sail, port_idx, interval_sail_fraction = classify_timesteps(self.itinerary)
@@ -2607,6 +2708,7 @@ class FR_O:
             constraints += [
                 cp.sum(generation_power[:, t], axis=0)
                 == prop_power[t]
+                + auxiliary_power[t]
                 - solar_power[t]
                 - battery_discharge[t]
                 + battery_charge[t]
@@ -2686,6 +2788,7 @@ class FR_O:
             speed_rel_water_mag=np.asarray(speed_rel_water_mag.value),
 
             prop_power=np.asarray(prop_power.value),
+            auxiliary_power=auxiliary_power,
             wave_resistance=np.asarray(wave_resistance.value),
             wind_resistance=np.asarray(wind_resistance.value),
             calm_water_resistance=np.asarray(calm_water_resistance.value),
@@ -2739,6 +2842,7 @@ class NaiveController:
         start_solve = time.time()
 
         T_future = self.itinerary.nb_timesteps - self.states.timesteps_completed
+        auxiliary_power = _future_auxiliary_power(self.itinerary, self.states, T_future)
 
         instant_sail, port_idx, interval_sail_fraction = classify_timesteps(self.itinerary)
         instant_sail = instant_sail[self.states.timesteps_completed:]
@@ -2854,6 +2958,7 @@ class NaiveController:
             speed_rel_water_mag=speed_rel_water_mag,
 
             prop_power=zeros.copy(),
+            auxiliary_power=auxiliary_power,
             wave_resistance=zeros.copy(),
             wind_resistance=zeros.copy(),
             calm_water_resistance=zeros.copy(),

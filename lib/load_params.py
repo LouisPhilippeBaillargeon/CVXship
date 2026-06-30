@@ -162,8 +162,9 @@ class Map:
     trans_ineq_from : np.ndarray
     trans_ineq_to   : np.ndarray
     zone_adj        : np.ndarray
-    zone_centroids  : np.ndarray = field(init=False)
     nb_zones        : float
+    speed_limit_bands: List[dict] = field(default_factory=list)
+    zone_centroids  : np.ndarray = field(init=False)
 
 def _compute_zone_centroids(info: MapInfo, zone_ineq: np.ndarray) -> np.ndarray:
     """
@@ -216,21 +217,92 @@ def _compute_zone_centroids(info: MapInfo, zone_ineq: np.ndarray) -> np.ndarray:
 
     return centroids
 
+
+def _single_value(raw, keys):
+    for key in keys:
+        if key in raw:
+            return raw[key]
+    return None
+
+
+def _load_speed_limit_bands(data, nb_zones: int) -> List[dict]:
+    """
+    Parse optional zone speed limits from map.toml.
+
+    Supported format:
+      [[speed_limit]]
+      zone = 3
+      speed = 10.0
+      until = "2024-03-21T18:00"
+
+      [[speed_limit]]
+      zones = [3, 4]
+      speed = 5.0
+      from = "2024-03-21T18:00"
+      until = "2024-03-22T18:00"
+    """
+    bands = []
+    for i, raw in enumerate(data.get("speed_limit", [])):
+        speed = _single_value(raw, ("speed", "speed_mps", "limit", "limit_mps", "max_speed"))
+        if speed is None:
+            raise ValueError(f"speed_limit[{i}] must define speed in m/s.")
+
+        zone_value = _single_value(
+            raw,
+            ("zone", "zone_index", "set", "set_index", "zones", "sets", "indices"),
+        )
+        if zone_value is None:
+            raise ValueError(f"speed_limit[{i}] must define a zone/set index.")
+
+        if isinstance(zone_value, list):
+            zones = [int(z) for z in zone_value]
+        else:
+            zones = [int(zone_value)]
+
+        for z in zones:
+            if z < 0 or z >= nb_zones:
+                raise ValueError(
+                    f"speed_limit[{i}] references zone {z}, "
+                    f"but valid zone indices are 0..{nb_zones - 1}."
+                )
+
+        start_raw = _single_value(raw, ("from", "start", "start_datetime"))
+        end_raw = _single_value(raw, ("until", "to", "end", "end_datetime"))
+        start = pd.to_datetime(start_raw) if start_raw is not None else None
+        end = pd.to_datetime(end_raw) if end_raw is not None else None
+        if start is not None and end is not None and end <= start:
+            raise ValueError(f"speed_limit[{i}] end must be after start.")
+
+        speed = float(speed)
+        if speed <= 0:
+            raise ValueError(f"speed_limit[{i}] speed must be > 0 m/s.")
+
+        bands.append({
+            "zones": zones,
+            "start": start,
+            "end": end,
+            "speed": speed,
+        })
+
+    return bands
+
+
 def load_map() -> Map:
     with open(MAP_TOML, "rb") as f:
-        data = tomllib.load(f)
+        toml_data = tomllib.load(f)
 
-    info = MapInfo(**data["params"])
+    info = MapInfo(**toml_data["params"])
 
-    data = np.load(ZONE_INEQ)
-    zone_ineq = data["lambda_array"]
+    zone_data = np.load(ZONE_INEQ)
+    zone_ineq = zone_data["lambda_array"]
     nb_zones = zone_ineq.shape[2]
 
     zone_adj = np.load(ADJ)
 
-    data = np.load(TRANSITION_INEQ)
-    trans_from = np.nan_to_num(data["transition_ineqs_from"], nan=0.0)
-    trans_to = np.nan_to_num(data["transition_ineqs_to"], nan=0.0)
+    trans_data = np.load(TRANSITION_INEQ)
+    trans_from = np.nan_to_num(trans_data["transition_ineqs_from"], nan=0.0)
+    trans_to = np.nan_to_num(trans_data["transition_ineqs_to"], nan=0.0)
+    speed_limit_bands = _load_speed_limit_bands(toml_data, nb_zones)
 
     m = Map(
         info=info,
@@ -239,6 +311,7 @@ def load_map() -> Map:
         trans_ineq_to=trans_to,
         zone_adj=zone_adj,
         nb_zones=nb_zones,
+        speed_limit_bands=speed_limit_bands,
     )
     m.zone_centroids = _compute_zone_centroids(m.info, m.zone_ineq)
     return m
@@ -276,6 +349,73 @@ class Itinerary:
     port_idx                : np.ndarray = field(default_factory=lambda: np.array([], dtype=int))
     interval_sail_fraction  : np.ndarray = field(default_factory=lambda: np.array([], dtype=float))
     interval_port_idx       : np.ndarray = field(default_factory=lambda: np.array([], dtype=int))
+    auxiliary_load_bands    : List[dict] = field(default_factory=list)
+    auxiliary_power         : np.ndarray = field(default_factory=lambda: np.array([], dtype=float))
+
+
+def _load_auxiliary_load_bands(data, itinerary_start, itinerary_end):
+    """
+    Parse contiguous auxiliary-load bands from itinerary.toml.
+
+    Preferred format:
+      [[auxiliary_load]]
+      power = 1.0
+      until = "2024-03-21T18:00"
+
+      [[auxiliary_load]]
+      power = 0.8
+      until = "2024-03-22T18:00"
+
+      [[auxiliary_load]]
+      power = 1.1
+    """
+    bands = []
+    previous_end = pd.to_datetime(itinerary_start)
+    horizon_end = pd.to_datetime(itinerary_end)
+
+    raw_bands = data.get("auxiliary_load", data.get("auxilary_load", []))
+
+    for i, raw in enumerate(raw_bands):
+        if "power" not in raw:
+            raise ValueError(f"auxiliary_load[{i}] must define power in MW.")
+
+        start = pd.to_datetime(raw.get("from", raw.get("start_datetime", previous_end)))
+        end_raw = raw.get("until", raw.get("end_datetime", None))
+        end = pd.to_datetime(end_raw) if end_raw is not None else horizon_end
+
+        if start < pd.to_datetime(itinerary_start):
+            start = pd.to_datetime(itinerary_start)
+        if end > horizon_end:
+            end = horizon_end
+        if end <= start:
+            previous_end = max(previous_end, end)
+            continue
+
+        bands.append({
+            "start": start,
+            "end": end,
+            "power": float(raw["power"]),
+        })
+        previous_end = end
+
+    return bands
+
+
+def _compute_auxiliary_power_profile(itinerary):
+    if not itinerary.auxiliary_load_bands:
+        return np.zeros(int(itinerary.nb_timesteps), dtype=float)
+
+    times = np.asarray(itinerary.time_points, dtype=object)
+    profile = np.zeros(int(itinerary.nb_timesteps), dtype=float)
+
+    for t in range(int(itinerary.nb_timesteps)):
+        mid = pd.to_datetime(times[t]) + (pd.to_datetime(times[t + 1]) - pd.to_datetime(times[t])) / 2
+        for band in itinerary.auxiliary_load_bands:
+            if band["start"] <= mid < band["end"]:
+                profile[t] = float(band["power"])
+                break
+
+    return profile
 
 
 def load_itinerary(map) -> Itinerary:
@@ -308,6 +448,8 @@ def load_itinerary(map) -> Itinerary:
     total_hours = (pd.to_datetime(end) - pd.to_datetime(start)).total_seconds() / 3600
     base_nb_timesteps = math.ceil(total_hours / timestep - 1e-12)
 
+    auxiliary_load_bands = _load_auxiliary_load_bands(data, start, end)
+
     # ---- Start and end positions ----
     target_x_pos, target_y_pos, _ = dx_dy_km(map, transit_list[-1].lat, transit_list[-1].lon)
 
@@ -322,6 +464,7 @@ def load_itinerary(map) -> Itinerary:
         target_x_pos = target_x_pos,
         target_y_pos = target_y_pos,
         fuel_price = fuel_price,
+        auxiliary_load_bands = auxiliary_load_bands,
     )
 
     grid = build_variable_timestep_grid(itinerary)
@@ -335,6 +478,7 @@ def load_itinerary(map) -> Itinerary:
     itinerary.interval_sail_fraction = grid["interval_sail_fraction"]
     itinerary.interval_port_idx = grid["interval_port_idx"]
     itinerary.nb_timesteps = len(itinerary.timestep_dt_h)
+    itinerary.auxiliary_power = _compute_auxiliary_power_profile(itinerary)
 
     return itinerary
 

@@ -5,14 +5,30 @@
 # timestep           : Duration of one timestep (h). 
 # fuel_price         : ($/kg)
 # init_speed         : (m/s)
-#Note : if there is not an integer amount of timesteps in the total duration of your trip (eg : trip duration = 4h37, timestep = 1h), then trip will be constrained to be done in 4h.
 # ============================
 [params]
-soc_i               = 4
-soc_f               = 10
+soc_i               = 1.5
+soc_f               = 3
 timestep            = 0.5
 fuel_price          = 1.396
 init_speed          = 0
+
+# ============================
+# Auxiliary load forecast
+# power              : Auxiliary load (MW)
+# until              : Optional end datetime. Omit on the last band to use it for the rest of the trip.
+# from/start_datetime: Optional explicit start datetime. If omitted, bands are contiguous in file order.
+# ============================
+# [[auxiliary_load]]
+# power              = 1.0
+# until              = "2024-03-21T18:00"
+#
+# [[auxiliary_load]]
+# power              = 0.8
+# until              = "2024-03-22T18:00"
+#
+# [[auxiliary_load]]
+# power              = 1.1
 
 # ============================
 # List of transit cities considered in the problem
@@ -34,9 +50,32 @@ max_charge_power    = 5
 
 [[transit]]
 city                = "GrandeEntree"
-arrival_datetime    = "2024-03-22T13:30"#"2024-03-22T08:30"
+arrival_datetime    = "2024-03-22T12:30"#"2024-03-22T08:30"
 departure_datetime  = "2024-03-22T18:00"
 lat                 = 45.970663
 lon                 = -62.350969
 power_cost          = 36.81
 max_charge_power    = 5
+# ============================
+[[auxiliary_load]]
+power = 0.1
+until = "2024-03-21T18:00"
+
+[[auxiliary_load]]
+power = 0.08
+until = "2024-03-22T18:00"
+
+[[auxiliary_load]]
+power = 0.11
+
+# ============================
+# [[speed_limit]]
+# zone = 3
+# speed = 10.0
+# until = "2024-03-21T18:00"
+
+# [[speed_limit]]
+# zone = 3
+# speed = 5.0
+# from = "2024-03-21T18:00"
+# until = "2024-03-22T18:00"
