@@ -112,12 +112,12 @@ wake_fraction   = 0.3
 # leak          : (/1)
 # ============================
 [battery]
-capacity        = 10
-max_charge_pow  = 3
-max_discharge_pow= 3
+capacity        = 3
+max_charge_pow  = 2
+max_discharge_pow= 2
 discharge_eff   = 0.95
 charge_eff      = 0.95
-leak            = 0.9995
+leak            = 0.9998
 
 # ============================
 # SOLAR PANNELS
@@ -137,8 +137,7 @@ NOCT            = 42
 # ============================
 [[generators]]
 name            = "Gen1"
-#power           = [0.28, 0.56, 1.4, 1.96, 2.08, 2.4, 2.8]
-power           = [0.28, 5.6, 14, 19.6, 20.8, 24, 28]
+power           = [0.28, 0.56, 1.4, 1.96, 2.08, 2.4, 2.8]
 eff             = [232, 215, 185, 180, 183, 185, 190]
 iddle_fuel      = 9.52
 

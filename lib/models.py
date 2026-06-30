@@ -9,8 +9,6 @@ import matplotlib.pyplot as plt
 import pickle
 import math
 import os
-
-
 from lib.load_params import Ship, Generator
 from lib.paths import B_SERIES_CQ, B_SERIES_CT, PLOTS
 from lib.utils import bisection
@@ -20,9 +18,16 @@ from lib.plotting import (
     _save_and_maybe_show,
 )
 
-
 eps = 1e-6
+RESISTANCE_BIG_M_SAFETY = 0.5
 
+
+def _finalize_resistance_big_m(model):
+    model.big_m_resistance = float(
+        np.nanmax(model.max_convex_resistance)
+        - np.nanmin(model.min_convex_resistance)
+        + RESISTANCE_BIG_M_SAFETY
+    )
 @dataclass
 class FitRange:
     min_speed: float
@@ -51,8 +56,12 @@ class FitRange:
         cls,
         sol,
         ship: Ship,
-        lower_factor: float = 0.8,
-        upper_factor: float = 1.2,
+        lower_speed_factor: float = 0.8,
+        upper_speed_factor: float = 1.2,
+        lower_res_factor: float = 0.8,
+        upper_res_factor: float = 1.2,
+        lower_prop_factor: float = 0.8,
+        upper_prop_factor: float = 1.2,
         eps: float = 1e-9,
     ) -> "FitRange":
         seg_dt_h = np.asarray(sol.segment_dt_h, dtype=float)
@@ -80,27 +89,27 @@ class FitRange:
         min_prop_pow_physical = ship.propulsion.min_pow * ship.propulsion.nb_propellers
 
         return cls(
-            min_speed=max(1.0, lower_factor * float(np.nanmax(valid_speed_rel))),
+            min_speed=max(1.0, lower_speed_factor * float(np.nanmax(valid_speed_rel))),
             max_speed=min(
                 float(ship.info.max_speed),
-                upper_factor * float(speed_max_source),
+                upper_speed_factor * float(speed_max_source),
             ),
-            min_resistance=min(
+            min_resistance=max(
                 eps,
-                lower_factor * float(np.nanmax(valid_resistance)),
+                lower_res_factor * float(np.nanmax(valid_resistance)),
             ),
             max_resistance=max(
                 eps,
-                upper_factor * float(np.nanmax(valid_resistance)),
+                upper_res_factor * float(np.nanmax(valid_resistance)),
             ),
             min_prop_power=max(
                 0.0,
-                lower_factor * float(np.nanmax(valid_prop_power)),
+                lower_prop_factor * float(np.nanmax(valid_prop_power)),
                 float(min_prop_pow_physical),
             ),
             max_prop_power=min(
                 float(max_prop_pow_physical),
-                upper_factor * float(np.nanmax(valid_prop_power)),
+                upper_prop_factor * float(np.nanmax(valid_prop_power)),
             ),
         )
 
@@ -688,26 +697,6 @@ class CalmWaterModel:
         _save_and_maybe_show(fig, "calm_water_resistance_comparison", show, directory=plot_dir, font_scale=2)
 
 
-
-def compute_rel_wind_speed_and_rel_attack_angle(wind_speed_vector,ship_speed_vector):
-    heading = np.pi/2-np.atan2(ship_speed_vector[1],ship_speed_vector[0]) #heading in the north=0, clockwise referential
-    Beta_Vw = np.pi/2-np.atan2(wind_speed_vector[1],wind_speed_vector[0]) #wind_angle in the north=0, clockwise referential
-
-    wind_speed = np.linalg.norm(wind_speed_vector)
-    ship_speed = np.linalg.norm(ship_speed_vector)
-
-    u_w = wind_speed*np.cos(Beta_Vw-heading)
-    v_w = wind_speed*np.sin(Beta_Vw-heading)
-
-    u_rw = ship_speed-u_w
-    v_rw = 0 - v_w          #sway assumed 0
-
-    V_rw = np.sqrt(np.square(u_rw)+np.square(v_rw)) #relative wind speed
-    gamma_rw = -np.atan2(v_rw,u_rw)                 #relative angle of attack
-
-    return V_rw, gamma_rw
-
-
 @dataclass
 class BaseWindModel:
     "Blendermann (1986, 1994), MSS notes chap 10"
@@ -716,6 +705,8 @@ class BaseWindModel:
     thrust_coeffs: Optional[np.ndarray] = field(default=None, init=False)
     relative_errors: Optional[np.ndarray] = field(default=None, init=False)
     max_convex_resistance: Optional[np.ndarray] = field(default=None, init=False)
+    min_convex_resistance: Optional[np.ndarray] = field(default=None, init=False)
+    big_m_resistance: Optional[float] = field(default=None, init=False)
     
     def compute_resistance(self,
                     wind_speed_vector, #eastward, northward wind speed m/s [vx, vy]
@@ -789,6 +780,7 @@ class WindModel2D(BaseWindModel):
         constraints += [param_vy_2>=eps]
         constraints += [param_vx_4>=eps]
         constraints += [param_vy_4>=eps]
+        constraints += [param_vs>=eps]
         constraints += [param_vs_2>=eps]
         constraints += [param_vs_3>=eps]
         constraints += [param_vs_4>=eps]
@@ -879,7 +871,7 @@ class WindModel2D(BaseWindModel):
             param_vy_2.value,
             param_vy_4.value,
         ])
-        return np.nanmax(abs_err),coeffs, max(R_fit.value[mask])
+        return np.nanmax(abs_err),coeffs, min(R_fit.value[mask]), max(R_fit.value[mask])
 
     def fit_convex_models(
         #fit convex wind models for every zone and timestep combination based on weather
@@ -893,11 +885,13 @@ class WindModel2D(BaseWindModel):
         self.thrust_coeffs      = np.zeros((nb_zones,nb_timesteps,11))
         self.relative_errors    = np.zeros((nb_zones,nb_timesteps))
         self.max_convex_resistance    = np.zeros((nb_zones,nb_timesteps))
+        self.min_convex_resistance    = np.zeros((nb_zones,nb_timesteps))
 
         for iz in range(nb_zones):
             for it in range(nb_timesteps):
-                self.relative_errors[iz,it], self.thrust_coeffs[iz,it,:],self.max_convex_resistance[iz,it] = self.fit_convex_model(wind_speed_x[iz,it],wind_speed_y[iz,it],debug=False)
+                self.relative_errors[iz,it], self.thrust_coeffs[iz,it,:], self.min_convex_resistance[iz,it], self.max_convex_resistance[iz,it] = self.fit_convex_model(wind_speed_x[iz,it],wind_speed_y[iz,it],debug=False)
             print("zone", iz, "fitted")
+        _finalize_resistance_big_m(self)
 
 @dataclass
 class WindModel1D(BaseWindModel):
@@ -933,6 +927,7 @@ class WindModel1D(BaseWindModel):
         intercept = cp.Variable()
 
         constraints = []
+        constraints += [param_vs>=eps]
         constraints += [param_vs_2>=eps]
         constraints += [param_vs_3>=eps]
         constraints += [param_vs_4>=eps]
@@ -957,7 +952,7 @@ class WindModel1D(BaseWindModel):
             param_vs_3.value,
             param_vs_4.value,
         ])
-        return np.nanmax(abs_err),coeffs, max(R_fit.value)
+        return np.nanmax(abs_err),coeffs, min(R_fit.value), max(R_fit.value)
 
     def fit_convex_models(
         #fit convex wind models for every zone and timestep combination based on weather
@@ -973,11 +968,13 @@ class WindModel1D(BaseWindModel):
         self.thrust_coeffs      = np.zeros((nb_zones,nb_timesteps,5))
         self.relative_errors    = np.zeros((nb_zones,nb_timesteps))
         self.max_convex_resistance    = np.zeros((nb_zones,nb_timesteps))
+        self.min_convex_resistance    = np.zeros((nb_zones,nb_timesteps))
 
         for iz in range(nb_zones):
             for it in range(nb_timesteps):
-                self.relative_errors[iz,it], self.thrust_coeffs[iz,it,:],self.max_convex_resistance[iz,it] = self.fit_convex_model(wind_speed_x[iz,it],wind_speed_y[iz,it], course_angles[iz,it], nb_steps=nb_steps, debug=debug)
+                self.relative_errors[iz,it], self.thrust_coeffs[iz,it,:], self.min_convex_resistance[iz,it], self.max_convex_resistance[iz,it] = self.fit_convex_model(wind_speed_x[iz,it],wind_speed_y[iz,it], course_angles[iz,it], nb_steps=nb_steps, debug=debug)
             print("zone", iz, "fitted")
+        _finalize_resistance_big_m(self)
 
 @dataclass
 class WindModelPathAligned2D(BaseWindModel):
@@ -1066,6 +1063,7 @@ class WindModelPathAligned2D(BaseWindModel):
         param_vy_4 = cp.Variable()
 
         constraints = [
+            param_vs >= eps,
             param_vs_2 >= eps,
             param_vs_3 >= eps,
             param_vs_4 >= eps,
@@ -1122,6 +1120,7 @@ class WindModelPathAligned2D(BaseWindModel):
         return (
             float(np.nanmax(abs_err)),
             coeffs,
+            float(np.nanmin(R_fit.value)),
             float(np.nanmax(R_fit.value)),
             float(np.nanmean(np.abs(Resistance))),
             float(np.nanmax(np.abs(Resistance))),
@@ -1150,6 +1149,7 @@ class WindModelPathAligned2D(BaseWindModel):
         self.thrust_coeffs = np.zeros((nb_segments, nb_timesteps, 11))
         self.relative_errors = np.zeros((nb_segments, nb_timesteps))
         self.max_convex_resistance = np.zeros((nb_segments, nb_timesteps))
+        self.min_convex_resistance = np.zeros((nb_segments, nb_timesteps))
         self.mean_true_resistance = np.zeros((nb_segments, nb_timesteps))
         self.max_true_resistance = np.zeros((nb_segments, nb_timesteps))
 
@@ -1176,6 +1176,7 @@ class WindModelPathAligned2D(BaseWindModel):
                 (
                     err,
                     coeffs,
+                    min_fit,
                     max_fit,
                     mean_true,
                     max_true,
@@ -1198,6 +1199,7 @@ class WindModelPathAligned2D(BaseWindModel):
 
                 self.relative_errors[s, t] = err
                 self.thrust_coeffs[s, t, :] = coeffs
+                self.min_convex_resistance[s, t] = min_fit
                 self.max_convex_resistance[s, t] = max_fit
                 self.mean_true_resistance[s, t] = mean_true
                 self.max_true_resistance[s, t] = max_true
@@ -1246,6 +1248,8 @@ class WindModelPathAligned2D(BaseWindModel):
                 fig.tight_layout()
                 plt.show()
 
+        _finalize_resistance_big_m(self)
+
 
 @dataclass
 class BaseWaveModel:
@@ -1257,6 +1261,8 @@ class BaseWaveModel:
     thrust_coeffs: Optional[np.ndarray] = field(default=None, init=False)
     relative_errors: Optional[np.ndarray] = field(default=None, init=False)
     max_convex_resistance : Optional[np.ndarray] = field(default=None, init=False)
+    min_convex_resistance : Optional[np.ndarray] = field(default=None, init=False)
+    big_m_resistance : Optional[float] = field(default=None, init=False)
 
     @staticmethod
     def compute_wave_relative_angle_encounter(
@@ -1464,6 +1470,7 @@ class WaveModel1D(BaseWaveModel):
         intercept = cp.Variable()
 
         constraints = []
+        constraints += [param_vs>=eps]
         constraints += [param_vs_2>=eps]
         constraints += [param_vs_3>=eps]
         constraints += [param_vs_4>=eps]
@@ -1489,7 +1496,7 @@ class WaveModel1D(BaseWaveModel):
             param_vs_4.value,
         ])
 
-        return np.nanmax(abs_err),coeffs, max(R_fit.value)
+        return np.nanmax(abs_err),coeffs, min(R_fit.value), max(R_fit.value)
 
     def fit_convex_models(
         #fit convex wave models for every zone and timestep combination based on weather
@@ -1505,11 +1512,13 @@ class WaveModel1D(BaseWaveModel):
         self.thrust_coeffs      = np.zeros((nb_zones,nb_timesteps,5))
         self.relative_errors    = np.zeros((nb_zones,nb_timesteps))
         self.max_convex_resistance = np.zeros((nb_zones,nb_timesteps))
+        self.min_convex_resistance = np.zeros((nb_zones,nb_timesteps))
 
         for iz in range(nb_zones):
             for it in range(nb_timesteps):
-                self.relative_errors[iz,it], self.thrust_coeffs[iz,it,:],self.max_convex_resistance[iz,it] = self.fit_convex_model(mean_wave_amplitudes[iz,it],mean_wave_frequency[iz,it],mean_wave_length[iz,it],mean_wave_direction[iz,it], course_angles[iz,it], debug=False)
+                self.relative_errors[iz,it], self.thrust_coeffs[iz,it,:], self.min_convex_resistance[iz,it], self.max_convex_resistance[iz,it] = self.fit_convex_model(mean_wave_amplitudes[iz,it],mean_wave_frequency[iz,it],mean_wave_length[iz,it],mean_wave_direction[iz,it], course_angles[iz,it], debug=False)
             print("zone", iz, "fitted")
+        _finalize_resistance_big_m(self)
 
 @dataclass
 class WaveModel2D(BaseWaveModel):
@@ -1580,6 +1589,7 @@ class WaveModel2D(BaseWaveModel):
         constraints += [param_vy_2>=eps]
         constraints += [param_vx_4>=eps]
         constraints += [param_vy_4>=eps]
+        constraints += [param_vs>=eps]
         constraints += [param_vs_2>=eps]
         constraints += [param_vs_3>=eps]
         constraints += [param_vs_4>=eps]
@@ -1646,7 +1656,7 @@ class WaveModel2D(BaseWaveModel):
             param_vy_4.value,
         ])
 
-        return np.nanmax(abs_err),coeffs, max(R_fit.value[mask])
+        return np.nanmax(abs_err),coeffs, min(R_fit.value[mask]), max(R_fit.value[mask])
 
     def fit_convex_models(
         #fit convex wave models for every zone and timestep combination based on weather
@@ -1661,11 +1671,13 @@ class WaveModel2D(BaseWaveModel):
         self.thrust_coeffs      = np.zeros((nb_zones,nb_timesteps,11))
         self.relative_errors    = np.zeros((nb_zones,nb_timesteps))
         self.max_convex_resistance = np.zeros((nb_zones,nb_timesteps))
+        self.min_convex_resistance = np.zeros((nb_zones,nb_timesteps))
 
         for iz in range(nb_zones):
             for it in range(nb_timesteps):
-                self.relative_errors[iz,it], self.thrust_coeffs[iz,it,:],self.max_convex_resistance[iz,it] = self.fit_convex_model(mean_wave_amplitudes[iz,it],mean_wave_frequency[iz,it],mean_wave_length[iz,it],mean_wave_direction[iz,it],debug=False)
+                self.relative_errors[iz,it], self.thrust_coeffs[iz,it,:], self.min_convex_resistance[iz,it], self.max_convex_resistance[iz,it] = self.fit_convex_model(mean_wave_amplitudes[iz,it],mean_wave_frequency[iz,it],mean_wave_length[iz,it],mean_wave_direction[iz,it],debug=False)
             print("zone", iz, "fitted")
+        _finalize_resistance_big_m(self)
 
 @dataclass
 class WaveModelPathAligned2D(BaseWaveModel):
@@ -1760,6 +1772,7 @@ class WaveModelPathAligned2D(BaseWaveModel):
         param_vy_4 = cp.Variable()
 
         constraints = [
+            param_vs >= eps,
             param_vs_2 >= eps,
             param_vs_3 >= eps,
             param_vs_4 >= eps,
@@ -1815,6 +1828,7 @@ class WaveModelPathAligned2D(BaseWaveModel):
         return (
             float(np.nanmax(abs_err)),
             coeffs,
+            float(np.nanmin(R_fit.value)),
             float(np.nanmax(R_fit.value)),
             float(np.nanmean(np.abs(Resistance))),
             float(np.nanmax(np.abs(Resistance))),
@@ -1845,6 +1859,7 @@ class WaveModelPathAligned2D(BaseWaveModel):
         self.thrust_coeffs = np.zeros((nb_segments, nb_timesteps, 11))
         self.relative_errors = np.zeros((nb_segments, nb_timesteps))
         self.max_convex_resistance = np.zeros((nb_segments, nb_timesteps))
+        self.min_convex_resistance = np.zeros((nb_segments, nb_timesteps))
         self.mean_true_resistance = np.zeros((nb_segments, nb_timesteps))
         self.max_true_resistance = np.zeros((nb_segments, nb_timesteps))
 
@@ -1871,10 +1886,11 @@ class WaveModelPathAligned2D(BaseWaveModel):
                     conservative=conservative,
                 )
 
-                err, coeffs, max_fit, mean_true, max_true, A, b, VX, VY, Rtrue, Rfit, E = out
+                err, coeffs, min_fit, max_fit, mean_true, max_true, A, b, VX, VY, Rtrue, Rfit, E = out
 
                 self.relative_errors[s, t] = err
                 self.thrust_coeffs[s, t, :] = coeffs
+                self.min_convex_resistance[s, t] = min_fit
                 self.max_convex_resistance[s, t] = max_fit
                 self.mean_true_resistance[s, t] = mean_true
                 self.max_true_resistance[s, t] = max_true
@@ -1916,6 +1932,8 @@ class WaveModelPathAligned2D(BaseWaveModel):
                 fig.tight_layout()
                 plt.show()
 
+        _finalize_resistance_big_m(self)
+
 @dataclass
 class PropulsionModel:
     """
@@ -1925,6 +1943,7 @@ class PropulsionModel:
     grid_granularity : np.int
     pitch_granularity : np.int
     fit_range : FitRange 
+    show_initial_power_surface: bool = False
 
     # B-series coefficients
     KQ_coeff = pd.read_csv(B_SERIES_CQ)
@@ -1986,30 +2005,24 @@ class PropulsionModel:
                 mask[i, j] = feasible
                 P_real[i, j] = p
             progress = (i + 1) / self.T.shape[0]
-            print(
-                f"[PropulsionModel] Computing real power grid: "
-                f"{100*progress:5.1f}% | "
-                f"row {i+1}/{self.T.shape[0]} | "
-            )
         self.mask_feasible_n = mask
         self.P_real = P_real
 
-        # Create figure
-        fig = plt.figure(figsize=(12, 9))
-        ax = fig.add_subplot(111, projection="3d")
-        # Plot REAL surface
-        ax.plot_surface(
-            self.U , self.T, P_real,
-            cmap="viridis", alpha=0.7,
-            linewidth=0, antialiased=True,
-            label="Real"
-        )
-        ax.set_xlabel("Speed [m/s]")
-        ax.set_ylabel("Thrust [MN]")
-        ax.set_zlabel("Power [MW]")
-        ax.set_title("Real (B-series) vs Fitted Convex Power Model")
-        plt.tight_layout()
-        plt.show()
+        if self.show_initial_power_surface:
+            fig = plt.figure(figsize=(12, 9))
+            ax = fig.add_subplot(111, projection="3d")
+            ax.plot_surface(
+                self.U, self.T, P_real,
+                cmap="viridis", alpha=0.7,
+                linewidth=0, antialiased=True,
+                label="Real",
+            )
+            ax.set_xlabel("Speed [m/s]")
+            ax.set_ylabel("Thrust [MN]")
+            ax.set_zlabel("Power [MW]")
+            ax.set_title("Real B-series Power Surface")
+            plt.tight_layout()
+            plt.show()
 
         
     #=======================================Physical computations===================================================

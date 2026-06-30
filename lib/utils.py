@@ -2,15 +2,7 @@ import math
 import numpy as np
 import pandas as pd
 from pyproj import Geod
-import cvxpy as cp
-import matplotlib.pyplot as plt
 GEOD = Geod(ellps="WGS84")
-from lib.paths import ADJ, ZONES
-
-
-#===========================Check if points are in zones=======================================================================================
-import numpy as np
-import matplotlib.pyplot as plt
 
 def _assert_finite(name, arr):
     arr = np.asarray(arr)
@@ -87,64 +79,6 @@ def _compute_tight_big_M_zone(map_obj, zone_ineq, safety_margin=1.0):
         big_M[z] = min_val - safety_margin
 
     return big_M
-
-def _compute_tight_big_M_transition(map_obj, trans_ineq, safety_margin=1.0):
-    """
-    Compute tight Big-M values for transition inequalities:
-        a_y*y + a_x*x + a_c >= M[z, iz] * (2 - zone[t,z] - zone[t+1,iz])
-
-    Parameters
-    ----------
-    map_obj : Map
-        Map object with span_km_east, span_km_north, nb_zones.
-    trans_ineq : np.ndarray
-        Shape (n_ineq, 3, nb_zones, nb_zones)
-        trans_ineq[k,0,z,iz] = Ay
-        trans_ineq[k,1,z,iz] = Ax
-        trans_ineq[k,2,z,iz] = Ac
-    safety_margin : float
-        Extra negative slack added to guarantee deactivation.
-
-    Returns
-    -------
-    np.ndarray
-        Shape (nb_zones, nb_zones)
-        Entry [z, iz] is the tightest valid disabling Big-M for all inequalities
-        associated with transition z -> iz.
-        If there are no inequalities for a pair, returns 0 for that pair.
-    """
-    nb_zones = map_obj.nb_zones
-    x_max = map_obj.info.span_km_east
-    y_max = map_obj.info.span_km_north
-
-    corners = np.array([
-        [0.0,   0.0],    # bottom-left
-        [x_max, 0.0],    # bottom-right
-        [0.0,   y_max],  # top-left
-        [x_max, y_max],  # top-right
-    ])
-
-    n_ineq = trans_ineq.shape[0]
-    big_M = np.zeros((nb_zones, nb_zones))
-
-    for z in range(nb_zones):
-        for iz in range(nb_zones):
-            coeffs = trans_ineq[:, :, z, iz]   # shape (n_ineq, 3)
-
-            # Skip empty transition blocks
-            if not np.any(coeffs):
-                big_M[z, iz] = 0.0
-                continue
-
-            min_val = np.inf
-            for x, y in corners:
-                vals = coeffs[:, 0] * y + coeffs[:, 1] * x + coeffs[:, 2]
-                min_val = min(min_val, np.min(vals))
-
-            big_M[z, iz] = min_val - safety_margin
-
-    return big_M
-
 
 
 def _ordered_zone_corner_ids(zone_corners_df: pd.DataFrame) -> dict[int, list[int]]:
@@ -334,8 +268,7 @@ def _compute_min_crossing_distance_per_zone(corners_path, zone_corners_path) -> 
 
 def _compute_min_zone_timesteps(corners_path, zone_corners_path, ship_max_speed_mps: float, timestep_h: float) -> dict[int, int]:
     """
-    Convert min crossing distance [km] into minimum required number of timesteps. 
-    Re-factor needed : Corners should be stored in the map object and this function should use it.
+    Convert min crossing distance [km] into minimum required number of timesteps.
     """
     if ship_max_speed_mps <= 0:
         raise ValueError("ship_max_speed_mps must be > 0.")
@@ -418,62 +351,6 @@ def dx_dy_km(map, lat, lon):
     dx = s_km * math.sin(th)  # East
     dy = s_km * math.cos(th)  # North
     return dx, dy, s_km
-
-def build_or_load_adjacency_matrix(n_zones=None, cache=True):
-    """
-    Return a (Z,Z) adjacency matrix Adj with 1 if transition z->z' is allowed.
-    Zones are adjacent iff they share at least 2 corner_id values.
-    Diagonal is 1 (stay).
-    """
-    zones_csv  = ZONES
-    cache_path = ADJ
-    
-
-    # Try cache first
-    if cache and cache_path.exists():
-        adj = np.load(cache_path)
-        if n_zones is None or adj.shape[0] == n_zones:
-            return adj
-
-    # Load CSV
-    df = pd.read_csv(zones_csv)
-    df = df.rename(columns={c: c.strip() for c in df.columns})
-    required = {"zone_id", "corner_id"}
-    if not required.issubset(df.columns):
-        raise ValueError(f"zones CSV missing columns: {required - set(df.columns)}")
-
-    df[["zone_id", "corner_id"]] = df[["zone_id", "corner_id"]].astype(int)
-
-    # Collect corners per zone_id
-    corners_per_zone = {
-        zid: set(grp["corner_id"].to_list())
-        for zid, grp in df.groupby("zone_id")
-    }
-
-    # Determine Z (number of zones to output)
-    Z = n_zones if n_zones is not None else (max(corners_per_zone) if corners_per_zone else 0)
-    adj = np.zeros((Z, Z), dtype=int)
-    np.fill_diagonal(adj, 1)  # staying in same zone is allowed
-
-    # Check pairwise intersections
-    for zid1, c1 in corners_per_zone.items():
-        for zid2, c2 in corners_per_zone.items():
-            if zid2 <= zid1:
-                continue
-            if len(c1 & c2) >= 2:
-                i, j = zid1, zid2
-                if i < Z and j < Z:
-                    adj[i, j] = 1
-                    adj[j, i] = 1
-
-    if cache:
-        try:
-            np.save(cache_path, adj)
-        except Exception:
-            pass
-
-    return adj
-
 
 def classify_timesteps(itinerary):
     """
@@ -619,6 +496,9 @@ def build_variable_timestep_grid(itinerary, states=None, eps=1e-9):
         ports.append((arr, dep, p))
         event_times.extend([arr, dep])
 
+    for band in getattr(itinerary, "auxiliary_load_bands", []):
+        event_times.extend([pd.to_datetime(band["start"]), pd.to_datetime(band["end"])])
+
     base_boundaries = [
         itinerary_start + k * base_dt
         for k in range(completed, nb_base + 1)
@@ -687,8 +567,6 @@ def build_variable_timestep_grid(itinerary, states=None, eps=1e-9):
     }
 
 
-    
-
 def compute_port_zone_indices(map, itinerary):
     nb_zones = map.nb_zones
     port_zone_idx = []
@@ -742,6 +620,59 @@ def bisection(f, a, b, tol=1e-6, max_iter=60):
 
     return 0.5*(a + b)  # Return best approximation
 
+
+
+def _path_segment_index(distance_breaks_km, d_km):
+    if d_km >= distance_breaks_km[-1]:
+        return len(distance_breaks_km) - 2
+    s = np.searchsorted(distance_breaks_km, d_km, side="right") - 1
+    return int(np.clip(s, 0, len(distance_breaks_km) - 2))
+
+
+def _active_speed_limit_mps(map_obj, zone_idx, midpoint, ship_max_speed_mps):
+    limit = float(ship_max_speed_mps)
+    for band in getattr(map_obj, "speed_limit_bands", []) or []:
+        if int(zone_idx) not in band.get("zones", []):
+            continue
+        start = band.get("start")
+        end = band.get("end")
+        if (start is None or midpoint >= start) and (end is None or midpoint < end):
+            limit = min(limit, float(band["speed"]))
+    return limit
+
+
+def _balanced_speed_profile_mps(total_distance_km, timestep_dt_h, interval_sail_fraction, caps_mps, eps):
+    sail_h = np.asarray(timestep_dt_h, dtype=float) * np.asarray(interval_sail_fraction, dtype=float)
+    caps_kmh = np.asarray(caps_mps, dtype=float) * 3.6
+    speed_kmh = np.zeros_like(sail_h, dtype=float)
+    active = sail_h > eps
+
+    if not np.any(active):
+        return speed_kmh / 3.6, 0.0
+
+    max_distance_km = float(np.sum(caps_kmh[active] * sail_h[active]))
+    if total_distance_km > max_distance_km + 1e-9:
+        speed_kmh[active] = caps_kmh[active]
+        print(
+            "WARNING: speed limits make the naive reference infeasible. "
+            f"Maximum capped distance is {max_distance_km:.3f} km, "
+            f"but the path requires {total_distance_km:.3f} km."
+        )
+        return speed_kmh / 3.6, float(np.max(speed_kmh[active]) / 3.6)
+
+    lo = 0.0
+    hi = float(np.max(caps_kmh[active]))
+    for _ in range(80):
+        mid = 0.5 * (lo + hi)
+        dist = float(np.sum(np.minimum(mid, caps_kmh[active]) * sail_h[active]))
+        if dist < total_distance_km:
+            lo = mid
+        else:
+            hi = mid
+
+    common_kmh = hi
+    speed_kmh[active] = np.minimum(common_kmh, caps_kmh[active])
+    return speed_kmh / 3.6, common_kmh / 3.6
 
 
 def build_constant_speed_path_reference(
@@ -814,25 +745,64 @@ def build_constant_speed_path_reference(
     total_distance_km = float(distance_breaks_km[-1])
 
     sailing_time_h = float(np.sum(interval_sail_fraction * timestep_dt_h))
-    constant_speed_kmh = total_distance_km / sailing_time_h if sailing_time_h > eps else 0.0
-    constant_speed_mps = constant_speed_kmh * 1000.0 / 3600.0
+    nominal_speed_kmh = total_distance_km / sailing_time_h if sailing_time_h > eps else 0.0
+    nominal_speed_mps = nominal_speed_kmh * 1000.0 / 3600.0
 
-    if ship is not None and constant_speed_mps > ship.info.max_speed + 1e-9:
+    if ship is not None and nominal_speed_mps > ship.info.max_speed + 1e-9:
         print(
             "WARNING: required constant speed "
-            f"{constant_speed_mps:.3f} m/s exceeds ship.info.max_speed "
+            f"{nominal_speed_mps:.3f} m/s exceeds ship.info.max_speed "
             f"{ship.info.max_speed:.3f} m/s."
         )
+
+    nominal_path_distance = np.zeros(T_future + 1, dtype=float)
+    for t in range(T_future):
+        nominal_path_distance[t + 1] = (
+            nominal_path_distance[t]
+            + nominal_speed_kmh
+            * timestep_dt_h[t]
+            * float(interval_sail_fraction[t])
+        )
+    nominal_path_distance = np.clip(nominal_path_distance, 0.0, total_distance_km)
+    nominal_path_distance[-1] = total_distance_km
+
+    if ship is not None:
+        itinerary_start = pd.to_datetime(itinerary.transits[0].arrival_datetime)
+        speed_limit_mps = np.full(T_future, float(ship.info.max_speed), dtype=float)
+        for t in range(T_future):
+            if interval_sail_fraction[t] <= eps:
+                continue
+            d_mid = 0.5 * (nominal_path_distance[t] + nominal_path_distance[t + 1])
+            s = _path_segment_index(distance_breaks_km, d_mid)
+            midpoint = itinerary_start + pd.to_timedelta(float(timestep_mid_offset_h[t]), unit="h")
+            speed_limit_mps[t] = _active_speed_limit_mps(
+                map_obj,
+                int(path_zone_ids[s]),
+                midpoint,
+                float(ship.info.max_speed),
+            )
+        speed_profile_mps, constant_speed_mps = _balanced_speed_profile_mps(
+            total_distance_km,
+            timestep_dt_h,
+            interval_sail_fraction,
+            speed_limit_mps,
+            eps,
+        )
+    else:
+        speed_limit_mps = np.full(T_future, np.inf, dtype=float)
+        speed_profile_mps = np.full(T_future, nominal_speed_mps, dtype=float)
+        constant_speed_mps = nominal_speed_mps
+    constant_speed_kmh = constant_speed_mps * 3.6
 
     path_distance = np.zeros(T_future + 1, dtype=float)
     for t in range(T_future):
         path_distance[t + 1] = (
             path_distance[t]
-            + constant_speed_kmh
+            + speed_profile_mps[t]
+            * 3.6
             * timestep_dt_h[t]
             * float(interval_sail_fraction[t])
         )
-
     path_distance = np.clip(path_distance, 0.0, total_distance_km)
     path_distance[-1] = total_distance_km
 
@@ -842,12 +812,7 @@ def build_constant_speed_path_reference(
 
     zone = np.zeros((T_future + 1, map_obj.nb_zones), dtype=float)
     for t, d_km in enumerate(path_distance):
-        if d_km >= distance_breaks_km[-1]:
-            s = len(distance_breaks_km) - 2
-        else:
-            s = np.searchsorted(distance_breaks_km, d_km, side="right") - 1
-            s = int(np.clip(s, 0, len(segment_lengths_km) - 1))
-
+        s = _path_segment_index(distance_breaks_km, d_km)
         zone[t, int(path_zone_ids[s])] = 1.0
 
     ship_speed = np.zeros((T_future, 2), dtype=float)
@@ -862,16 +827,12 @@ def build_constant_speed_path_reference(
         if d1 <= d0 + eps:
             continue
 
-        speed_mag[t] = constant_speed_mps
+        speed_mag[t] = speed_profile_mps[t]
 
         d_mid = 0.5 * (d0 + d1)
-        if d_mid >= distance_breaks_km[-1]:
-            s = len(distance_breaks_km) - 2
-        else:
-            s = np.searchsorted(distance_breaks_km, d_mid, side="right") - 1
-            s = int(np.clip(s, 0, len(segment_dirs) - 1))
+        s = _path_segment_index(distance_breaks_km, d_mid)
 
-        ship_speed[t, :] = constant_speed_mps * segment_dirs[s, :]
+        ship_speed[t, :] = speed_profile_mps[t] * segment_dirs[s, :]
 
     return {
         "instant_sail": instant_sail,
@@ -893,6 +854,8 @@ def build_constant_speed_path_reference(
         "total_distance_km": total_distance_km,
         "constant_speed_kmh": constant_speed_kmh,
         "constant_speed_mps": constant_speed_mps,
+        "nominal_constant_speed_mps": nominal_speed_mps,
+        "speed_limit_mps": speed_limit_mps,
     }
 
 
