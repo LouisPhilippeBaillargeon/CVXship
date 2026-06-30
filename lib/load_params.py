@@ -5,7 +5,7 @@ from typing import List
 import tomllib
 import math
 
-from lib.utils import build_or_load_adjacency_matrix, dx_dy_km, point_in_zones
+from lib.utils import build_or_load_adjacency_matrix, build_variable_timestep_grid, dx_dy_km, point_in_zones
 from lib.paths import SHIP, MAP_TOML, ITINERARY, ZONE_INEQ, TRANSITION_INEQ, ADJ
 from lib.weather import weather_from_nc_file
 
@@ -265,10 +265,20 @@ class Itinerary:
     soc_f              : float
     timestep           : float
     init_speed         : float
+    base_nb_timesteps  : int
     nb_timesteps       : int
     target_x_pos       : float
     target_y_pos       : float
     fuel_price         : float
+    time_points             : np.ndarray = field(default_factory=lambda: np.array([], dtype=object))
+    timestep_dt_h           : np.ndarray = field(default_factory=lambda: np.array([], dtype=float))
+    timestep_start_offset_h : np.ndarray = field(default_factory=lambda: np.array([], dtype=float))
+    timestep_mid_offset_h   : np.ndarray = field(default_factory=lambda: np.array([], dtype=float))
+    timestep_end_offset_h   : np.ndarray = field(default_factory=lambda: np.array([], dtype=float))
+    instant_sail            : np.ndarray = field(default_factory=lambda: np.array([], dtype=bool))
+    port_idx                : np.ndarray = field(default_factory=lambda: np.array([], dtype=int))
+    interval_sail_fraction  : np.ndarray = field(default_factory=lambda: np.array([], dtype=float))
+    interval_port_idx       : np.ndarray = field(default_factory=lambda: np.array([], dtype=int))
 
 
 def load_itinerary(map) -> Itinerary:
@@ -295,27 +305,41 @@ def load_itinerary(map) -> Itinerary:
             )
         )
 
-        # ---- compute nb_timesteps ----
-        start = transit_list[0].arrival_datetime 
-        end   = transit_list[-1].departure_datetime
-        total_hours = (pd.to_datetime(end) - pd.to_datetime(start)).total_seconds() / 3600
-        nb_timesteps = math.floor(total_hours / timestep)
+    # ---- compute nominal-grid timestep count ----
+    start = transit_list[0].arrival_datetime
+    end = transit_list[-1].departure_datetime
+    total_hours = (pd.to_datetime(end) - pd.to_datetime(start)).total_seconds() / 3600
+    base_nb_timesteps = math.ceil(total_hours / timestep - 1e-12)
 
-        # ---- Start and end positions ----
-        target_x_pos, target_y_pos, _ = dx_dy_km(map, transit_list[-1].lat, transit_list[-1].lon)
+    # ---- Start and end positions ----
+    target_x_pos, target_y_pos, _ = dx_dy_km(map, transit_list[-1].lat, transit_list[-1].lon)
 
-    
-    return Itinerary(
+    itinerary = Itinerary(
         transits=transit_list,
         soc_i=soc_i,
         soc_f=soc_f,
         timestep = timestep,
         init_speed = init_speed,
-        nb_timesteps = nb_timesteps,
+        base_nb_timesteps = base_nb_timesteps,
+        nb_timesteps = base_nb_timesteps,
         target_x_pos = target_x_pos,
         target_y_pos = target_y_pos,
         fuel_price = fuel_price,
     )
+
+    grid = build_variable_timestep_grid(itinerary)
+    itinerary.time_points = grid["times"]
+    itinerary.timestep_dt_h = grid["timestep_dt_h"]
+    itinerary.timestep_start_offset_h = grid["timestep_start_offset_h"]
+    itinerary.timestep_mid_offset_h = grid["timestep_mid_offset_h"]
+    itinerary.timestep_end_offset_h = grid["timestep_end_offset_h"]
+    itinerary.instant_sail = grid["instant_sail"]
+    itinerary.port_idx = grid["port_idx"]
+    itinerary.interval_sail_fraction = grid["interval_sail_fraction"]
+    itinerary.interval_port_idx = grid["interval_port_idx"]
+    itinerary.nb_timesteps = len(itinerary.timestep_dt_h)
+
+    return itinerary
 
 
 #===================================================INITIAL STATES======================================================================================

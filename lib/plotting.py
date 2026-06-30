@@ -653,7 +653,7 @@ def _print_cost_summary_vs_benchmark(solutions, labels, benchmark_label):
                 f"{cost:>12,.6f} $   "
                 f"{solve_time:>8.2f} s   "
                 f"{percent_diff:>10.4f}%   "
-                f"(Δ = {delta:,.6f} $)"
+                f"(Delta = {delta:,.6f} $)"
             )
 
     print("=" * 80 + "\n")

@@ -482,6 +482,17 @@ def classify_timesteps(itinerary):
         port_idx                : int array,  shape [nb_timesteps+1]
         interval_sail_fraction  : float array, shape [nb_timesteps]
     """
+    if (
+        hasattr(itinerary, "instant_sail")
+        and getattr(itinerary, "instant_sail") is not None
+        and len(getattr(itinerary, "instant_sail")) > 0
+    ):
+        return (
+            np.asarray(itinerary.instant_sail, dtype=bool).copy(),
+            np.asarray(itinerary.port_idx, dtype=int).copy(),
+            np.asarray(itinerary.interval_sail_fraction, dtype=float).copy(),
+        )
+
     dt_h = itinerary.timestep
     dt   = pd.Timedelta(hours=dt_h)
 
@@ -548,6 +559,132 @@ def classify_timesteps(itinerary):
         interval_sail_fraction[t] = sail_duration.total_seconds() / dt_seconds
 
     return instant_sail, port_idx, interval_sail_fraction
+
+
+def build_variable_timestep_grid(itinerary, states=None, eps=1e-9):
+    """
+    Build an expanded timestep grid split at every arrival/departure instant.
+
+    The returned intervals are pure sailing or pure port intervals. The original
+    fixed grid boundaries are retained, so only boundary-crossing timesteps are
+    split and the horizon length can increase.
+    """
+    base_dt_h = float(itinerary.timestep)
+    base_dt = pd.Timedelta(hours=base_dt_h)
+    itinerary_start = pd.to_datetime(itinerary.transits[0].arrival_datetime)
+    itinerary_end = pd.to_datetime(itinerary.transits[-1].departure_datetime)
+    nb_base = int(getattr(itinerary, "base_nb_timesteps", itinerary.nb_timesteps))
+    horizon_end = itinerary_end
+    completed = int(getattr(states, "timesteps_completed", 0)) if states is not None else 0
+    if (
+        states is not None
+        and hasattr(itinerary, "time_points")
+        and len(getattr(itinerary, "time_points")) > 0
+        and hasattr(itinerary, "timestep_dt_h")
+        and len(getattr(itinerary, "timestep_dt_h")) > 0
+    ):
+        if completed >= len(itinerary.timestep_dt_h):
+            raise ValueError("No timesteps left; trip is finished.")
+        return {
+            "times": np.asarray(itinerary.time_points, dtype=object)[completed:],
+            "timestep_dt_h": np.asarray(itinerary.timestep_dt_h, dtype=float)[completed:],
+            "timestep_start_offset_h": np.asarray(itinerary.timestep_start_offset_h, dtype=float)[completed:],
+            "timestep_mid_offset_h": np.asarray(itinerary.timestep_mid_offset_h, dtype=float)[completed:],
+            "timestep_end_offset_h": np.asarray(itinerary.timestep_end_offset_h, dtype=float)[completed:],
+            "instant_sail": np.asarray(itinerary.instant_sail, dtype=bool)[completed:],
+            "port_idx": np.asarray(itinerary.port_idx, dtype=int)[completed:],
+            "interval_sail": np.asarray(itinerary.interval_sail_fraction, dtype=float)[completed:] > 0.5,
+            "interval_port_idx": np.asarray(itinerary.interval_port_idx, dtype=int)[completed:],
+            "interval_sail_fraction": np.asarray(itinerary.interval_sail_fraction, dtype=float)[completed:],
+            "base_dt_h": base_dt_h,
+        }
+
+    if (
+        states is not None
+        and hasattr(itinerary, "time_points")
+        and len(getattr(itinerary, "time_points")) > completed
+    ):
+        horizon_start = pd.to_datetime(itinerary.time_points[completed])
+    else:
+        horizon_start = itinerary_start + completed * base_dt
+
+    if horizon_start >= horizon_end:
+        raise ValueError("No timesteps left; trip is finished.")
+
+    ports = []
+    event_times = []
+    for p, tr in enumerate(itinerary.transits):
+        arr = pd.to_datetime(tr.arrival_datetime)
+        dep = pd.to_datetime(tr.departure_datetime)
+        ports.append((arr, dep, p))
+        event_times.extend([arr, dep])
+
+    base_boundaries = [
+        itinerary_start + k * base_dt
+        for k in range(completed, nb_base + 1)
+    ]
+
+    boundaries = [horizon_start]
+    boundaries.extend(t for t in base_boundaries if horizon_start < t <= itinerary_end)
+    boundaries.extend(t for t in event_times if horizon_start < t < itinerary_end)
+    boundaries.append(itinerary_end)
+    boundaries = sorted(set(boundaries))
+
+    filtered = [boundaries[0]]
+    for t in boundaries[1:]:
+        if (t - filtered[-1]).total_seconds() > eps:
+            filtered.append(t)
+    boundaries = filtered
+
+    def _port_at_midpoint(instant):
+        for arr, dep, p in ports:
+            if arr <= instant < dep:
+                return p
+        return -1
+
+    def _port_at_node(instant):
+        for arr, dep, p in ports:
+            if arr <= instant <= dep:
+                return p
+        return -1
+
+    T = len(boundaries) - 1
+    timestep_dt_h = np.zeros(T, dtype=float)
+    interval_sail = np.zeros(T, dtype=bool)
+    interval_port_idx = np.full(T, -1, dtype=int)
+    timestep_start_offset_h = np.zeros(T, dtype=float)
+    timestep_mid_offset_h = np.zeros(T, dtype=float)
+    timestep_end_offset_h = np.zeros(T, dtype=float)
+
+    for t in range(T):
+        a = boundaries[t]
+        b = boundaries[t + 1]
+        mid = a + (b - a) / 2
+        p = _port_at_midpoint(mid)
+
+        timestep_dt_h[t] = (b - a).total_seconds() / 3600.0
+        interval_sail[t] = p < 0
+        interval_port_idx[t] = p
+        timestep_start_offset_h[t] = (a - itinerary_start).total_seconds() / 3600.0
+        timestep_mid_offset_h[t] = (mid - itinerary_start).total_seconds() / 3600.0
+        timestep_end_offset_h[t] = (b - itinerary_start).total_seconds() / 3600.0
+
+    node_port_idx = np.array([_port_at_node(t) for t in boundaries], dtype=int)
+    instant_sail = node_port_idx < 0
+
+    return {
+        "times": np.array(boundaries, dtype=object),
+        "timestep_dt_h": timestep_dt_h,
+        "timestep_start_offset_h": timestep_start_offset_h,
+        "timestep_mid_offset_h": timestep_mid_offset_h,
+        "timestep_end_offset_h": timestep_end_offset_h,
+        "instant_sail": instant_sail,
+        "port_idx": node_port_idx,
+        "interval_sail": interval_sail,
+        "interval_port_idx": interval_port_idx,
+        "interval_sail_fraction": interval_sail.astype(float),
+        "base_dt_h": base_dt_h,
+    }
 
 
     
@@ -636,14 +773,29 @@ def build_constant_speed_path_reference(
     waypoints = np.asarray(waypoints, dtype=float)
     path_zone_ids = np.asarray(path_zone_ids, dtype=int)
 
-    T_future = itinerary.nb_timesteps - states.timesteps_completed
+    t0 = int(getattr(states, "timesteps_completed", 0))
+    if hasattr(itinerary, "timestep_dt_h") and len(getattr(itinerary, "timestep_dt_h")) > 0:
+        timestep_dt_h = np.asarray(itinerary.timestep_dt_h, dtype=float)[t0:]
+        timestep_mid_offset_h = np.asarray(itinerary.timestep_mid_offset_h, dtype=float)[t0:]
+        instant_sail = np.asarray(itinerary.instant_sail, dtype=bool)[t0:]
+        port_idx = np.asarray(itinerary.port_idx, dtype=int)[t0:]
+        interval_sail_fraction = np.asarray(itinerary.interval_sail_fraction, dtype=float)[t0:]
+        interval_port_idx = np.asarray(itinerary.interval_port_idx, dtype=int)[t0:]
+        timestep_start_offset_h = np.asarray(itinerary.timestep_start_offset_h, dtype=float)[t0:]
+        timestep_end_offset_h = np.asarray(itinerary.timestep_end_offset_h, dtype=float)[t0:]
+    else:
+        grid = build_variable_timestep_grid(itinerary, states)
+        timestep_dt_h = grid["timestep_dt_h"]
+        timestep_mid_offset_h = grid["timestep_mid_offset_h"]
+        instant_sail = grid["instant_sail"]
+        port_idx = grid["port_idx"]
+        interval_sail_fraction = grid["interval_sail_fraction"]
+        interval_port_idx = grid["interval_port_idx"]
+        timestep_start_offset_h = grid["timestep_start_offset_h"]
+        timestep_end_offset_h = grid["timestep_end_offset_h"]
+    T_future = len(timestep_dt_h)
     if T_future <= 0:
         raise ValueError("No timesteps left; trip is finished.")
-
-    instant_sail, port_idx, interval_sail_fraction = classify_timesteps(itinerary)
-    instant_sail = instant_sail[states.timesteps_completed:]
-    port_idx = port_idx[states.timesteps_completed:]
-    interval_sail_fraction = interval_sail_fraction[states.timesteps_completed:]
 
     segment_vecs = waypoints[1:] - waypoints[:-1]
     segment_lengths_km = np.linalg.norm(segment_vecs, axis=1)
@@ -661,7 +813,7 @@ def build_constant_speed_path_reference(
     distance_breaks_km = np.concatenate(([0.0], np.cumsum(segment_lengths_km)))
     total_distance_km = float(distance_breaks_km[-1])
 
-    sailing_time_h = float(np.sum(interval_sail_fraction) * itinerary.timestep)
+    sailing_time_h = float(np.sum(interval_sail_fraction * timestep_dt_h))
     constant_speed_kmh = total_distance_km / sailing_time_h if sailing_time_h > eps else 0.0
     constant_speed_mps = constant_speed_kmh * 1000.0 / 3600.0
 
@@ -677,7 +829,7 @@ def build_constant_speed_path_reference(
         path_distance[t + 1] = (
             path_distance[t]
             + constant_speed_kmh
-            * itinerary.timestep
+            * timestep_dt_h[t]
             * float(interval_sail_fraction[t])
         )
 
@@ -725,6 +877,11 @@ def build_constant_speed_path_reference(
         "instant_sail": instant_sail,
         "port_idx": port_idx,
         "interval_sail_fraction": interval_sail_fraction,
+        "timestep_dt_h": timestep_dt_h,
+        "timestep_mid_offset_h": timestep_mid_offset_h,
+        "timestep_start_offset_h": timestep_start_offset_h,
+        "timestep_end_offset_h": timestep_end_offset_h,
+        "interval_port_idx": interval_port_idx,
         "path_distance": path_distance,
         "ship_pos": ship_pos,
         "zone": zone,
