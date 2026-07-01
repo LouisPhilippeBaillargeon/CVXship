@@ -10,6 +10,7 @@ from lib.optimizers import DJPE_TSO, NaiveController, FR_TSO, ShortestPath, CJPE
 from lib.utils import point_in_zones, dx_dy_km, classify_timesteps, _assert_finite
 from lib.evaluation import compute_non_convex_cost_all_timesteps_nc_interpolated
 from lib.weather_interpolation import prepare_nc_interp_source
+from lib.debug_diagnostics import clear_debug_reports, print_debug_report
 
 new_weather = True
 new_ship = True
@@ -17,6 +18,7 @@ dimensions = "both"  # "1D", "2D" or "both"
 
 
 if __name__ == "__main__":
+    clear_debug_reports()
     map, itinerary, states, ship, weather = load_config()
     nc_sources = prepare_nc_interp_source(map, itinerary)
     fit_range = FitRange.initial_from_ship(ship)
@@ -116,7 +118,7 @@ if __name__ == "__main__":
         calm_model.plot_calm_water_models_ieee(
             nb_points=200,
             fit_if_needed=True,
-            show=True,
+            show=False,
         )
 
         propulsion_model = PropulsionModel(
@@ -126,7 +128,7 @@ if __name__ == "__main__":
             fit_range=fit_range,
         )
 
-        fit_error_P_max, fit_error_P_mean = propulsion_model.fit_convex_model(debug=True)
+        fit_error_P_max, fit_error_P_mean = propulsion_model.fit_convex_model(debug=False)
         print("max error power", fit_error_P_max, "%")
         print("mean error power", fit_error_P_mean, "%")
         print("Ship model fit took:", time.time() - start, "seconds")
@@ -195,7 +197,7 @@ if __name__ == "__main__":
                 wind_x_path,
                 wind_y_path,
                 course_angles,
-                debug=True,
+                debug=False,
             )
 
             wave_model_path_2D = WaveModelPathAligned2D(ship, fit_range)
@@ -205,7 +207,7 @@ if __name__ == "__main__":
                 wave_len_path,
                 wave_dir_path,
                 course_angles,
-                debug=True,
+                debug=False,
             )
             save_obj(WIND_MODEL_PATH_ALIGNED_2D, wind_model_path_2D)
             save_obj(WAVE_MODEL_PATH_ALIGNED_2D, wave_model_path_2D)
@@ -244,7 +246,7 @@ if __name__ == "__main__":
             runner,
             debug=debug,
             nc_sources=nc_sources,
-            redispatch_energy=True,
+            redispatch_energy=False,
         )
         sol = result[1]
         print(
@@ -377,7 +379,7 @@ if __name__ == "__main__":
         )
         FR_O_runner.nc_sources = nc_sources
         FR_O_runner.optimize(
-            debug=False,
+            debug=True,
         )
         _, FR_O_nonconv_sol, _, _ = compute_non_convex_cost_all_timesteps_nc_interpolated(
             FR_O_runner,
@@ -390,6 +392,7 @@ if __name__ == "__main__":
             "FR_O",
         )
         if dimensions == "1D":
+            print_debug_report()
             plot_solutions([FR_STO_POW_sol, naive_nonconv_sol, FR_O_nonconv_sol_pow],["FR_TSO + energy", "Naive Controller + energy", "FR_O + energy"], benchmark_label="Naive Controller + energy", show = False, subfolder="All sol compared", map=optimizer.map)
     
     if dimensions == "2D" or dimensions == "both":
@@ -434,6 +437,7 @@ if __name__ == "__main__":
         plot_solutions([optimizer.sol, DJPE_TSO_POW_sol],["Convex Gloabal solution", "Non-convex DJPE_TSO + energy redispatch"], benchmark_label="Non-convex DJPE_TSO + energy redispatch", show=False, subfolder="DJPE_TSO Path", map=optimizer.map)
 
         if dimensions == "2D":
+            print_debug_report()
             plot_solutions([DJPE_TSO_POW_sol, naive_nonconv_sol],["DJPE_TSO + energy", "Naive Controller + energy"], benchmark_label="Naive Controller + energy", show = True, subfolder="All sol compared", map=optimizer.map)
     
     if dimensions == "both":
@@ -490,4 +494,5 @@ if __name__ == "__main__":
             print("  optimizer:", np.asarray(glob_cont_opt.sol.__dict__[name]).shape)
             print("  evaluator:", np.asarray(CJTE_TSO_POW_sol.__dict__[name]).shape)
         plot_solutions([glob_cont_opt.sol, CJTE_TSO_POW_sol],["Convex CJPE_TSO solution", "Non-convex CJPE_TSO + energy redispatch"], benchmark_label="Non-convex CJPE_TSO + energy redispatch", show=False, subfolder="CJPE_TSO Path", map=optimizer.map)
+        print_debug_report()
         plot_solutions([naive_fit_sol, naive_nonconv_sol, FR_O_nonconv_sol, FR_O_nonconv_sol_pow, FR_STO_nonconv_sol, FR_STO_POW_sol, CJTE_TSO_sol, CJTE_TSO_POW_sol, DJPE_TSO_sol, DJPE_TSO_POW_sol],["Naive Controller", "Naive Controller + energy", "FR_O", "FR_O + energy", "FR_TSO", "FR_TSO + energy", "CJPE_TSO", "CJPE_TSO + energy", "DJPE_TSO", "DJPE_TSO + energy"], benchmark_label="Naive Controller", show = True, subfolder="All sol compared", map=optimizer.map)

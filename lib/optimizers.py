@@ -13,6 +13,7 @@ from lib.weather import Weather
 from lib.utils import classify_timesteps, dx_dy_km, compute_port_zone_indices, point_in_zones, _compute_tight_big_M_zone, _compute_min_zone_timesteps, _compute_min_crossing_distance_per_zone, build_constant_speed_path_reference, xy_from_path_distance, _ordered_zone_corner_ids, _zone_edges_from_corner_ids
 from lib.weather_interpolation import prepare_nc_interp_source, interpolated_weather_at, query_time_for_segment
 from lib.paths import CORNERS, ZONES
+from lib.debug_diagnostics import record_optimizer_debug
 
 
 @dataclass
@@ -1258,6 +1259,30 @@ class DJPE_TSO:
                 timestep_dt_h           = timestep_dt_h,
                 interval_port_idx       = interval_port_idx,
             )
+            if debug:
+                record_optimizer_debug(
+                    "DJPE_TSO",
+                    self,
+                    {
+                        "mode": "DJPE_TSO",
+                        "zone": zone.value,
+                        "ship_speed_vec": ship_speed_out,
+                        "rel_speed_vec": speed_rel_water_out,
+                        "speed_mag": speed_mag.value,
+                        "speed_rel_water_mag": speed_rel_water_mag.value,
+                        "wind_resistance": wind_resistance.value,
+                        "wave_resistance": wave_resistance.value,
+                        "calm_water_resistance": calm_water_resistance.value,
+                        "total_resistance": total_resistance.value,
+                        "acc_force": acc_force.value,
+                        "prop_power": prop_power.value,
+                        "generation_power": gen_power_out,
+                        "gen_costs": gen_costs_out,
+                        "gen_on": gen_on_out,
+                        "wind_model_future": wind_model_future,
+                        "wave_model_future": wave_model_future,
+                    },
+                )
             return 1
 
         else:
@@ -1962,6 +1987,48 @@ class CJPE_TSO:
                 timestep_dt_h           = timestep_dt_h,
                 interval_port_idx       = interval_port_idx,
             )
+            if debug:
+                record_optimizer_debug(
+                    "CJPE_TSO",
+                    self,
+                    {
+                        "mode": "CJPE_TSO",
+                        "zone": zone.value,
+                        "ship_speed_x": ship_speed_x.value,
+                        "ship_speed_y": ship_speed_y.value,
+                        "ship_speed_split_vec": np.stack(
+                            [
+                                np.asarray(ship_speed_x_split.value),
+                                np.asarray(ship_speed_y_split.value),
+                            ],
+                            axis=1,
+                        ),
+                        "ship_speed_x_rel_water": ship_speed_x_rel_water.value,
+                        "ship_speed_y_rel_water": ship_speed_y_rel_water.value,
+                        "rel_speed_split_vec": np.stack(
+                            [
+                                np.asarray(ship_speed_x_split_rel_water.value),
+                                np.asarray(ship_speed_y_split_rel_water.value),
+                            ],
+                            axis=1,
+                        ),
+                        "speed_mag": speed_mag.value,
+                        "speed_rel_water_mag": speed_rel_water_mag.value,
+                        "wind_resistance": wind_resistance.value,
+                        "wave_resistance": wave_resistance.value,
+                        "calm_water_resistance": calm_water_resistance.value,
+                        "total_resistance": total_resistance.value,
+                        "acc_force": acc_force.value,
+                        "prop_power": prop_power.value,
+                        "generation_power": generation_power.value,
+                        "gen_costs": gen_costs.value,
+                        "gen_on": gen_on_out,
+                        "wind_model_future": wind_model_future,
+                        "wave_model_future": wave_model_future,
+                        "wind_model_nd_future": wind_model_nd_future,
+                        "wave_model_nd_future": wave_model_nd_future,
+                    },
+                )
             return 1
 
         else:
@@ -2615,6 +2682,42 @@ class FR_TSO:
             timestep_dt_h=timestep_dt_h,
             interval_port_idx=interval_port_idx,
         )
+        if debug:
+            record_optimizer_debug(
+                "FR_TSO",
+                self,
+                {
+                    "mode": "FR_TSO",
+                    "seg": seg.value,
+                    "ship_speed_split_value": np.stack(
+                        [
+                            np.asarray(ship_speed_x_split.value),
+                            np.asarray(ship_speed_y_split.value),
+                        ],
+                        axis=2,
+                    ),
+                    "rel_speed_split_vec": np.stack(
+                        [
+                            np.asarray(ship_speed_x_split_rel_water.value),
+                            np.asarray(ship_speed_y_split_rel_water.value),
+                        ],
+                        axis=1,
+                    ),
+                    "speed_mag": speed_mag.value,
+                    "speed_rel_water_mag": speed_rel_water_mag.value,
+                    "wind_resistance": wind_resistance.value,
+                    "wave_resistance": wave_resistance.value,
+                    "calm_water_resistance": calm_water_resistance.value,
+                    "total_resistance": total_resistance.value,
+                    "acc_force": acc_force.value,
+                    "prop_power": prop_power.value,
+                    "generation_power": generation_power.value,
+                    "gen_costs": gen_costs.value,
+                    "gen_on": gen_on_out,
+                    "wind_model_future": wind_model_future,
+                    "wave_model_future": wave_model_future,
+                },
+            )
 
         return 1
     
@@ -2651,6 +2754,8 @@ class FR_O:
     wave_model_ts: Optional[WaveModel1D] = field(default=None, init=False)
     sampled_current_x: Optional[np.ndarray] = field(default=None, init=False)
     sampled_current_y: Optional[np.ndarray] = field(default=None, init=False)
+    sampled_wind: Optional[np.ndarray] = field(default=None, init=False)
+    sampled_wave: Optional[list] = field(default=None, init=False)
     sampled_irradiance: Optional[np.ndarray] = field(default=None, init=False)
     sampled_course_angle: Optional[np.ndarray] = field(default=None, init=False)
     nc_sources: Optional[dict] = field(default=None, init=False)
@@ -2691,6 +2796,8 @@ class FR_O:
 
         current_x_ts = np.zeros(T_future)
         current_y_ts = np.zeros(T_future)
+        sampled_wind = np.zeros((T_future, 2), dtype=float)
+        sampled_wave = []
         irradiance_ts = np.zeros(T_future)
 
         if self.nc_sources is None:
@@ -2717,11 +2824,18 @@ class FR_O:
 
             wind_x_ts[0, t] = w["wind"][0]
             wind_y_ts[0, t] = w["wind"][1]
+            sampled_wind[t, :] = w["wind"]
 
             wave_amp_ts[0, t] = w["wave_amp"]
             wave_freq_ts[0, t] = w["wave_freq"]
             wave_len_ts[0, t] = w["wave_len"]
             wave_dir_ts[0, t] = w["wave_dir"]
+            sampled_wave.append({
+                "wave_amp": float(w["wave_amp"]),
+                "wave_freq": float(w["wave_freq"]),
+                "wave_len": float(w["wave_len"]),
+                "wave_dir": float(w["wave_dir"]),
+            })
 
             current_x_ts[t] = w["current"][0]
             current_y_ts[t] = w["current"][1]
@@ -2729,6 +2843,8 @@ class FR_O:
 
         self.sampled_current_x = current_x_ts
         self.sampled_current_y = current_y_ts
+        self.sampled_wind = sampled_wind
+        self.sampled_wave = sampled_wave
         self.sampled_irradiance = irradiance_ts
         self.sampled_course_angle = course_ts.reshape(-1)
 
@@ -3161,6 +3277,31 @@ class FR_O:
             timestep_dt_h=timestep_dt_h,
             interval_port_idx=interval_port_idx,
         )
+        if debug:
+            record_optimizer_debug(
+                "FR_O",
+                self,
+                {
+                    "mode": "FR_O",
+                    "ship_speed_x": ship_speed_x.value,
+                    "ship_speed_y": ship_speed_y.value,
+                    "speed_rel_water_x": speed_rel_water_x.value,
+                    "speed_rel_water_y": speed_rel_water_y.value,
+                    "speed_mag": speed_mag.value,
+                    "speed_rel_water_mag": speed_rel_water_mag.value,
+                    "wind_resistance": wind_resistance.value,
+                    "wave_resistance": wave_resistance.value,
+                    "calm_water_resistance": calm_water_resistance.value,
+                    "total_resistance": total_resistance.value,
+                    "acc_force": acc_force.value,
+                    "prop_power": prop_power.value,
+                    "generation_power": generation_power.value,
+                    "gen_costs": gen_costs.value,
+                    "gen_on": gen_on_out,
+                    "wind_model_future": wind_model_future,
+                    "wave_model_future": wave_model_future,
+                },
+            )
         return 1
 
 @dataclass
