@@ -90,24 +90,23 @@ if __name__ == "__main__":
     naive.generator_models = generatorModels
     naive.calm_model = calm_model_initial
 
-    _, naive_nonconv_sol, _, _ = compute_non_convex_cost_all_timesteps_nc_interpolated(
+    _, naive_fit_sol, _, _ = compute_non_convex_cost_all_timesteps_nc_interpolated(
         naive,
         debug=False,
         nc_sources=nc_sources,
     )
-
     # ============================================================
     # 3) Build real fit range from evaluated naive
     # ============================================================
     fit_range = FitRange.from_solution(
-        naive_nonconv_sol,
+        naive_fit_sol,
         ship=ship,
         lower_speed_factor = 0.85,
-        upper_speed_factor = 1.15,
+        upper_speed_factor = 1.1,
         lower_res_factor = 0.7,
         upper_res_factor = 1.2,
-        lower_prop_factor = 0.6,
-        upper_prop_factor = 1.3,
+        lower_prop_factor = 0.7,
+        upper_prop_factor = 1.2,
     )
     print("Fit range from evaluated naive:",fit_range)
 
@@ -224,6 +223,12 @@ if __name__ == "__main__":
             wave_model_path_2D = load_obj(WAVE_MODEL_PATH_ALIGNED_2D)
         print("Saved weather model loaded")
 
+    naive.wind_model = base_wind_model
+    naive.wave_model = base_wave_model
+    naive.propulsion_model = propulsion_model
+    naive.generator_models = generatorModels
+    naive.calm_model = calm_model
+
     if path.sol is None:
         raise RuntimeError("ShortestPath did not produce a solution.")
     
@@ -234,7 +239,36 @@ if __name__ == "__main__":
     sail_time = float(np.sum(interval_sail_fraction[states.timesteps_completed:] * timestep_dt_h))
     ref_speed = (path.sol.total_distance/sail_time)*1000/3600
 
-    plot_solutions([naive.sol, naive_nonconv_sol],["Naive solution runner", "Naive solution eval"], benchmark_label="Naive solution runner", show=False, subfolder="Naive", map=naive.map)
+    def evaluate_with_updated_power_management(runner, label, debug=False):
+        result = compute_non_convex_cost_all_timesteps_nc_interpolated(
+            runner,
+            debug=debug,
+            nc_sources=nc_sources,
+            redispatch_energy=True,
+        )
+        sol = result[1]
+        print(
+            f"{label} re-evaluated: "
+            f"first_stage={sol.first_stage_optimizer}, "
+            f"power_management={sol.power_management_optimizer}, "
+            f"energy_solve_time={sol.energy_solve_time:.2f} s, "
+            f"cost={sol.estimated_cost:.6f} $"
+        )
+        return result
+
+    _, naive_nonconv_sol, _, _ = evaluate_with_updated_power_management(
+        naive,
+        "Naive Controller",
+    )
+
+    plot_solutions(
+        [naive.sol, naive_nonconv_sol],
+        ["Naive solution runner", "Naive solution eval + energy redispatch"],
+        benchmark_label="Naive solution eval + energy redispatch",
+        show=False,
+        subfolder="Naive",
+        map=naive.map,
+    )
 
     if dimensions == "1D" or dimensions == "both":
         optimizer = FR_TSO(
@@ -262,7 +296,16 @@ if __name__ == "__main__":
         )
         if ok:
             print("Optimization succeeded.")
-            n_all, fixed_path_sol, dt_h, best_pitch = compute_non_convex_cost_all_timesteps_nc_interpolated(optimizer, debug=False, nc_sources=nc_sources)
+            n_all, FR_STO_POW_sol, dt_h, best_pitch = evaluate_with_updated_power_management(
+                optimizer,
+                "FR_TSO",
+            )
+            _, FR_STO_nonconv_sol, _, _ = compute_non_convex_cost_all_timesteps_nc_interpolated(
+                optimizer,
+                debug=False,
+                nc_sources=nc_sources,
+                redispatch_energy=False,
+            )
             def _point_to_polyline_min_dist(points, waypoints):
                 points = np.asarray(points, dtype=float)
                 waypoints = np.asarray(waypoints, dtype=float)
@@ -286,16 +329,16 @@ if __name__ == "__main__":
 
             for name, sol in [
                 ("optimizer.sol", optimizer.sol),
-                ("fixed_path_sol", fixed_path_sol),
+                ("FR_STO_POW_sol", FR_STO_POW_sol),
                 ("naive.sol", naive.sol),
                 ("naive_solution", naive_nonconv_sol),
             ]:
                 print("\n---", name, "---")
-                print("has fixed_path_waypoints:", getattr(sol, "fixed_path_waypoints", None) is not None)
+                print("has FR_STO_waypoints:", getattr(sol, "FR_STO_waypoints", None) is not None)
                 print("has crossing_point:", getattr(sol, "crossing_point", None) is not None)
                 print("ship_pos first/last:", sol.ship_pos[0], sol.ship_pos[-1])
 
-                wp = getattr(sol, "fixed_path_waypoints", None)
+                wp = getattr(sol, "FR_STO_waypoints", None)
                 if wp is None:
                     wp = path.sol.waypoints
 
@@ -303,7 +346,7 @@ if __name__ == "__main__":
 
                 if getattr(sol, "crossing_point", None) is not None:
                     dq = _point_to_polyline_min_dist(sol.crossing_point, wp)
-            plot_solutions([optimizer.sol, fixed_path_sol],["Convex FR_TSO solution", "Non-convex FR_TSO solution"], benchmark_label="Non-convex FR_TSO solution", show=False, subfolder="FR_TSO", map=optimizer.map)
+            plot_solutions([optimizer.sol, FR_STO_POW_sol],["Convex FR_TSO solution", "Non-convex FR_TSO + energy redispatch"], benchmark_label="Non-convex FR_TSO + energy redispatch", show=False, subfolder="FR_TSO", map=optimizer.map)
         else:
             print("Optimization failed.")
 
@@ -317,7 +360,7 @@ if __name__ == "__main__":
             )
         )
         ref_speed = path.sol.total_distance / remaining_sail_time_h * 1000 / 3600
-        fixed_path_ts = FR_O(
+        FR_O_runner = FR_O(
             wind_model=wind_model_1D,
             wave_model=wave_model_1D,
             propulsion_model=propulsion_model,
@@ -332,17 +375,22 @@ if __name__ == "__main__":
             waypoints=path.sol.waypoints,
             path_zone_ids=path.sol.zone_sequence,
         )
-        fixed_path_ts.nc_sources = nc_sources
-        fixed_path_ts.optimize(
+        FR_O_runner.nc_sources = nc_sources
+        FR_O_runner.optimize(
             debug=False,
         )
-        _, fixed_path_ts_nonconv_sol, _, _ = compute_non_convex_cost_all_timesteps_nc_interpolated(
-            fixed_path_ts,
+        _, FR_O_nonconv_sol, _, _ = compute_non_convex_cost_all_timesteps_nc_interpolated(
+            FR_O_runner,
             debug=False,
             nc_sources=nc_sources,
+            redispatch_energy=False,
+        )
+        _, FR_O_nonconv_sol_pow, _, _ = evaluate_with_updated_power_management(
+            FR_O_runner,
+            "FR_O",
         )
         if dimensions == "1D":
-            plot_solutions([fixed_path_sol, naive_nonconv_sol, fixed_path_ts_nonconv_sol],["FR_TSO", "Naive Controller", "FR_O"], benchmark_label="Naive Controller", show = False, subfolder="All sol compared", map=optimizer.map)
+            plot_solutions([FR_STO_POW_sol, naive_nonconv_sol, FR_O_nonconv_sol_pow],["FR_TSO + energy", "Naive Controller + energy", "FR_O + energy"], benchmark_label="Naive Controller + energy", show = False, subfolder="All sol compared", map=optimizer.map)
     
     if dimensions == "2D" or dimensions == "both":
         optimizer = DJPE_TSO(
@@ -373,11 +421,20 @@ if __name__ == "__main__":
             naive_zone_radius=1,
         )
         plot_zones_and_points(optimizer.sol.ship_pos, optimizer.map.zone_ineq)
-        n_all, global_sol, dt_h, best_pitch = compute_non_convex_cost_all_timesteps_nc_interpolated(optimizer, debug=False, nc_sources=nc_sources)
-        plot_solutions([optimizer.sol, global_sol],["Convex Gloabal solution", "Non-convex DJPE_TSO solution"], benchmark_label="Non-convex DJPE_TSO solution", show=False, subfolder="DJPE_TSO Path", map=optimizer.map)
-        
+        _, DJPE_TSO_sol, _, _ = compute_non_convex_cost_all_timesteps_nc_interpolated(
+            optimizer,
+            debug=False,
+            nc_sources=nc_sources,
+            redispatch_energy=False,
+        )
+        n_all, DJPE_TSO_POW_sol, dt_h, best_pitch = evaluate_with_updated_power_management(
+            optimizer,
+            "DJPE_TSO",
+        )
+        plot_solutions([optimizer.sol, DJPE_TSO_POW_sol],["Convex Gloabal solution", "Non-convex DJPE_TSO + energy redispatch"], benchmark_label="Non-convex DJPE_TSO + energy redispatch", show=False, subfolder="DJPE_TSO Path", map=optimizer.map)
+
         if dimensions == "2D":
-            plot_solutions([global_sol, naive_nonconv_sol],["DJPE_TSO", "Naive Controller"], benchmark_label="Naive Controller", show = True, subfolder="All sol compared", map=optimizer.map)
+            plot_solutions([DJPE_TSO_POW_sol, naive_nonconv_sol],["DJPE_TSO + energy", "Naive Controller + energy"], benchmark_label="Naive Controller + energy", show = True, subfolder="All sol compared", map=optimizer.map)
     
     if dimensions == "both":
         glob_cont_opt = CJPE_TSO(
@@ -410,7 +467,16 @@ if __name__ == "__main__":
             naive_zone_radius=1,
         )
         plot_zones_and_points(glob_cont_opt.sol.ship_pos, glob_cont_opt.map.zone_ineq)
-        n_all, glob_cont_opt_sol, dt_h, best_pitch = compute_non_convex_cost_all_timesteps_nc_interpolated(glob_cont_opt, debug=False, nc_sources=nc_sources)
+        _, CJTE_TSO_sol, _, _ = compute_non_convex_cost_all_timesteps_nc_interpolated(
+            glob_cont_opt,
+            debug=False,
+            nc_sources=nc_sources,
+            redispatch_energy=False,
+        )
+        n_all, CJTE_TSO_POW_sol, dt_h, best_pitch = evaluate_with_updated_power_management(
+            glob_cont_opt,
+            "CJPE_TSO",
+        )
         for name in [
             "prop_power",
             "wave_resistance",
@@ -422,6 +488,6 @@ if __name__ == "__main__":
         ]:
             print(name)
             print("  optimizer:", np.asarray(glob_cont_opt.sol.__dict__[name]).shape)
-            print("  evaluator:", np.asarray(glob_cont_opt_sol.__dict__[name]).shape)
-        plot_solutions([glob_cont_opt.sol, glob_cont_opt_sol],["Convex CJPE_TSO solution", "Non-convex CJPE_TSO solution"], benchmark_label="Non-convex CJPE_TSO solution", show=False, subfolder="CJPE_TSO Path", map=optimizer.map)
-        plot_solutions([glob_cont_opt_sol, global_sol, fixed_path_sol, naive_nonconv_sol, fixed_path_ts_nonconv_sol],["CJPE_TSO","DJPE_TSO", "FR_TSO", "Naive Controller", "FR_O"], benchmark_label="Naive Controller", show = True, subfolder="All sol compared", map=optimizer.map)
+            print("  evaluator:", np.asarray(CJTE_TSO_POW_sol.__dict__[name]).shape)
+        plot_solutions([glob_cont_opt.sol, CJTE_TSO_POW_sol],["Convex CJPE_TSO solution", "Non-convex CJPE_TSO + energy redispatch"], benchmark_label="Non-convex CJPE_TSO + energy redispatch", show=False, subfolder="CJPE_TSO Path", map=optimizer.map)
+        plot_solutions([naive_fit_sol, naive_nonconv_sol, FR_O_nonconv_sol, FR_O_nonconv_sol_pow, FR_STO_nonconv_sol, FR_STO_POW_sol, CJTE_TSO_sol, CJTE_TSO_POW_sol, DJPE_TSO_sol, DJPE_TSO_POW_sol],["Naive Controller", "Naive Controller + energy", "FR_O", "FR_O + energy", "FR_TSO", "FR_TSO + energy", "CJPE_TSO", "CJPE_TSO + energy", "DJPE_TSO", "DJPE_TSO + energy"], benchmark_label="Naive Controller", show = True, subfolder="All sol compared", map=optimizer.map)

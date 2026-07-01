@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional, List, Dict, Tuple
 import cvxpy as cp
 import numpy as np
@@ -63,6 +63,10 @@ class Solution:
     timestep_mid_offset_h   : Optional[np.ndarray] = None
     timestep_end_offset_h   : Optional[np.ndarray] = None
     interval_port_idx       : Optional[np.ndarray] = None
+    solar_power_available   : Optional[np.ndarray] = None
+    first_stage_optimizer   : Optional[str] = None
+    power_management_optimizer: Optional[str] = None
+    energy_solve_time       : Optional[float] = None
 
 
 @dataclass
@@ -202,6 +206,348 @@ def _ship_speed_limit_matrix(map_obj, itinerary, states, ship, T_future: int) ->
             limits[int(z), active_t] = limit
 
     return limits
+
+
+@dataclass
+class EnergyOnlyOptimizer:
+    """
+    Second-stage power-management optimizer.
+
+    It keeps the evaluated route, speed, resistance, and propulsion power fixed,
+    then redispatches only solar, battery, shore, SOC, and generator power using
+    the same continuous energy-management logic as the route optimizers.
+    """
+
+    generator_models    : List[GeneratorModel]
+    itinerary           : Itinerary
+    states              : States
+    ship                : Ship
+    source_optimizer_name: Optional[str] = None
+
+    sol: Optional[Solution] = field(default=None, init=False)
+
+    @staticmethod
+    def _as_segment_matrix(value, T: int, H: int, name: str) -> np.ndarray:
+        arr = np.asarray(value, dtype=float)
+
+        if arr.shape == (T, H):
+            return arr
+
+        if arr.shape == (T,):
+            if H == 1:
+                return arr[:, None]
+            return np.repeat(arr[:, None], H, axis=1)
+
+        raise ValueError(f"{name} must have shape {(T,)} or {(T, H)}, got {arr.shape}.")
+
+    def optimize(
+        self,
+        evaluated_solution: Solution,
+        solar_power_available: Optional[np.ndarray] = None,
+        debug: bool = False,
+        solver=cp.MOSEK,
+    ) -> int:
+        prop_power_raw = np.asarray(evaluated_solution.prop_power, dtype=float)
+
+        if prop_power_raw.ndim == 1:
+            T_future = prop_power_raw.shape[0]
+            H = 1
+            prop_power = prop_power_raw[:, None]
+        elif prop_power_raw.ndim == 2:
+            T_future, H = prop_power_raw.shape
+            prop_power = prop_power_raw
+        else:
+            raise ValueError(
+                f"evaluated_solution.prop_power must be 1D or 2D, got {prop_power_raw.shape}."
+            )
+
+        timestep_dt_h = getattr(evaluated_solution, "timestep_dt_h", None)
+        if timestep_dt_h is None:
+            timestep_dt_h = _future_dt_h(self.itinerary, self.states, T_future)
+        else:
+            timestep_dt_h = np.asarray(timestep_dt_h, dtype=float).reshape(-1)
+
+        if timestep_dt_h.shape != (T_future,):
+            raise ValueError(
+                f"Expected timestep_dt_h shape {(T_future,)}, got {timestep_dt_h.shape}."
+            )
+
+        segment_dt_source = getattr(evaluated_solution, "segment_dt_h", None)
+        if segment_dt_source is None:
+            segment_dt_h = timestep_dt_h[:, None] if H == 1 else np.repeat(
+                (timestep_dt_h / H)[:, None],
+                H,
+                axis=1,
+            )
+        else:
+            segment_dt_h = self._as_segment_matrix(
+                segment_dt_source,
+                T_future,
+                H,
+                "segment_dt_h",
+            )
+
+        auxiliary_power = getattr(evaluated_solution, "auxiliary_power", None)
+        if auxiliary_power is None or len(auxiliary_power) == 0:
+            auxiliary_power = _future_auxiliary_power(self.itinerary, self.states, T_future)
+        else:
+            auxiliary_power = np.asarray(auxiliary_power, dtype=float).reshape(-1)
+
+        if auxiliary_power.shape != (T_future,):
+            raise ValueError(
+                f"Expected auxiliary_power shape {(T_future,)}, got {auxiliary_power.shape}."
+            )
+
+        if solar_power_available is None:
+            solar_power_available = getattr(evaluated_solution, "solar_power_available", None)
+        if solar_power_available is None:
+            solar_power_available = evaluated_solution.solar_power
+
+        solar_power_available = np.maximum(
+            0.0,
+            self._as_segment_matrix(
+                solar_power_available,
+                T_future,
+                H,
+                "solar_power_available",
+            ),
+        )
+
+        interval_sail_fraction = np.asarray(
+            evaluated_solution.interval_sail_fraction,
+            dtype=float,
+        ).reshape(-1)
+        if interval_sail_fraction.shape != (T_future,):
+            raise ValueError(
+                "Expected interval_sail_fraction shape "
+                f"{(T_future,)}, got {interval_sail_fraction.shape}."
+            )
+        interval_sail = interval_sail_fraction > 0.5
+
+        interval_port_idx = getattr(evaluated_solution, "interval_port_idx", None)
+        if interval_port_idx is None:
+            interval_port_idx = _future_interval_port_idx(
+                self.itinerary,
+                self.states,
+                T_future,
+                np.asarray(evaluated_solution.port_idx, dtype=int),
+            )
+        interval_port_idx = np.asarray(interval_port_idx, dtype=int).reshape(-1)
+        if interval_port_idx.shape != (T_future,):
+            raise ValueError(
+                f"Expected interval_port_idx shape {(T_future,)}, got {interval_port_idx.shape}."
+            )
+
+        records = [
+            (t, h)
+            for t in range(T_future)
+            for h in range(H)
+            if float(segment_dt_h[t, h]) > 1e-9
+        ]
+        if not records:
+            raise ValueError("Cannot optimize energy dispatch: no positive-duration segments found.")
+
+        nb_seg = len(records)
+        nb_gen = len(self.generator_models)
+        if nb_gen <= 0:
+            raise ValueError("EnergyOnlyOptimizer requires at least one generator model.")
+
+        dt_flat = np.array([segment_dt_h[t, h] for t, h in records], dtype=float)
+        prop_flat = np.array([prop_power[t, h] for t, h in records], dtype=float)
+        aux_flat = np.array([auxiliary_power[t] for t, _h in records], dtype=float)
+        solar_available_flat = np.array(
+            [solar_power_available[t, h] for t, h in records],
+            dtype=float,
+        )
+        sail_flat = np.array([interval_sail[t] for t, _h in records], dtype=bool)
+
+        shore_cost_flat = np.zeros(nb_seg, dtype=float)
+        shore_max_flat = np.zeros(nb_seg, dtype=float)
+        for i, (t, _h) in enumerate(records):
+            if sail_flat[i]:
+                continue
+
+            p = int(interval_port_idx[t])
+            if p < 0:
+                raise ValueError(f"Invalid interval_port_idx[{t}]={p} during port interval.")
+
+            shore_cost_flat[i] = float(self.itinerary.transits[p].power_cost)
+            shore_max_flat[i] = float(self.itinerary.transits[p].max_charge_power)
+
+        solar_power = cp.Variable(nb_seg, nonneg=True)
+        shore_power = cp.Variable(nb_seg)
+        battery_charge = cp.Variable(nb_seg, nonneg=True)
+        battery_discharge = cp.Variable(nb_seg, nonneg=True)
+        SOC = cp.Variable(nb_seg + 1)
+        generation_power = cp.Variable((nb_gen, nb_seg), nonneg=True)
+
+        constraints = [
+            solar_power <= solar_available_flat,
+            SOC >= 0,
+            SOC <= self.ship.battery.capacity,
+            battery_charge <= self.ship.battery.max_charge_pow,
+            battery_discharge <= self.ship.battery.max_discharge_pow,
+            SOC[0] == float(np.asarray(evaluated_solution.SOC, dtype=float).reshape(-1)[0]),
+            SOC[-1] >= self.itinerary.soc_f,
+        ]
+
+        adjusted_leak = float(self.ship.battery.leak) ** dt_flat
+        for i in range(nb_seg):
+            constraints += [
+                SOC[i + 1] == adjusted_leak[i] * SOC[i]
+                - dt_flat[i] * battery_discharge[i] / self.ship.battery.discharge_eff
+                + dt_flat[i] * self.ship.battery.charge_eff * battery_charge[i]
+            ]
+
+            if sail_flat[i]:
+                constraints += [shore_power[i] == 0]
+            else:
+                constraints += [
+                    shore_power[i] >= 0,
+                    shore_power[i] <= shore_max_flat[i],
+                ]
+
+        max_p = np.array([g.max_power for g in self.ship.generators], dtype=float)[:, None]
+        max_p = np.repeat(max_p, nb_seg, axis=1)
+
+        coeffs = np.array([gm.power_coeffs for gm in self.generator_models], dtype=float)
+        c = np.repeat(coeffs[:, 0][:, None], nb_seg, axis=1)
+        b = np.repeat(coeffs[:, 1][:, None], nb_seg, axis=1)
+        a = np.repeat(coeffs[:, 2][:, None], nb_seg, axis=1)
+
+        gen_on_fixed = np.zeros((nb_gen, nb_seg), dtype=float)
+        gen_on_fixed[:, sail_flat] = 1.0
+
+        constraints += [generation_power <= cp.multiply(max_p, gen_on_fixed)]
+
+        for i in range(nb_seg):
+            constraints += [
+                cp.sum(generation_power[:, i], axis=0)
+                == prop_flat[i]
+                + aux_flat[i]
+                - solar_power[i]
+                - battery_discharge[i]
+                + battery_charge[i]
+                - shore_power[i]
+            ]
+
+        gen_cost_expr = (
+            cp.multiply(a, cp.square(generation_power))
+            + cp.multiply(b, generation_power)
+            + cp.multiply(c, gen_on_fixed)
+        ) * self.itinerary.fuel_price
+        gen_dt = np.repeat(dt_flat[None, :], nb_gen, axis=0)
+
+        objective = cp.Minimize(
+            cp.sum(cp.multiply(gen_cost_expr, gen_dt))
+            + cp.sum(cp.multiply(shore_power, shore_cost_flat * dt_flat))
+        )
+
+        problem = cp.Problem(objective, constraints)
+
+        start_solve = time.time()
+        problem.solve(
+            solver=solver,
+            verbose=debug,
+        )
+        solve_time = time.time() - start_solve
+
+        if debug:
+            print("ENERGY ONLY SOLVE: status =", problem.status, "value =", problem.value)
+            print(f"Energy-only solve time (wall clock): {solve_time:.2f} seconds")
+            if problem.solver_stats is not None:
+                print("Solver reported solve time:", problem.solver_stats.solve_time, "seconds")
+
+        if problem.status not in ("optimal", "optimal_inaccurate"):
+            print(f"Energy-only optimization status: {problem.status}")
+            return 0
+
+        generation_flat = np.asarray(generation_power.value, dtype=float)
+        solar_flat = np.asarray(solar_power.value, dtype=float)
+        shore_flat = np.asarray(shore_power.value, dtype=float)
+        battery_charge_flat = np.asarray(battery_charge.value, dtype=float)
+        battery_discharge_flat = np.asarray(battery_discharge.value, dtype=float)
+        soc_flat = np.asarray(SOC.value, dtype=float).reshape(-1)
+
+        gen_costs_flat = (
+            a * generation_flat**2
+            + b * generation_flat
+            + c * gen_on_fixed
+        ) * float(self.itinerary.fuel_price)
+        shore_power_cost_flat = shore_flat * shore_cost_flat
+
+        generation_out = np.zeros((nb_gen, T_future, H), dtype=float)
+        gen_costs_out = np.zeros((nb_gen, T_future, H), dtype=float)
+        gen_on_out = np.zeros((nb_gen, T_future, H), dtype=float)
+        solar_out = np.zeros((T_future, H), dtype=float)
+        shore_out = np.zeros((T_future, H), dtype=float)
+        shore_cost_out = np.zeros((T_future, H), dtype=float)
+        battery_charge_out = np.zeros((T_future, H), dtype=float)
+        battery_discharge_out = np.zeros((T_future, H), dtype=float)
+
+        for i, (t, h) in enumerate(records):
+            generation_out[:, t, h] = generation_flat[:, i]
+            gen_costs_out[:, t, h] = gen_costs_flat[:, i]
+            gen_on_out[:, t, h] = gen_on_fixed[:, i]
+            solar_out[t, h] = solar_flat[i]
+            shore_out[t, h] = shore_flat[i]
+            shore_cost_out[t, h] = shore_power_cost_flat[i]
+            battery_charge_out[t, h] = battery_charge_flat[i]
+            battery_discharge_out[t, h] = battery_discharge_flat[i]
+
+        # Keep padded zero-duration segment values visually continuous, matching
+        # the evaluator's convention; they do not affect cost because dt is zero.
+        for t in range(T_future):
+            real_h = np.where(segment_dt_h[t, :] > 1e-9)[0]
+            if real_h.size == 0:
+                continue
+
+            last = int(real_h[-1])
+            for h in range(H):
+                if segment_dt_h[t, h] > 1e-9:
+                    continue
+                generation_out[:, t, h] = generation_out[:, t, last]
+                gen_costs_out[:, t, h] = gen_costs_out[:, t, last]
+                gen_on_out[:, t, h] = gen_on_out[:, t, last]
+                solar_out[t, h] = solar_out[t, last]
+                shore_out[t, h] = shore_out[t, last]
+                shore_cost_out[t, h] = shore_cost_out[t, last]
+                battery_charge_out[t, h] = battery_charge_out[t, last]
+                battery_discharge_out[t, h] = battery_discharge_out[t, last]
+
+        SOC_out = np.zeros(T_future + 1, dtype=float)
+        cursor = 0
+        SOC_out[0] = soc_flat[0]
+        for t in range(T_future):
+            for h in range(H):
+                if segment_dt_h[t, h] > 1e-9:
+                    cursor += 1
+            SOC_out[t + 1] = soc_flat[cursor]
+
+        first_stage_optimizer = (
+            getattr(evaluated_solution, "first_stage_optimizer", None)
+            or self.source_optimizer_name
+        )
+
+        self.sol = replace(
+            evaluated_solution,
+            estimated_cost=float(problem.value),
+            generation_power=generation_out,
+            gen_costs=gen_costs_out,
+            gen_on=gen_on_out,
+            solar_power=solar_out,
+            shore_power=shore_out,
+            shore_power_cost=shore_cost_out,
+            battery_charge=battery_charge_out,
+            battery_discharge=battery_discharge_out,
+            SOC=SOC_out,
+            solar_power_available=solar_power_available,
+            first_stage_optimizer=first_stage_optimizer,
+            power_management_optimizer=type(self).__name__,
+            energy_solve_time=solve_time,
+        )
+
+        return 1
 
 
 @dataclass

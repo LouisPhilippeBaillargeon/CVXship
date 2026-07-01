@@ -1,6 +1,11 @@
 import numpy as np
 
-from lib.optimizers import Solution, _future_auxiliary_power
+from lib.optimizers import (
+    Solution,
+    _future_auxiliary_power,
+    _future_interval_port_idx,
+    EnergyOnlyOptimizer,
+)
 from lib.weather_interpolation import (
     prepare_nc_interp_source,
     interpolated_weather_at,
@@ -23,7 +28,14 @@ def _path_pos_at_distance(waypoints, d_abs):
     return waypoints[s] + alpha * seg_vecs[s]
 
 
-def compute_non_convex_cost_all_timesteps_nc_interpolated(runner, eps=1e-9, debug=False, nc_sources=None):
+def compute_non_convex_cost_all_timesteps_nc_interpolated(
+    runner,
+    eps=1e-9,
+    debug=False,
+    nc_sources=None,
+    redispatch_energy=False,
+    energy_solver=None,
+):
     """
     Evaluate a solution with raw NetCDF weather interpolated at each segment midpoint.
 
@@ -75,6 +87,19 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(runner, eps=1e-9, debu
     dt_s_vec = dt_vec * 3600.0
     mask_sail = np.asarray(sol.interval_sail_fraction, dtype=float).reshape(-1) > 0.5
     zone_mat = np.asarray(sol.zone, dtype=float)
+    interval_port_idx_eval = getattr(sol, "interval_port_idx", None)
+    if interval_port_idx_eval is None:
+        interval_port_idx_eval = _future_interval_port_idx(
+            itinerary,
+            runner.states,
+            T,
+            np.asarray(sol.port_idx, dtype=int),
+        )
+    interval_port_idx_eval = np.asarray(interval_port_idx_eval, dtype=int).reshape(-1)
+    if interval_port_idx_eval.shape != (T,):
+        raise ValueError(
+            f"Expected interval_port_idx shape {(T,)}, got {interval_port_idx_eval.shape}."
+        )
 
     speed_cmd = np.asarray(sol.speed_mag, dtype=float)
     uses_two_setpoints = speed_cmd.ndim == 2 and speed_cmd.shape[1] == 2
@@ -98,7 +123,6 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(runner, eps=1e-9, debu
 
     gen_cmd, gen_kind = _as_NT_or_NTH(sol.generation_power, "generation_power")
     gen_on_cmd, gen_on_kind = _as_NT_or_NTH(sol.gen_on, "gen_on")
-    solar_cmd, solar_kind = _as_T_or_TH(sol.solar_power, "solar_power")
     shore_cmd, shore_kind = _as_T_or_TH(sol.shore_power, "shore_power")
     shore_cost_cmd, shore_cost_kind = _as_T_or_TH(sol.shore_power_cost, "shore_power_cost")
     batt_ch_cmd, batt_ch_kind = _as_T_or_TH(sol.battery_charge, "battery_charge")
@@ -323,6 +347,7 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(runner, eps=1e-9, debu
     gen_costs = np.zeros((nb_gen, T, Hmax))
     gen_on_all = np.zeros((nb_gen, T, Hmax))
     solar_power = np.zeros((T, Hmax))
+    solar_power_available = np.zeros((T, Hmax))
     shore_power = np.zeros((T, Hmax))
     shore_power_cost = np.zeros((T, Hmax))
     battery_charge = np.zeros((T, Hmax))
@@ -333,7 +358,129 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(runner, eps=1e-9, debu
 
     coeffs = np.array([gm.power_coeffs for gm in generator_models], dtype=float)
     c0, b0, a0 = coeffs[:, 0], coeffs[:, 1], coeffs[:, 2]
+    gen_min_power = np.array([g.min_power for g in ship.generators], dtype=float)
+    gen_max_power = np.array([g.max_power for g in ship.generators], dtype=float)
     speed_before = float(getattr(runner.states, "current_speed", 0.0))
+    battery_capacity = float(ship.battery.capacity)
+    battery_charge_eff = float(ship.battery.charge_eff)
+    battery_discharge_eff = float(ship.battery.discharge_eff)
+    battery_max_charge = float(ship.battery.max_charge_pow)
+    battery_max_discharge = float(ship.battery.max_discharge_pow)
+    soc_running = float(np.clip(getattr(runner.states, "soc", 0.0), 0.0, battery_capacity))
+    SOC_eval = np.zeros(T + 1, dtype=float)
+    SOC_eval[0] = soc_running
+    validation_warnings = {}
+    validation_errors = {}
+
+    def _record_message(store, key, message, amount=0.0):
+        rec = store.setdefault(
+            key,
+            {"message": message, "count": 0, "max_amount": 0.0},
+        )
+        rec["count"] += 1
+        rec["max_amount"] = max(rec["max_amount"], float(abs(amount)))
+
+    def _shore_command_limit(t):
+        if mask_sail[t]:
+            return 0.0, 0.0
+
+        p = int(interval_port_idx_eval[t])
+        return (
+            float(itinerary.transits[p].max_charge_power),
+            float(itinerary.transits[p].power_cost),
+        )
+
+    def _dispatch_generators(remaining_load, gen_cmd, gen_on_cmd, t, h):
+        gen_cmd = np.asarray(gen_cmd, dtype=float).copy()
+        gen_on_cmd = np.asarray(gen_on_cmd, dtype=float).copy()
+        gp = np.zeros(nb_gen, dtype=float)
+        remaining_load = float(max(0.0, remaining_load))
+
+        clipped_cmd = np.clip(gen_cmd, 0.0, gen_max_power)
+        clipped_delta = np.max(np.abs(clipped_cmd - gen_cmd)) if gen_cmd.size else 0.0
+        if clipped_delta > eps:
+            _record_message(
+                validation_warnings,
+                "generator_command_clipped",
+                "Generator command was clipped to generator power limits.",
+                clipped_delta,
+            )
+        gen_cmd = clipped_cmd
+
+        if remaining_load <= eps:
+            return gp, np.zeros(nb_gen, dtype=float), 0.0
+
+        commanded_total = float(np.sum(gen_cmd))
+
+        if commanded_total >= remaining_load - eps:
+            on = gen_cmd > eps
+            if not np.any(on):
+                _record_message(
+                    validation_errors,
+                    "generator_no_online_capacity",
+                    "Generator dispatch is infeasible: no commanded generator can meet remaining load.",
+                    remaining_load,
+                )
+                return gp, np.zeros(nb_gen, dtype=float), remaining_load
+
+            floor = np.zeros(nb_gen, dtype=float)
+            floor[on] = gen_min_power[on]
+            below_min = on & (gen_cmd < floor - eps)
+            if np.any(below_min):
+                _record_message(
+                    validation_warnings,
+                    "generator_command_below_min",
+                    "Generator command was below minimum power for an active generator.",
+                    float(np.max(floor[below_min] - gen_cmd[below_min])),
+                )
+
+            min_total = float(np.sum(floor))
+            if remaining_load <= min_total + eps:
+                gp = floor
+                wasted = max(0.0, min_total - remaining_load)
+                if wasted > eps:
+                    _record_message(
+                        validation_warnings,
+                        "generator_minimum_power_wasted",
+                        "Generator output was wasted because active generators hit minimum power.",
+                        wasted,
+                    )
+                return gp, (gp > eps).astype(float), 0.0
+
+            reduction_needed = commanded_total - remaining_load
+            room_down = np.maximum(gen_cmd - floor, 0.0)
+            room_total = float(np.sum(room_down))
+            if reduction_needed <= eps:
+                gp = gen_cmd
+            elif room_total > eps:
+                gp = gen_cmd - reduction_needed * room_down / room_total
+            else:
+                gp = floor
+
+            gp = np.maximum(gp, floor)
+            return gp, (gp > eps).astype(float), 0.0
+
+        increase_needed = remaining_load - commanded_total
+        room_up = np.maximum(gen_max_power - gen_cmd, 0.0)
+        room_total = float(np.sum(room_up))
+
+        if room_total + eps < increase_needed:
+            gp = gen_max_power.copy()
+            shortfall = remaining_load - float(np.sum(gp))
+            _record_message(
+                validation_errors,
+                "generator_capacity_shortfall",
+                "Generator dispatch is infeasible: high limits cannot meet remaining load.",
+                shortfall,
+            )
+            return gp, (gp > eps).astype(float), shortfall
+
+        if room_total > eps:
+            gp = gen_cmd + increase_needed * room_up / room_total
+        else:
+            gp = gen_cmd
+
+        return gp, (gp > eps).astype(float), 0.0
 
     def _cmd_speed_for_acc(t, h_cmd):
         if uses_two_setpoints:
@@ -367,7 +514,6 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(runner, eps=1e-9, debu
             step_distance[t, h] = float(seg["distance_km"])
             ship_speed[t, :, h] = v_ship
             speed_mag[t, h] = float(np.linalg.norm(v_ship))
-            solar_power[t, h] = _pick_T(solar_cmd, solar_kind, t, h_cmd)
             shore_power[t, h] = _pick_T(shore_cmd, shore_kind, t, h_cmd)
             shore_power_cost[t, h] = _pick_T(shore_cost_cmd, shore_cost_kind, t, h_cmd)
             battery_charge[t, h] = _pick_T(batt_ch_cmd, batt_ch_kind, t, h_cmd)
@@ -376,10 +522,16 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(runner, eps=1e-9, debu
             gen_sched = _pick_NT(gen_cmd, gen_kind, t, h_cmd)
             gen_on = _pick_NT(gen_on_cmd, gen_on_kind, t, h_cmd)
 
-            if mask_sail[t]:
-                qtime = query_time_for_segment(itinerary, runner.states, t, seg["mid_offset_h"])
-                w = interpolated_weather_at(nc_sources, runner.map, seg["mid_pos"], qtime)
+            qtime = query_time_for_segment(itinerary, runner.states, t, seg["mid_offset_h"])
+            w = interpolated_weather_at(nc_sources, runner.map, seg["mid_pos"], qtime)
+            solar_power_available[t, h] = max(
+                0.0,
+                ship.solarPannels.area
+                * ship.solarPannels.efficiency
+                * float(w["irradiance"]),
+            )
 
+            if mask_sail[t]:
                 current = w["current"]
                 v_rel = v_ship - current
                 speed_rel_water[t, :, h] = v_rel
@@ -437,38 +589,146 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(runner, eps=1e-9, debu
                         "prop", prop_power[t, h],
                     )
 
-            total_gen_power = (
-                prop_power[t, h]
-                + auxiliary_power[t]
-                - solar_power[t, h]
-                + battery_charge[t, h]
-                - battery_discharge[t, h]
-                - shore_power[t, h]
+            dt_h_safe = max(dt_h, eps)
+            soc_after_leak = (float(ship.battery.leak) ** dt_h) * soc_running
+
+            cmd_charge = max(0.0, float(battery_charge[t, h]))
+            max_charge_from_soc = max(
+                0.0,
+                (battery_capacity - soc_after_leak) / (battery_charge_eff * dt_h_safe),
             )
-            total_gen_power = max(0.0, total_gen_power)
+            feasible_cmd_charge = min(
+                cmd_charge,
+                battery_max_charge,
+                max_charge_from_soc,
+            )
+            if abs(feasible_cmd_charge - cmd_charge) > eps:
+                _record_message(
+                    validation_warnings,
+                    "battery_charge_command_reduced",
+                    "Battery charge command was reduced by charge power or SOC headroom.",
+                    cmd_charge - feasible_cmd_charge,
+                )
 
-            sched = np.asarray(gen_sched, dtype=float).copy()
-            gen_on = np.asarray(gen_on, dtype=float).copy()
-            if total_gen_power <= eps:
-                gen_on[:] = 0.0
-            sched[gen_on <= 0.5] = 0.0
-            sched_sum = float(np.sum(sched))
+            cmd_discharge = max(0.0, float(battery_discharge[t, h]))
+            max_discharge_from_soc = (
+                soc_after_leak + dt_h * battery_charge_eff * feasible_cmd_charge
+            ) * battery_discharge_eff / dt_h_safe
+            feasible_cmd_discharge = min(
+                cmd_discharge,
+                battery_max_discharge,
+                max_discharge_from_soc,
+            )
+            if abs(feasible_cmd_discharge - cmd_discharge) > eps:
+                _record_message(
+                    validation_warnings,
+                    "battery_discharge_command_reduced",
+                    "Battery discharge command was reduced by discharge power or SOC availability.",
+                    cmd_discharge - feasible_cmd_discharge,
+                )
 
-            if sched_sum > eps:
-                weights = sched / sched_sum
+            shore_limit, shore_unit_cost = _shore_command_limit(t)
+            cmd_shore = max(0.0, float(shore_power[t, h]))
+            feasible_cmd_shore = min(cmd_shore, shore_limit)
+            if abs(feasible_cmd_shore - cmd_shore) > eps:
+                _record_message(
+                    validation_warnings,
+                    "shore_power_command_reduced",
+                    "Shore power command was reduced by sailing state or port shore-power limit.",
+                    cmd_shore - feasible_cmd_shore,
+                )
+
+            load = prop_power[t, h] + auxiliary_power[t] + feasible_cmd_charge
+            solar_available = solar_power_available[t, h]
+
+            actual_charge = feasible_cmd_charge
+            actual_discharge = 0.0
+            actual_shore = 0.0
+            gp = np.zeros(nb_gen, dtype=float)
+            gen_on_actual = np.zeros(nb_gen, dtype=float)
+
+            if solar_available >= load - eps:
+                excess_solar = max(0.0, solar_available - load)
+                max_total_charge = min(battery_max_charge, max_charge_from_soc)
+                extra_charge = min(excess_solar, max(0.0, max_total_charge - actual_charge))
+                actual_charge += extra_charge
+
+                if feasible_cmd_discharge > eps:
+                    _record_message(
+                        validation_warnings,
+                        "battery_discharge_canceled_by_solar",
+                        "Battery discharge command was canceled because solar met the load.",
+                        feasible_cmd_discharge,
+                    )
+                if feasible_cmd_shore > eps:
+                    _record_message(
+                        validation_warnings,
+                        "shore_power_canceled_by_solar",
+                        "Shore power command was canceled because solar met the load.",
+                        feasible_cmd_shore,
+                    )
+                if extra_charge > eps:
+                    _record_message(
+                        validation_warnings,
+                        "battery_extra_charge_from_solar",
+                        "Battery was charged above command to avoid wasting available solar.",
+                        extra_charge,
+                    )
+
+                solar_power[t, h] = min(solar_available, load + extra_charge)
+
             else:
-                online = gen_on > 0.5
-                if np.any(online):
-                    weights = online.astype(float) / np.sum(online)
-                else:
-                    weights = np.ones(nb_gen) / nb_gen
+                solar_power[t, h] = solar_available
+                remaining_load = load - solar_power[t, h]
 
-            gp = weights * total_gen_power
+                actual_discharge = min(feasible_cmd_discharge, remaining_load)
+                remaining_load -= actual_discharge
+                if actual_discharge + eps < feasible_cmd_discharge:
+                    _record_message(
+                        validation_warnings,
+                        "battery_discharge_reduced_by_priority",
+                        "Battery discharge command was reduced because solar already covered part of the load.",
+                        feasible_cmd_discharge - actual_discharge,
+                    )
+
+                actual_shore = min(feasible_cmd_shore, remaining_load)
+                remaining_load -= actual_shore
+                if actual_shore + eps < feasible_cmd_shore:
+                    _record_message(
+                        validation_warnings,
+                        "shore_power_reduced_by_priority",
+                        "Shore power command was reduced because solar or battery discharge already covered the load.",
+                        feasible_cmd_shore - actual_shore,
+                    )
+
+                if remaining_load > eps:
+                    gp, gen_on_actual, _unmet = _dispatch_generators(
+                        remaining_load,
+                        gen_sched,
+                        gen_on,
+                        t,
+                        h,
+                    )
+
+            battery_charge[t, h] = actual_charge
+            battery_discharge[t, h] = actual_discharge
+            shore_power[t, h] = actual_shore
+            shore_power_cost[t, h] = actual_shore * shore_unit_cost
+
+            soc_running = (
+                soc_after_leak
+                - dt_h * actual_discharge / battery_discharge_eff
+                + dt_h * battery_charge_eff * actual_charge
+            )
+            soc_running = float(np.clip(soc_running, 0.0, battery_capacity))
+
             generation_power[:, t, h] = gp
-            gen_on_all[:, t, h] = gen_on
-            gc = (a0 * gp**2 + b0 * gp + c0 * gen_on) * float(itinerary.fuel_price)
+            gen_on_all[:, t, h] = gen_on_actual
+            gc = (a0 * gp**2 + b0 * gp + c0 * gen_on_actual) * float(itinerary.fuel_price)
             gen_costs[:, t, h] = gc
             total_cost_all[t, h] = dt_h * (float(np.sum(gc)) + shore_power_cost[t, h])
+
+        SOC_eval[t + 1] = soc_running
 
     for t in range(T):
         n_real = len(segments_by_t[t])
@@ -492,12 +752,18 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(runner, eps=1e-9, debu
         gen_on_all[:, t, n_real:Hmax] = gen_on_all[:, t, last:last + 1]
         solar_power[t, n_real:Hmax] = solar_power[t, last]
         shore_power[t, n_real:Hmax] = shore_power[t, last]
+        solar_power_available[t, n_real:Hmax] = solar_power_available[t, last]
         shore_power_cost[t, n_real:Hmax] = shore_power_cost[t, last]
         battery_charge[t, n_real:Hmax] = battery_charge[t, last]
         battery_discharge[t, n_real:Hmax] = battery_discharge[t, last]
         n_all[t, n_real:Hmax] = n_all[t, last]
         best_pitch[t, n_real:Hmax] = best_pitch[t, last]
         total_cost_all[t, n_real:Hmax] = 0.0
+
+    first_stage_optimizer = (
+        getattr(sol, "first_stage_optimizer", None)
+        or type(runner).__name__
+    )
 
     non_conv_sol = Solution(
         estimated_cost=float(np.sum(total_cost_all)),
@@ -528,7 +794,7 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(runner, eps=1e-9, debu
         shore_power_cost=shore_power_cost,
         battery_charge=battery_charge,
         battery_discharge=battery_discharge,
-        SOC=sol.SOC,
+        SOC=SOC_eval,
         path_distance=getattr(sol, "path_distance", None),
         fixed_path_waypoints=getattr(sol, "fixed_path_waypoints", None),
         path_zone_ids=getattr(sol, "path_zone_ids", None),
@@ -536,7 +802,51 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(runner, eps=1e-9, debu
         step_distance=step_distance,
         segment_dt_h=segment_dt_h,
         timestep_dt_h=dt_vec,
-        interval_port_idx=getattr(sol, "interval_port_idx", None),
+        interval_port_idx=interval_port_idx_eval,
+        solar_power_available=solar_power_available,
+        first_stage_optimizer=first_stage_optimizer,
+        power_management_optimizer="EvaluatorScheduleScaling",
     )
+
+    non_conv_sol.is_valid = len(validation_errors) == 0
+    non_conv_sol.validation_warnings = validation_warnings
+    non_conv_sol.validation_errors = validation_errors
+
+    if not redispatch_energy:
+        source_label = first_stage_optimizer or type(runner).__name__
+        for rec in validation_warnings.values():
+            print(
+                f"[EMS WARNING] {source_label}: {rec['message']} "
+                f"count={rec['count']}, max_delta={rec['max_amount']:.6g} MW"
+            )
+        for rec in validation_errors.values():
+            print(
+                f"[EMS ERROR] {source_label}: {rec['message']} "
+                f"count={rec['count']}, max_shortfall={rec['max_amount']:.6g} MW"
+            )
+
+    if redispatch_energy:
+        energy_optimizer = EnergyOnlyOptimizer(
+            generator_models=generator_models,
+            itinerary=itinerary,
+            states=runner.states,
+            ship=ship,
+            source_optimizer_name=first_stage_optimizer,
+        )
+        solve_kwargs = {
+            "evaluated_solution": non_conv_sol,
+            "solar_power_available": solar_power_available,
+            "debug": debug,
+        }
+        if energy_solver is not None:
+            solve_kwargs["solver"] = energy_solver
+
+        ok = energy_optimizer.optimize(**solve_kwargs)
+        if not ok:
+            raise RuntimeError(
+                "Energy-only redispatch failed for "
+                f"{first_stage_optimizer}; see solver status above."
+            )
+        non_conv_sol = energy_optimizer.sol
 
     return n_all, non_conv_sol, segment_dt_h, best_pitch
