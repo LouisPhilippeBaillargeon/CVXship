@@ -473,7 +473,8 @@ def _record_common_slacks(report: OptimizerDebugReport, ctx: Dict[str, Any]) -> 
     wave = _as_2d_time(ctx["wave_resistance"])
     wind = _as_2d_time(ctx["wind_resistance"])
     calm = _as_2d_time(ctx["calm_water_resistance"])
-    diff = total - (wave + wind + calm)
+    acc = _as_2d_time(ctx["acc_force"]) if "acc_force" in ctx else 0.0
+    diff = total - (wave + wind + calm + acc)
     if sol is not None:
         report.add("slack.total_resistance_minus_components", diff[_sail_mask(sol, total.shape[1])])
     else:

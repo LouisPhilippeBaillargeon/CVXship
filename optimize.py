@@ -270,15 +270,36 @@ if __name__ == "__main__":
         )
         return result
 
+    def evaluate_with_rule_based_power_management(runner, label, debug=False):
+        result = compute_non_convex_cost_all_timesteps_nc_interpolated(
+            runner,
+            debug=debug,
+            nc_sources=nc_sources,
+            redispatch_energy=False,
+        )
+        sol = result[1]
+        print(
+            f"{label} rule-based EMS: "
+            f"first_stage={sol.first_stage_optimizer}, "
+            f"power_management={sol.power_management_optimizer}, "
+            f"cost={sol.estimated_cost:.6f} $"
+        )
+        return result
+
+    _, naive_rule_sol, _, _ = evaluate_with_rule_based_power_management(
+        naive,
+        "Naive Controller",
+    )
+
     _, naive_nonconv_sol, _, _ = evaluate_with_updated_power_management(
         naive,
         "Naive Controller",
     )
 
     plot_solutions(
-        [naive.sol, naive_nonconv_sol],
-        ["Naive solution runner", "Naive solution eval + energy redispatch"],
-        benchmark_label="Naive solution eval + energy redispatch",
+        [naive_rule_sol, naive_nonconv_sol],
+        ["Naive solution + rule-based EMS", "Naive solution + energy redispatch"],
+        benchmark_label="Naive solution + rule-based EMS",
         show=False,
         subfolder="Naive",
         map=naive.map,
@@ -304,21 +325,19 @@ if __name__ == "__main__":
         ok = optimizer.optimize(
             unit_commitment     = False,
             debug               = True,
-            restrict_to_naive   = True,
-            naive_solution      = naive.sol,
-            naive_segment_radius=1,
+            restrict_to_base    = True,
+            base_solution       = naive.sol,
+            base_segment_radius = 1,
         )
         if ok:
             print("Optimization succeeded.")
-            n_all, FR_STO_POW_sol, dt_h, best_pitch = evaluate_with_updated_power_management(
+            _, FR_STO_rule_sol, _, _ = evaluate_with_rule_based_power_management(
                 optimizer,
                 "FR_TSO",
             )
-            _, FR_STO_nonconv_sol, _, _ = compute_non_convex_cost_all_timesteps_nc_interpolated(
+            n_all, FR_STO_POW_sol, dt_h, best_pitch = evaluate_with_updated_power_management(
                 optimizer,
-                debug=False,
-                nc_sources=nc_sources,
-                redispatch_energy=False,
+                "FR_TSO",
             )
             def _point_to_polyline_min_dist(points, waypoints):
                 points = np.asarray(points, dtype=float)
@@ -345,7 +364,7 @@ if __name__ == "__main__":
                 ("optimizer.sol", optimizer.sol),
                 ("FR_STO_POW_sol", FR_STO_POW_sol),
                 ("naive.sol", naive.sol),
-                ("naive_solution", naive_nonconv_sol),
+                ("base_solution", naive_nonconv_sol),
             ]:
                 print("\n---", name, "---")
                 print("has FR_STO_waypoints:", getattr(sol, "FR_STO_waypoints", None) is not None)
@@ -393,11 +412,9 @@ if __name__ == "__main__":
         FR_O_runner.optimize(
             debug=True,
         )
-        _, FR_O_nonconv_sol, _, _ = compute_non_convex_cost_all_timesteps_nc_interpolated(
+        _, FR_O_rule_sol, _, _ = evaluate_with_rule_based_power_management(
             FR_O_runner,
-            debug=False,
-            nc_sources=nc_sources,
-            redispatch_energy=False,
+            "FR_O",
         )
         _, FR_O_nonconv_sol_pow, _, _ = evaluate_with_updated_power_management(
             FR_O_runner,
@@ -405,7 +422,14 @@ if __name__ == "__main__":
         )
         if dimensions == "1D":
             print_debug_report()
-            plot_solutions([FR_STO_POW_sol, naive_nonconv_sol, FR_O_nonconv_sol_pow],["FR_TSO + energy", "Naive Controller + energy", "FR_O + energy"], benchmark_label="Naive Controller + energy", show = False, subfolder="All sol compared", map=optimizer.map)
+            plot_solutions(
+                [naive_rule_sol, naive_nonconv_sol, FR_O_rule_sol, FR_O_nonconv_sol_pow, FR_STO_rule_sol, FR_STO_POW_sol],
+                ["Naive + rule-based", "Naive + energy", "FR_O + rule-based", "FR_O + energy", "FR_TSO + rule-based", "FR_TSO + energy"],
+                benchmark_label="Naive + rule-based",
+                show=False,
+                subfolder="All sol compared",
+                map=optimizer.map,
+            )
     
     if dimensions == "2D" or dimensions == "both":
         optimizer = DJPE_TSO(
@@ -431,16 +455,15 @@ if __name__ == "__main__":
             debug=True,
             ordered_zones = True,
             min_timestep = True,
-            restrict_to_naive=False,
-            naive_solution=naive.sol,
-            naive_zone_radius=1,
+            enforce_adjacency=True,
+            restrict_to_base=False,
+            base_solution=naive.sol,
+            base_zone_radius=1,
         )
         plot_zones_and_points(optimizer.sol.ship_pos, optimizer.map.zone_ineq)
-        _, DJPE_TSO_sol, _, _ = compute_non_convex_cost_all_timesteps_nc_interpolated(
+        _, DJPE_TSO_rule_sol, _, _ = evaluate_with_rule_based_power_management(
             optimizer,
-            debug=False,
-            nc_sources=nc_sources,
-            redispatch_energy=False,
+            "DJPE_TSO",
         )
         n_all, DJPE_TSO_POW_sol, dt_h, best_pitch = evaluate_with_updated_power_management(
             optimizer,
@@ -450,7 +473,14 @@ if __name__ == "__main__":
 
         if dimensions == "2D":
             print_debug_report()
-            plot_solutions([DJPE_TSO_POW_sol, naive_nonconv_sol],["DJPE_TSO + energy", "Naive Controller + energy"], benchmark_label="Naive Controller + energy", show = True, subfolder="All sol compared", map=optimizer.map)
+            plot_solutions(
+                [naive_rule_sol, naive_nonconv_sol, DJPE_TSO_rule_sol, DJPE_TSO_POW_sol],
+                ["Naive + rule-based", "Naive + energy", "DJPE_TSO + rule-based", "DJPE_TSO + energy"],
+                benchmark_label="Naive + rule-based",
+                show=True,
+                subfolder="All sol compared",
+                map=optimizer.map,
+            )
     
     if dimensions == "both":
         glob_cont_opt = CJPE_TSO(
@@ -478,16 +508,15 @@ if __name__ == "__main__":
             debug=True,
             ordered_zones = True,
             min_timestep = True,
-            restrict_to_naive=False,
-            naive_solution=naive.sol,
-            naive_zone_radius=1,
+            enforce_adjacency=True,
+            restrict_to_base=False,
+            base_solution=naive.sol,
+            base_zone_radius=1,
         )
         plot_zones_and_points(glob_cont_opt.sol.ship_pos, glob_cont_opt.map.zone_ineq)
-        _, CJTE_TSO_sol, _, _ = compute_non_convex_cost_all_timesteps_nc_interpolated(
+        _, CJTE_TSO_rule_sol, _, _ = evaluate_with_rule_based_power_management(
             glob_cont_opt,
-            debug=False,
-            nc_sources=nc_sources,
-            redispatch_energy=False,
+            "CJPE_TSO",
         )
         n_all, CJTE_TSO_POW_sol, dt_h, best_pitch = evaluate_with_updated_power_management(
             glob_cont_opt,
@@ -506,4 +535,33 @@ if __name__ == "__main__":
             print("  evaluator:", np.asarray(CJTE_TSO_POW_sol.__dict__[name]).shape)
         plot_solutions([glob_cont_opt.sol, CJTE_TSO_POW_sol],["Convex CJPE_TSO solution", "Non-convex CJPE_TSO + energy redispatch"], benchmark_label="Non-convex CJPE_TSO + energy redispatch", show=False, subfolder="CJPE_TSO Path", map=optimizer.map)
         print_debug_report()
-        plot_solutions([naive_fit_sol, naive_nonconv_sol, FR_O_nonconv_sol, FR_O_nonconv_sol_pow, FR_STO_nonconv_sol, FR_STO_POW_sol, CJTE_TSO_sol, CJTE_TSO_POW_sol, DJPE_TSO_sol, DJPE_TSO_POW_sol],["Naive Controller", "Naive Controller + energy", "FR_O", "FR_O + energy", "FR_TSO", "FR_TSO + energy", "CJPE_TSO", "CJPE_TSO + energy", "DJPE_TSO", "DJPE_TSO + energy"], benchmark_label="Naive Controller", show = True, subfolder="All sol compared", map=optimizer.map)
+        plot_solutions(
+            [
+                naive_rule_sol,
+                naive_nonconv_sol,
+                FR_O_rule_sol,
+                FR_O_nonconv_sol_pow,
+                FR_STO_rule_sol,
+                FR_STO_POW_sol,
+                CJTE_TSO_rule_sol,
+                CJTE_TSO_POW_sol,
+                DJPE_TSO_rule_sol,
+                DJPE_TSO_POW_sol,
+            ],
+            [
+                "Naive Controller + rule-based",
+                "Naive Controller + energy",
+                "FR_O + rule-based",
+                "FR_O + energy",
+                "FR_TSO + rule-based",
+                "FR_TSO + energy",
+                "CJPE_TSO + rule-based",
+                "CJPE_TSO + energy",
+                "DJPE_TSO + rule-based",
+                "DJPE_TSO + energy",
+            ],
+            benchmark_label="Naive Controller + rule-based",
+            show=True,
+            subfolder="All sol compared",
+            map=optimizer.map,
+        )

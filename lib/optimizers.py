@@ -39,6 +39,7 @@ class Solution:
     wave_resistance         : np.ndarray #[T_future]
     wind_resistance         : np.ndarray #[T_future]
     calm_water_resistance      : np.ndarray #[T_future]
+    acc_force               : np.ndarray #[T_future]
     total_resistance        : np.ndarray #[T_future]
 
     generation_power        : np.ndarray #[nb_gen,T_future]
@@ -109,6 +110,74 @@ def _segment_indices_from_distance(D_breaks: np.ndarray, d_values: np.ndarray) -
     d_values = np.asarray(d_values, dtype=float).reshape(-1)
     s = np.searchsorted(D_breaks, d_values, side="right") - 1
     return np.clip(s, 0, len(D_breaks) - 2).astype(int)
+
+
+def _ordered_ids_from_solution(selection_matrix: np.ndarray) -> List[int]:
+    """
+    Return unique set ids in first-encountered order from a one-hot solution.
+    Consecutive repeats are collapsed before removing later repeats.
+    """
+    selected_idx = _indices_from_one_hot(selection_matrix)
+
+    ordered_ids = []
+    for z in selected_idx:
+        z = int(z)
+        if len(ordered_ids) == 0 or ordered_ids[-1] != z:
+            ordered_ids.append(z)
+
+    unique_ordered_ids = []
+    seen = set()
+    for z in ordered_ids:
+        if z in seen:
+            continue
+        unique_ordered_ids.append(z)
+        seen.add(z)
+
+    return unique_ordered_ids
+
+
+def _add_ordered_set_constraints(
+    constraints: list,
+    selection,
+    nb_sets: int,
+    ordered_set_ids: List[int],
+):
+    """
+    Restrict a one-hot set selection to stay in the base order and advance by
+    at most one set per timestep.
+    """
+    ordered_set_ids = [int(z) for z in ordered_set_ids]
+    ordered_set_id_set = set(ordered_set_ids)
+
+    for z in range(nb_sets):
+        if z not in ordered_set_id_set:
+            constraints += [selection[:, z] == 0]
+
+    for t in range(selection.shape[0] - 1):
+        for k, z_next in enumerate(ordered_set_ids):
+            if k == 0:
+                allowed_prev = [z_next]
+            else:
+                allowed_prev = [ordered_set_ids[k - 1], z_next]
+
+            constraints += [
+                selection[t + 1, z_next] <= cp.sum(selection[t, allowed_prev])
+            ]
+
+
+def _base_timestep_weights(
+    timestep_dt_h: np.ndarray,
+    interval_sail_fraction: np.ndarray,
+    base_timestep_h: float,
+) -> np.ndarray:
+    if base_timestep_h <= 0:
+        raise ValueError("base_timestep_h must be > 0.")
+
+    return (
+        np.asarray(timestep_dt_h, dtype=float)
+        * np.asarray(interval_sail_fraction, dtype=float)
+        / float(base_timestep_h)
+    )
 
 
 def _future_dt_h(itinerary, states, T_future: int) -> np.ndarray:
@@ -631,9 +700,10 @@ class DJPE_TSO:
         debug = False,
         ordered_zones = False,
         min_timestep = False,
-        restrict_to_naive=False,
-        naive_solution=None,
-        naive_zone_radius=1,
+        enforce_adjacency=True,
+        restrict_to_base=False,
+        base_solution=None,
+        base_zone_radius=1,
     ):
         constraints = []
 
@@ -646,6 +716,7 @@ class DJPE_TSO:
         timestep_dt_h = _future_dt_h(self.itinerary, self.states, T_future)
         auxiliary_power = _future_auxiliary_power(self.itinerary, self.states, T_future)
         half_dt_h = 0.5 * timestep_dt_h
+        half_dt_s = half_dt_h * 3600.0
         ship_speed_limit = _ship_speed_limit_matrix(
             self.map, self.itinerary, self.states, self.ship, T_future
         )
@@ -711,44 +782,25 @@ class DJPE_TSO:
                 constraints += [zone[t, :] == e]
 
         # =============================================== ADJACENCY ==================================================
-        forbid = (1 - self.map.zone_adj).astype(int)
-        constraints += [zone[:-1, :] @ forbid + zone[1:, :] <= 1]
+        if enforce_adjacency:
+            forbid = (1 - self.map.zone_adj).astype(int)
+            constraints += [zone[:-1, :] @ forbid + zone[1:, :] <= 1]
 
         if ordered_zones:
-            if naive_solution is None:
-                raise ValueError("ordered_zones=True now requires naive_solution.")
+            if base_solution is None:
+                raise ValueError("ordered_zones=True requires base_solution.")
 
-            naive_zone_idx = np.argmax(np.asarray(naive_solution.zone), axis=1)
-
-            # Keep unique zones in the order encountered by the naive solution
-            ordered_zone_ids = []
-            for z in naive_zone_idx:
-                z = int(z)
-                if len(ordered_zone_ids) == 0 or ordered_zone_ids[-1] != z:
-                    ordered_zone_ids.append(z)
-
-            # Remove repeated later occurrences defensively
-            seen = set()
-            ordered_zone_ids = [z for z in ordered_zone_ids if not (z in seen or seen.add(z))]
+            ordered_zone_ids = _ordered_ids_from_solution(base_solution.zone)
 
             if debug:
-                print("Ordered zone ids from naive:", ordered_zone_ids)
+                print("Ordered zone ids from base:", ordered_zone_ids)
 
-            zone_rank = {z: k for k, z in enumerate(ordered_zone_ids)}
-
-            # Optional but recommended: forbid zones not in the naive route
-            for z in range(self.map.nb_zones):
-                if z not in zone_rank:
-                    constraints += [zone[:, z] == 0]
-
-            # Monotone progress: rank can stay the same or increase by one
-            for t in range(T_future):
-                for k, z_next in enumerate(ordered_zone_ids):
-                    allowed_prev = ordered_zone_ids[: k + 1]
-
-                    constraints += [
-                        zone[t + 1, z_next] <= cp.sum(zone[t, allowed_prev])
-                    ]
+            _add_ordered_set_constraints(
+                constraints,
+                zone,
+                self.map.nb_zones,
+                ordered_zone_ids,
+            )
 
         # ================================ SAFE TRANSITIONS WITH TWO HALF-SEGMENTS ===================================
         crossing_point = cp.Variable((T_future, 2))
@@ -823,6 +875,11 @@ class DJPE_TSO:
                 print("map.zone_ineq nb_zones:", self.map.zone_ineq.shape[2])
 
             zone_used = cp.Variable(self.map.nb_zones, boolean=True)
+            base_step_weights = _base_timestep_weights(
+                timestep_dt_h,
+                interval_sail_fraction,
+                self.itinerary.timestep,
+            )
 
             start_zone = int(np.argmax(point_in_zones(
                 np.array([self.states.current_x_pos, self.states.current_y_pos]),
@@ -834,33 +891,39 @@ class DJPE_TSO:
                 if z in (start_zone, end_zone):
                     continue
 
-                occ_z = cp.sum(zone[:, z])
-                constraints += [occ_z >= zone_used[z]]
-                constraints += [occ_z <= (T_future + 1) * zone_used[z]]
-                constraints += [occ_z >= min_zone_steps[z] * zone_used[z]]
+                node_occ_z = cp.sum(zone[:, z])
+                interval_occ_z = 0.5 * cp.sum(
+                    cp.multiply(
+                        base_step_weights,
+                        zone[:-1, z] + zone[1:, z],
+                    )
+                )
+                constraints += [node_occ_z >= zone_used[z]]
+                constraints += [node_occ_z <= (T_future + 1) * zone_used[z]]
+                constraints += [interval_occ_z >= float(min_zone_steps[z]) * zone_used[z]]
 
             if debug:
                 min_dist_by_id = _compute_min_crossing_distance_per_zone(CORNERS, ZONES)
                 print("Minimum crossing distance per zone [km]:", min_dist_by_id)
                 print("Minimum crossing timesteps per zone:", min_zone_steps_by_id)
 
-        # ========================================== RESTRICT TO NAIVE +/- R ZONES ====================================
-        if restrict_to_naive:
-            if naive_solution is None:
-                raise ValueError("restrict_to_naive=True requires naive_solution.")
+        # ========================================== RESTRICT TO BASE +/- R ZONES =====================================
+        if restrict_to_base:
+            if base_solution is None:
+                raise ValueError("restrict_to_base=True requires base_solution.")
 
-            naive_zone_idx = _indices_from_one_hot(naive_solution.zone)
+            base_zone_idx = _indices_from_one_hot(base_solution.zone)
 
-            if len(naive_zone_idx) != T_future + 1:
+            if len(base_zone_idx) != T_future + 1:
                 raise ValueError(
-                    f"naive_solution.zone has length {len(naive_zone_idx)}, "
+                    f"base_solution.zone has length {len(base_zone_idx)}, "
                     f"but expected {T_future + 1}."
                 )
 
             allowed_zone_mask = _one_hot_window_from_indices(
-                naive_zone_idx,
+                base_zone_idx,
                 nb_choices=self.map.nb_zones,
-                radius=naive_zone_radius,
+                radius=base_zone_radius,
             )
 
             for t in range(T_future + 1):
@@ -869,7 +932,7 @@ class DJPE_TSO:
                         constraints += [zone[t, z] == 0]
 
             if debug:
-                print(f"Restricted DJPE_TSO zones to naive +/- {naive_zone_radius}.")
+                print(f"Restricted DJPE_TSO zones to base +/- {base_zone_radius}.")
 
         # ================================================ EARTH-FIXED SPEED ==========================================
         ship_speed_x = cp.Variable((T_future, H))
@@ -904,6 +967,27 @@ class DJPE_TSO:
                         2,
                     )
                 ]
+
+        # ================================================= ACCELERATION ===============================================
+        acc = cp.Variable((T_future, H))
+        acc_force = cp.Variable((T_future, H))
+        half_dt_s_TH = np.repeat(half_dt_s[:, None], H, axis=1)
+
+        constraints += [acc <= self.ship.info.max_speed / half_dt_s_TH]
+        constraints += [acc >= -self.ship.info.max_speed / half_dt_s_TH]
+        constraints += [
+            acc[0, 0] == (speed_mag[0, 0] - self.itinerary.init_speed) / half_dt_s[0],
+            acc[0, 1] == (speed_mag[0, 1] - speed_mag[0, 0]) / half_dt_s[0],
+        ]
+
+        for t in range(1, T_future):
+            constraints += [
+                acc[t, 0] == (speed_mag[t, 0] - speed_mag[t - 1, 1]) / half_dt_s[t],
+                acc[t, 1] == (speed_mag[t, 1] - speed_mag[t, 0]) / half_dt_s[t],
+            ]
+
+        constraints += [acc_force >= 0]
+        constraints += [acc_force >= acc * self.ship.info.weight / 1_000_000]
 
         # ================================================ RELATIVE SPEEDS =============================================
         speed_rel_water_x = cp.Variable((T_future, H))
@@ -1036,7 +1120,7 @@ class DJPE_TSO:
         constraints += [total_resistance >= 0]
         constraints += [wave_resistance >= 0]
         constraints += [
-            total_resistance >= wave_resistance + wind_resistance + calm_water_resistance
+            total_resistance >= wave_resistance + wind_resistance + calm_water_resistance + acc_force
         ]
 
         # ================================================= PROPULSION =================================================
@@ -1230,11 +1314,25 @@ class DJPE_TSO:
                 [np.array(ship_speed_x.value), np.array(ship_speed_y.value)],
                 axis=1,
             )  # [T_future, 2(x,y), 2(segment)]
+            speed_mag_out = np.linalg.norm(np.moveaxis(ship_speed_out, 1, -1), axis=-1)
+            ship_pos_out = np.asarray(ship_pos.value, dtype=float)
+            crossing_point_out = np.asarray(crossing_point.value, dtype=float)
+            step_distance_out = np.stack(
+                [
+                    np.linalg.norm(crossing_point_out - ship_pos_out[:-1, :], axis=1),
+                    np.linalg.norm(ship_pos_out[1:, :] - crossing_point_out, axis=1),
+                ],
+                axis=1,
+            )
 
             speed_rel_water_out = np.stack(
                 [np.array(speed_rel_water_x.value), np.array(speed_rel_water_y.value)],
                 axis=1,
             )  # [T_future, 2(x,y), 2(segment)]
+            speed_rel_water_mag_out = np.linalg.norm(
+                np.moveaxis(speed_rel_water_out, 1, -1),
+                axis=-1,
+            )
 
             shore_power_cost = np.array(shore_power.value).astype(float) * shore_cost[:, None].astype(float)
 
@@ -1245,20 +1343,21 @@ class DJPE_TSO:
                 instant_sail            = instant_sail,
                 port_idx                = port_idx,
                 interval_sail_fraction  = interval_sail_fraction,
-                total_distance          = float(np.sum(step_distance.value)),
+                total_distance          = float(np.sum(step_distance_out)),
 
                 zone                    = np.array(zone.value),
-                ship_pos                = np.array(ship_pos.value),
+                ship_pos                = ship_pos_out,
                 ship_speed              = ship_speed_out,
-                speed_mag               = np.array(speed_mag.value),
+                speed_mag               = speed_mag_out,
                 speed_rel_water         = speed_rel_water_out,
-                speed_rel_water_mag     = np.array(speed_rel_water_mag.value),
+                speed_rel_water_mag     = speed_rel_water_mag_out,
 
                 prop_power              = np.array(prop_power.value),
                 auxiliary_power         = auxiliary_power,
                 wave_resistance         = np.array(wave_resistance.value),
                 wind_resistance         = np.array(wind_resistance.value),
                 calm_water_resistance   = np.array(calm_water_resistance.value),
+                acc_force               = np.array(acc_force.value),
                 total_resistance        = np.array(total_resistance.value),
 
                 generation_power        = gen_power_out,
@@ -1271,8 +1370,8 @@ class DJPE_TSO:
                 battery_discharge       = np.array(battery_discharge.value),
                 SOC                     = np.array(SOC.value),
 
-                crossing_point          = np.array(crossing_point.value),
-                step_distance           = np.array(step_distance.value),
+                crossing_point          = crossing_point_out,
+                step_distance           = step_distance_out,
                 timestep_dt_h           = timestep_dt_h,
                 interval_port_idx       = interval_port_idx,
             )
@@ -1291,6 +1390,7 @@ class DJPE_TSO:
                         "wave_resistance": wave_resistance.value,
                         "calm_water_resistance": calm_water_resistance.value,
                         "total_resistance": total_resistance.value,
+                        "acc_force": acc_force.value,
                         "prop_power": prop_power.value,
                         "generation_power": gen_power_out,
                         "gen_costs": gen_costs_out,
@@ -1332,9 +1432,10 @@ class CJPE_TSO:
         debug = False,
         ordered_zones = False,
         min_timestep = False,
-        restrict_to_naive=False,
-        naive_solution=None,
-        naive_zone_radius=1,
+        enforce_adjacency=True,
+        restrict_to_base=False,
+        base_solution=None,
+        base_zone_radius=1,
     ):
         constraints = []
 
@@ -1344,6 +1445,7 @@ class CJPE_TSO:
         T_future = self.itinerary.nb_timesteps - self.states.timesteps_completed
         timestep_dt_h = _future_dt_h(self.itinerary, self.states, T_future)
         auxiliary_power = _future_auxiliary_power(self.itinerary, self.states, T_future)
+        timestep_dt_s = timestep_dt_h * 3600.0
         half_dt_h = 0.5 * timestep_dt_h
         ship_speed_limit = _ship_speed_limit_matrix(
             self.map, self.itinerary, self.states, self.ship, T_future
@@ -1411,44 +1513,25 @@ class CJPE_TSO:
                 constraints += [zone[t, :] == e]
 
         # =============================================== ADJACENCY ==================================================
-        forbid = (1 - self.map.zone_adj).astype(int)
-        constraints += [zone[:-1, :] @ forbid + zone[1:, :] <= 1]
+        if enforce_adjacency:
+            forbid = (1 - self.map.zone_adj).astype(int)
+            constraints += [zone[:-1, :] @ forbid + zone[1:, :] <= 1]
 
         if ordered_zones:
-            if naive_solution is None:
-                raise ValueError("ordered_zones=True now requires naive_solution.")
+            if base_solution is None:
+                raise ValueError("ordered_zones=True requires base_solution.")
 
-            naive_zone_idx = np.argmax(np.asarray(naive_solution.zone), axis=1)
-
-            # Keep unique zones in the order encountered by the naive solution
-            ordered_zone_ids = []
-            for z in naive_zone_idx:
-                z = int(z)
-                if len(ordered_zone_ids) == 0 or ordered_zone_ids[-1] != z:
-                    ordered_zone_ids.append(z)
-
-            # Remove repeated later occurrences defensively
-            seen = set()
-            ordered_zone_ids = [z for z in ordered_zone_ids if not (z in seen or seen.add(z))]
+            ordered_zone_ids = _ordered_ids_from_solution(base_solution.zone)
 
             if debug:
-                print("Ordered zone ids from naive:", ordered_zone_ids)
+                print("Ordered zone ids from base:", ordered_zone_ids)
 
-            zone_rank = {z: k for k, z in enumerate(ordered_zone_ids)}
-
-            # Optional but recommended: forbid zones not in the naive route
-            for z in range(self.map.nb_zones):
-                if z not in zone_rank:
-                    constraints += [zone[:, z] == 0]
-
-            # Monotone progress: rank can stay the same or increase by one
-            for t in range(T_future):
-                for k, z_next in enumerate(ordered_zone_ids):
-                    allowed_prev = ordered_zone_ids[: k + 1]
-
-                    constraints += [
-                        zone[t + 1, z_next] <= cp.sum(zone[t, allowed_prev])
-                    ]
+            _add_ordered_set_constraints(
+                constraints,
+                zone,
+                self.map.nb_zones,
+                ordered_zone_ids,
+            )
 
         # ================================ SAFE TRANSITIONS WITH TWO SEGMENTS ===================================
         crossing_point = cp.Variable((T_future, 2))
@@ -1523,6 +1606,11 @@ class CJPE_TSO:
                 print("map.zone_ineq nb_zones:", self.map.zone_ineq.shape[2])
 
             zone_used = cp.Variable(self.map.nb_zones, boolean=True)
+            base_step_weights = _base_timestep_weights(
+                timestep_dt_h,
+                interval_sail_fraction,
+                self.itinerary.timestep,
+            )
 
             start_zone = int(np.argmax(point_in_zones(
                 np.array([self.states.current_x_pos, self.states.current_y_pos]),
@@ -1534,33 +1622,39 @@ class CJPE_TSO:
                 if z in (start_zone, end_zone):
                     continue
 
-                occ_z = cp.sum(zone[:, z])
-                constraints += [occ_z >= zone_used[z]]
-                constraints += [occ_z <= (T_future + 1) * zone_used[z]]
-                constraints += [occ_z >= min_zone_steps[z] * zone_used[z]]
+                node_occ_z = cp.sum(zone[:, z])
+                interval_occ_z = 0.5 * cp.sum(
+                    cp.multiply(
+                        base_step_weights,
+                        zone[:-1, z] + zone[1:, z],
+                    )
+                )
+                constraints += [node_occ_z >= zone_used[z]]
+                constraints += [node_occ_z <= (T_future + 1) * zone_used[z]]
+                constraints += [interval_occ_z >= float(min_zone_steps[z]) * zone_used[z]]
 
             if debug:
                 min_dist_by_id = _compute_min_crossing_distance_per_zone(CORNERS, ZONES)
                 print("Minimum crossing distance per zone [km]:", min_dist_by_id)
                 print("Minimum crossing timesteps per zone:", min_zone_steps_by_id)
 
-        # ========================================== RESTRICT TO NAIVE +/- R ZONES ====================================
-        if restrict_to_naive:
-            if naive_solution is None:
-                raise ValueError("restrict_to_naive=True requires naive_solution.")
+        # ========================================== RESTRICT TO BASE +/- R ZONES =====================================
+        if restrict_to_base:
+            if base_solution is None:
+                raise ValueError("restrict_to_base=True requires base_solution.")
 
-            naive_zone_idx = _indices_from_one_hot(naive_solution.zone)
+            base_zone_idx = _indices_from_one_hot(base_solution.zone)
 
-            if len(naive_zone_idx) != T_future + 1:
+            if len(base_zone_idx) != T_future + 1:
                 raise ValueError(
-                    f"naive_solution.zone has length {len(naive_zone_idx)}, "
+                    f"base_solution.zone has length {len(base_zone_idx)}, "
                     f"but expected {T_future + 1}."
                 )
 
             allowed_zone_mask = _one_hot_window_from_indices(
-                naive_zone_idx,
+                base_zone_idx,
                 nb_choices=self.map.nb_zones,
-                radius=naive_zone_radius,
+                radius=base_zone_radius,
             )
 
             for t in range(T_future + 1):
@@ -1569,7 +1663,7 @@ class CJPE_TSO:
                         constraints += [zone[t, z] == 0]
 
             if debug:
-                print(f"Restricted DJPE_TSO zones to naive +/- {naive_zone_radius}.")
+                print(f"Restricted CJPE_TSO zones to base +/- {base_zone_radius}.")
 
         # ================================================ EARTH-FIXED SPEED ==========================================
         speed_mag_split = cp.Variable((T_future, 2), nonneg=True)
@@ -1605,6 +1699,20 @@ class CJPE_TSO:
                     )
                 ]
         constraints += [speed_mag >=cp.sum(speed_mag_split,axis=1)/2]
+
+        # ================================================= ACCELERATION ===============================================
+        acc = cp.Variable(T_future)
+        acc_force = cp.Variable(T_future)
+
+        constraints += [acc <= self.ship.info.max_speed / timestep_dt_s]
+        constraints += [acc >= -self.ship.info.max_speed / timestep_dt_s]
+        constraints += [acc[0] == (speed_mag[0] - self.itinerary.init_speed) / timestep_dt_s[0]]
+
+        for t in range(1, T_future):
+            constraints += [acc[t] == (speed_mag[t] - speed_mag[t - 1]) / timestep_dt_s[t]]
+
+        constraints += [acc_force >= 0]
+        constraints += [acc_force >= acc * self.ship.info.weight / 1_000_000]
 
         # ================================================ RELATIVE SPEEDS =============================================
         ship_speed_x_split_rel_water = cp.Variable((T_future, 2))
@@ -1779,7 +1887,7 @@ class CJPE_TSO:
         constraints += [total_resistance >= 0]
         constraints += [wave_resistance >= 0]
         constraints += [
-            total_resistance >= wave_resistance + wind_resistance + calm_water_resistance
+            total_resistance >= wave_resistance + wind_resistance + calm_water_resistance + acc_force
         ]
 
         # ================================================= PROPULSION =================================================
@@ -1935,11 +2043,35 @@ class CJPE_TSO:
                 [np.array(ship_speed_x.value), np.array(ship_speed_y.value)],
                 axis=1,
             )  # [T_future, 2(x,y), 2(segment)]
+            ship_speed_split_out = np.stack(
+                [
+                    np.asarray(ship_speed_x_split.value),
+                    np.asarray(ship_speed_y_split.value),
+                ],
+                axis=1,
+            )
+            speed_mag_out = np.mean(
+                np.linalg.norm(np.moveaxis(ship_speed_split_out, 1, -1), axis=-1),
+                axis=1,
+            )
 
             speed_rel_water_out = np.stack(
                 [np.array(ship_speed_x_split_rel_water.value), np.array(ship_speed_y_split_rel_water.value)],
                 axis=1,
             )  # [T_future, 2(x,y), 2(segment)]
+            speed_rel_water_mag_out = np.mean(
+                np.linalg.norm(np.moveaxis(speed_rel_water_out, 1, -1), axis=-1),
+                axis=1,
+            )
+            ship_pos_out = np.asarray(ship_pos.value, dtype=float)
+            crossing_point_out = np.asarray(crossing_point.value, dtype=float)
+            step_distance_out = np.stack(
+                [
+                    np.linalg.norm(crossing_point_out - ship_pos_out[:-1, :], axis=1),
+                    np.linalg.norm(ship_pos_out[1:, :] - crossing_point_out, axis=1),
+                ],
+                axis=1,
+            )
             shore_power_cost = np.array(shore_power.value).astype(float) * shore_cost.astype(float)
 
             self.sol = Solution(
@@ -1949,20 +2081,21 @@ class CJPE_TSO:
                 instant_sail            = instant_sail,
                 port_idx                = port_idx,
                 interval_sail_fraction  = interval_sail_fraction,
-                total_distance          = float(np.sum(step_distance.value)),
+                total_distance          = float(np.sum(step_distance_out)),
 
                 zone                    = np.array(zone.value),
-                ship_pos                = np.array(ship_pos.value),
+                ship_pos                = ship_pos_out,
                 ship_speed              = ship_speed_out,
-                speed_mag               = np.array(speed_mag.value),
+                speed_mag               = speed_mag_out,
                 speed_rel_water         = speed_rel_water_out,
-                speed_rel_water_mag     = np.array(speed_rel_water_mag.value),
+                speed_rel_water_mag     = speed_rel_water_mag_out,
 
                 prop_power              = np.array(prop_power.value),
                 auxiliary_power         = auxiliary_power,
                 wave_resistance         = np.array(wave_resistance.value),
                 wind_resistance         = np.array(wind_resistance.value),
                 calm_water_resistance   = np.array(calm_water_resistance.value),
+                acc_force               = np.array(acc_force.value),
                 total_resistance        = np.array(total_resistance.value),
 
                 generation_power        = np.array(generation_power.value),
@@ -1975,8 +2108,8 @@ class CJPE_TSO:
                 battery_discharge       = np.array(battery_discharge.value),
                 SOC                     = np.array(SOC.value),
 
-                crossing_point          = np.array(crossing_point.value),
-                step_distance           = np.array(step_distance.value),
+                crossing_point          = crossing_point_out,
+                step_distance           = step_distance_out,
                 path_zone_ids           = np.array(self.path_zone_ids),
                 timestep_dt_h           = timestep_dt_h,
                 interval_port_idx       = interval_port_idx,
@@ -2012,6 +2145,7 @@ class CJPE_TSO:
                         "wave_resistance": wave_resistance.value,
                         "calm_water_resistance": calm_water_resistance.value,
                         "total_resistance": total_resistance.value,
+                        "acc_force": acc_force.value,
                         "prop_power": prop_power.value,
                         "generation_power": generation_power.value,
                         "gen_costs": gen_costs.value,
@@ -2052,9 +2186,10 @@ class FR_TSO:
         self,
         unit_commitment=False,
         debug=False,
-        restrict_to_naive=False,
-        naive_solution=None,
-        naive_segment_radius=1,
+        min_timestep=False,
+        restrict_to_base=False,
+        base_solution=None,
+        base_segment_radius=1,
     ):
         constraints = []
 
@@ -2064,6 +2199,7 @@ class FR_TSO:
         T_future = self.itinerary.nb_timesteps - self.states.timesteps_completed
         timestep_dt_h = _future_dt_h(self.itinerary, self.states, T_future)
         auxiliary_power = _future_auxiliary_power(self.itinerary, self.states, T_future)
+        timestep_dt_s = timestep_dt_h * 3600.0
         ship_speed_limit = _ship_speed_limit_matrix(
             self.map, self.itinerary, self.states, self.ship, T_future
         )
@@ -2102,22 +2238,22 @@ class FR_TSO:
         cos_seg = np.cos(theta_seg)
         sin_seg = np.sin(theta_seg)
 
-        # ================================= NAIVE RESTRICTION REF =================================
-        naive_seg_idx = None
-        if restrict_to_naive:
-            if naive_solution is None:
-                raise ValueError("restrict_to_naive=True requires naive_solution.")
-            if naive_solution.path_distance is None:
-                raise ValueError("Fixed path restriction requires naive_solution.path_distance.")
+        # ================================= BASE RESTRICTION REF =================================
+        base_seg_idx = None
+        if restrict_to_base:
+            if base_solution is None:
+                raise ValueError("restrict_to_base=True requires base_solution.")
+            if base_solution.path_distance is None:
+                raise ValueError("Fixed path restriction requires base_solution.path_distance.")
 
-            naive_seg_idx = _segment_indices_from_distance(
+            base_seg_idx = _segment_indices_from_distance(
                 D_breaks,
-                naive_solution.path_distance,
+                base_solution.path_distance,
             )
 
-            if len(naive_seg_idx) != T_future + 1:
+            if len(base_seg_idx) != T_future + 1:
                 raise ValueError(
-                    f"naive_solution.path_distance has length {len(naive_seg_idx)}, "
+                    f"base_solution.path_distance has length {len(base_seg_idx)}, "
                     f"but expected {T_future + 1}."
                 )
 
@@ -2167,12 +2303,58 @@ class FR_TSO:
                         seg[t + 1, s_next] <= seg[t, s_next] + seg[t, s_next - 1]
                     ]
 
-        # ================================= RESTRICT TO NAIVE +/- R SEGMENTS =================================
-        if restrict_to_naive:
+        # ================================= MINIMUM TIMESTEPS PER SEGMENT =================================
+        if min_timestep:
+            base_step_weights = _base_timestep_weights(
+                timestep_dt_h,
+                interval_sail_fraction,
+                self.itinerary.timestep,
+            )
+
+            max_dist_per_base_step_km = (
+                np.max(path_speed_limit, axis=1)
+                * float(self.itinerary.timestep)
+                * 3600.0
+                / 1000.0
+            )
+
+            min_segment_steps = np.zeros(nb_path_zones, dtype=int)
+            for s in range(nb_path_zones):
+                remaining_len = max(
+                    0.0,
+                    min(float(D_breaks[s + 1]), total_path_length)
+                    - max(float(D_breaks[s]), d0),
+                )
+                if remaining_len <= 1e-9:
+                    continue
+                if max_dist_per_base_step_km[s] <= 0:
+                    raise ValueError("Segment speed limit must be > 0.")
+                min_segment_steps[s] = max(
+                    1,
+                    int(np.ceil(remaining_len / max_dist_per_base_step_km[s])),
+                )
+
+            for s in range(nb_path_zones):
+                if min_segment_steps[s] <= 0:
+                    continue
+
+                interval_occ_s = 0.5 * cp.sum(
+                    cp.multiply(
+                        base_step_weights,
+                        seg[:-1, s] + seg[1:, s],
+                    )
+                )
+                constraints += [interval_occ_s >= float(min_segment_steps[s])]
+
+            if debug:
+                print("min_segment_steps:", min_segment_steps)
+
+        # ================================= RESTRICT TO BASE +/- R SEGMENTS =================================
+        if restrict_to_base:
             allowed_seg_mask = _one_hot_window_from_indices(
-                naive_seg_idx,
+                base_seg_idx,
                 nb_choices=nb_path_zones,
-                radius=naive_segment_radius,
+                radius=base_segment_radius,
             )
 
             for t in range(T_future + 1):
@@ -2181,7 +2363,7 @@ class FR_TSO:
                         constraints += [seg[t, s] == 0]
 
             if debug:
-                print(f"Restricted FR_TSO segments to naive +/- {naive_segment_radius}.")
+                print(f"Restricted FR_TSO segments to base +/- {base_segment_radius}.")
 
         # ================================= SPEED =================================
         step_distance = cp.Variable(T_future, nonneg=True)
@@ -2235,6 +2417,23 @@ class FR_TSO:
         constraints += [ship_speed_y_split <= self.ship.info.max_speed]
         constraints += [ship_speed_x_split >= -self.ship.info.max_speed]
         constraints += [ship_speed_y_split >= -self.ship.info.max_speed]
+
+        # ================================= ACCELERATION =================================
+        acc = cp.Variable(T_future)
+        acc_force = cp.Variable(T_future)
+
+        init_speed = float(getattr(self.itinerary, "init_speed", 0.0))
+
+        constraints += [acc <= self.ship.info.max_speed / timestep_dt_s]
+        constraints += [acc >= -self.ship.info.max_speed / timestep_dt_s]
+        constraints += [acc[0] == (speed_mag[0] - init_speed) / timestep_dt_s[0]]
+
+        for t in range(1, T_future):
+            constraints += [acc[t] == (speed_mag[t] - speed_mag[t - 1]) / timestep_dt_s[t]]
+
+        constraints += [acc_force == acc * self.ship.info.weight / 1_000_000]
+        constraints += [acc_force <= (self.ship.info.max_speed / timestep_dt_s) * self.ship.info.weight / 1_000_000]
+        constraints += [acc_force >= -(self.ship.info.max_speed / timestep_dt_s) * self.ship.info.weight / 1_000_000]
 
         # ================================= WATER-RELATIVE SPEED =================================
         ship_speed_x_split_rel_water = cp.Variable((T_future, 2))
@@ -2399,7 +2598,7 @@ class FR_TSO:
                 ]
 
         constraints += [
-            total_resistance >= wave_resistance + wind_resistance + calm_water_resistance
+            total_resistance >= wave_resistance + wind_resistance + calm_water_resistance + acc_force
         ]
 
         # ================================= PROPULSION =================================
@@ -2627,6 +2826,7 @@ class FR_TSO:
             wave_resistance=np.asarray(wave_resistance.value),
             wind_resistance=np.asarray(wind_resistance.value),
             calm_water_resistance=np.asarray(calm_water_resistance.value),
+            acc_force=np.asarray(acc_force.value),
             total_resistance=np.asarray(total_resistance.value),
 
             generation_power=np.asarray(generation_power.value),
@@ -2676,6 +2876,7 @@ class FR_TSO:
                     "wave_resistance": wave_resistance.value,
                     "calm_water_resistance": calm_water_resistance.value,
                     "total_resistance": total_resistance.value,
+                    "acc_force": acc_force.value,
                     "prop_power": prop_power.value,
                     "generation_power": generation_power.value,
                     "gen_costs": gen_costs.value,
@@ -2848,6 +3049,7 @@ class FR_O:
         self._precompute_timesampled_weather_models(debug=debug)
         timestep_dt_h = _future_dt_h(self.itinerary, self.states, T_future)
         auxiliary_power = _future_auxiliary_power(self.itinerary, self.states, T_future)
+        timestep_dt_s = timestep_dt_h * 3600.0
 
         instant_sail, port_idx, interval_sail_fraction = classify_timesteps(self.itinerary)
         instant_sail = instant_sail[self.states.timesteps_completed:]
@@ -2915,6 +3117,23 @@ class FR_O:
 
         ship_speed_x = cp.multiply(speed_mag, cos_t)
         ship_speed_y = cp.multiply(speed_mag, sin_t)
+
+        # ================================= ACCELERATION =================================
+        acc = cp.Variable(T_future)
+        acc_force = cp.Variable(T_future)
+
+        init_speed = float(getattr(self.itinerary, "init_speed", 0.0))
+
+        constraints += [acc <= self.ship.info.max_speed / timestep_dt_s]
+        constraints += [acc >= -self.ship.info.max_speed / timestep_dt_s]
+        constraints += [acc[0] == (speed_mag[0] - init_speed) / timestep_dt_s[0]]
+
+        for t in range(1, T_future):
+            constraints += [acc[t] == (speed_mag[t] - speed_mag[t - 1]) / timestep_dt_s[t]]
+
+        constraints += [acc_force == acc * self.ship.info.weight / 1_000_000]
+        constraints += [acc_force <= (self.ship.info.max_speed / timestep_dt_s) * self.ship.info.weight / 1_000_000]
+        constraints += [acc_force >= -(self.ship.info.max_speed / timestep_dt_s) * self.ship.info.weight / 1_000_000]
 
         # ================================= WATER-RELATIVE SPEED =================================
         speed_rel_water_x = cp.Variable(T_future)
@@ -2997,11 +3216,12 @@ class FR_O:
                 ]
         constraints += [
             total_resistance >= (
-            wave_resistance
-            + wind_resistance
-            + calm_water_resistance
-        )
-]
+                wave_resistance
+                + wind_resistance
+                + calm_water_resistance
+                + acc_force
+            )
+        ]
 
         # ================================= PROPULSION =================================
         res_per_prop = cp.Variable(T_future, nonneg=True)
@@ -3194,6 +3414,7 @@ class FR_O:
             wave_resistance=np.asarray(wave_resistance.value),
             wind_resistance=np.asarray(wind_resistance.value),
             calm_water_resistance=np.asarray(calm_water_resistance.value),
+            acc_force=np.asarray(acc_force.value),
             total_resistance=np.asarray(total_resistance.value),
 
             generation_power=np.asarray(generation_power.value),
@@ -3232,6 +3453,7 @@ class FR_O:
                     "wave_resistance": wave_resistance.value,
                     "calm_water_resistance": calm_water_resistance.value,
                     "total_resistance": total_resistance.value,
+                    "acc_force": acc_force.value,
                     "prop_power": prop_power.value,
                     "generation_power": generation_power.value,
                     "gen_costs": gen_costs.value,
@@ -3387,6 +3609,7 @@ class NaiveController:
             wave_resistance=zeros.copy(),
             wind_resistance=zeros.copy(),
             calm_water_resistance=zeros.copy(),
+            acc_force=zeros.copy(),
             total_resistance=zeros.copy(),
 
             generation_power=generation_power,

@@ -342,6 +342,7 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
     wave_resistance = np.zeros((T, Hmax))
     wind_resistance = np.zeros((T, Hmax))
     calm_water_resistance = np.zeros((T, Hmax))
+    acc_force = np.zeros((T, Hmax))
     total_resistance = np.zeros((T, Hmax))
     generation_power = np.zeros((nb_gen, T, Hmax))
     gen_costs = np.zeros((nb_gen, T, Hmax))
@@ -361,6 +362,8 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
     c0 = c0_matrix[:, 0]
     gen_min_power = np.array([g.min_power for g in ship.generators], dtype=float)
     gen_max_power = np.array([g.max_power for g in ship.generators], dtype=float)
+    dt_s_vec = np.maximum(dt_vec * 3600.0, eps)
+    speed_before = float(getattr(runner.states, "current_speed", 0.0))
     battery_capacity = float(ship.battery.capacity)
     battery_charge_eff = float(ship.battery.charge_eff)
     battery_discharge_eff = float(ship.battery.discharge_eff)
@@ -494,6 +497,28 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
 
         return gp, (gp > eps).astype(float), 0.0
 
+    def _cmd_speed_for_acc(t, h_cmd):
+        if uses_two_setpoints:
+            return float(effective_speed_cmd[t, h_cmd])
+        return float(effective_speed_cmd[t])
+
+    def _previous_cmd_speed_for_acc(t, h_cmd):
+        if uses_two_setpoints:
+            if t == 0 and h_cmd == 0:
+                return speed_before
+            if h_cmd == 0:
+                return float(speed_cmd[t - 1, 1])
+            return float(speed_cmd[t, 0])
+        if t == 0:
+            return speed_before
+        return float(speed_cmd[t - 1])
+
+    def _acc_for(t, h_cmd, dt_h):
+        if uses_two_setpoints:
+            denom_s = max(float(dt_h) * 3600.0, eps)
+            return (_cmd_speed_for_acc(t, h_cmd) - _previous_cmd_speed_for_acc(t, h_cmd)) / denom_s
+        return (_cmd_speed_for_acc(t, 0) - _previous_cmd_speed_for_acc(t, 0)) / dt_s_vec[t]
+
     for t in range(T):
         for h, seg in enumerate(segments_by_t[t]):
             dt_h = float(seg["dt_h"])
@@ -544,9 +569,14 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
                 )
                 calm_water_resistance[t, h] = float(calm_model.compute_resistance(speed_rel_water_mag[t, h]))
 
+                a = _acc_for(t, h_cmd, dt_h)
+                acc_force[t, h] = a * ship.info.weight / 1_000_000
                 total_resistance[t, h] = max(
                     0.0,
-                    wind_resistance[t, h] + wave_resistance[t, h] + calm_water_resistance[t, h],
+                    wind_resistance[t, h]
+                    + wave_resistance[t, h]
+                    + calm_water_resistance[t, h]
+                    + acc_force[t, h],
                 )
 
                 ua = (1.0 - ship.propulsion.wake_fraction) * speed_rel_water_mag[t, h]
@@ -749,6 +779,131 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
 
         SOC_eval[t + 1] = soc_running
 
+    real_segment_records = [
+        (t, h)
+        for t in range(T)
+        for h in range(len(segments_by_t[t]))
+        if segment_dt_h[t, h] > eps
+    ]
+
+    def _recompute_soc_trace():
+        soc = float(np.clip(getattr(runner.states, "soc", 0.0), 0.0, battery_capacity))
+        soc_by_t = np.zeros(T + 1, dtype=float)
+        before = {}
+        after = {}
+        soc_by_t[0] = soc
+
+        for tt in range(T):
+            for hh in range(len(segments_by_t[tt])):
+                dt_local = float(segment_dt_h[tt, hh])
+                if dt_local <= eps:
+                    continue
+
+                before[(tt, hh)] = soc
+                soc = (
+                    (float(ship.battery.leak) ** dt_local) * soc
+                    - dt_local * float(battery_discharge[tt, hh]) / battery_discharge_eff
+                    + dt_local * battery_charge_eff * float(battery_charge[tt, hh])
+                )
+                soc = float(np.clip(soc, 0.0, battery_capacity))
+                after[(tt, hh)] = soc
+
+            soc_by_t[tt + 1] = soc
+
+        return soc_by_t, before, after
+
+    SOC_eval, _soc_before, soc_after = _recompute_soc_trace()
+
+    target_soc = float(getattr(itinerary, "soc_f", 0.0))
+    if target_soc > battery_capacity + eps:
+        _record_message(
+            validation_errors,
+            "terminal_soc_target_above_capacity",
+            "Terminal SOC target is above battery capacity.",
+            target_soc - battery_capacity,
+        )
+    elif SOC_eval[-1] < target_soc - eps:
+        future_leak_factor = {}
+        leak_factor = 1.0
+        for rec_t, rec_h in reversed(real_segment_records):
+            future_leak_factor[(rec_t, rec_h)] = leak_factor
+            leak_factor *= float(ship.battery.leak) ** float(segment_dt_h[rec_t, rec_h])
+
+        for rec_t, rec_h in reversed(real_segment_records):
+            if SOC_eval[-1] >= target_soc - eps:
+                break
+            if mask_sail[rec_t]:
+                continue
+
+            dt_local = float(segment_dt_h[rec_t, rec_h])
+            if dt_local <= eps:
+                continue
+
+            shore_limit, shore_unit_cost = _shore_command_limit(rec_t)
+            charge_headroom = battery_max_charge - float(battery_charge[rec_t, rec_h])
+            shore_headroom = shore_limit - float(shore_power[rec_t, rec_h])
+            soc_headroom = (
+                battery_capacity - float(soc_after.get((rec_t, rec_h), battery_capacity))
+            ) / (battery_charge_eff * dt_local)
+            max_delta = max(
+                0.0,
+                min(charge_headroom, shore_headroom, soc_headroom),
+            )
+            if max_delta <= eps:
+                continue
+
+            final_gain_per_mw = (
+                dt_local
+                * battery_charge_eff
+                * float(future_leak_factor.get((rec_t, rec_h), 1.0))
+            )
+            if final_gain_per_mw <= eps:
+                continue
+
+            missing_soc = target_soc - float(SOC_eval[-1])
+            delta_charge = min(max_delta, missing_soc / final_gain_per_mw)
+            if delta_charge <= eps:
+                continue
+
+            old_charge = float(battery_charge[rec_t, rec_h])
+            old_shore = float(shore_power[rec_t, rec_h])
+            old_shore_cost = float(shore_power_cost[rec_t, rec_h])
+            old_total_cost = float(total_cost_all[rec_t, rec_h])
+            old_final_soc = float(SOC_eval[-1])
+
+            battery_charge[rec_t, rec_h] = old_charge + delta_charge
+            shore_power[rec_t, rec_h] = old_shore + delta_charge
+            shore_power_cost[rec_t, rec_h] = shore_power[rec_t, rec_h] * shore_unit_cost
+            total_cost_all[rec_t, rec_h] = dt_local * (
+                float(np.sum(gen_costs[:, rec_t, rec_h]))
+                + shore_power_cost[rec_t, rec_h]
+            )
+
+            SOC_eval, _soc_before, soc_after = _recompute_soc_trace()
+            actual_gain = float(SOC_eval[-1]) - old_final_soc
+            if actual_gain <= eps:
+                battery_charge[rec_t, rec_h] = old_charge
+                shore_power[rec_t, rec_h] = old_shore
+                shore_power_cost[rec_t, rec_h] = old_shore_cost
+                total_cost_all[rec_t, rec_h] = old_total_cost
+                SOC_eval, _soc_before, soc_after = _recompute_soc_trace()
+                continue
+
+            _record_message(
+                validation_warnings,
+                "terminal_soc_restored_with_port_shore",
+                "Shore charging was increased at port to restore terminal SOC.",
+                delta_charge,
+            )
+
+        if SOC_eval[-1] < target_soc - eps:
+            _record_message(
+                validation_errors,
+                "terminal_soc_shortfall",
+                "Terminal SOC target could not be restored with available port shore power.",
+                target_soc - float(SOC_eval[-1]),
+            )
+
     for t in range(T):
         n_real = len(segments_by_t[t])
         if n_real <= 0 or n_real >= Hmax:
@@ -764,6 +919,7 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         wave_resistance[t, n_real:Hmax] = wave_resistance[t, last]
         wind_resistance[t, n_real:Hmax] = wind_resistance[t, last]
         calm_water_resistance[t, n_real:Hmax] = calm_water_resistance[t, last]
+        acc_force[t, n_real:Hmax] = acc_force[t, last]
         total_resistance[t, n_real:Hmax] = total_resistance[t, last]
         generation_power[:, t, n_real:Hmax] = generation_power[:, t, last:last + 1]
         gen_costs[:, t, n_real:Hmax] = gen_costs[:, t, last:last + 1]
@@ -802,6 +958,7 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         wave_resistance=wave_resistance,
         wind_resistance=wind_resistance,
         calm_water_resistance=calm_water_resistance,
+        acc_force=acc_force,
         total_resistance=total_resistance,
         generation_power=generation_power,
         gen_costs=gen_costs,
@@ -822,7 +979,7 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         interval_port_idx=interval_port_idx_eval,
         solar_power_available=solar_power_available,
         first_stage_optimizer=first_stage_optimizer,
-        power_management_optimizer="EvaluatorScheduleScaling",
+        power_management_optimizer="RuleBasedSetpointRestoration",
     )
 
     non_conv_sol.is_valid = len(validation_errors) == 0
