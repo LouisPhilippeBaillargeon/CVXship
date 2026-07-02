@@ -39,7 +39,6 @@ class Solution:
     wave_resistance         : np.ndarray #[T_future]
     wind_resistance         : np.ndarray #[T_future]
     calm_water_resistance      : np.ndarray #[T_future]
-    acc_force               : np.ndarray #[T_future]
     total_resistance        : np.ndarray #[T_future]
 
     generation_power        : np.ndarray #[nb_gen,T_future]
@@ -134,6 +133,68 @@ def _future_auxiliary_power(itinerary, states, T_future: int) -> np.ndarray:
     if out.shape != (T_future,):
         raise ValueError(f"Expected {T_future} future auxiliary power values, got {out.shape}.")
     return out
+
+
+def _generator_dispatch_data(ship: Ship, generator_models: List[GeneratorModel], horizon: int):
+    if generator_models is None:
+        raise ValueError("Generator models must be attached before optimization.")
+
+    nb_gen = len(generator_models)
+    nb_ship_gen = len(ship.generators)
+
+    if nb_gen <= 0:
+        raise ValueError("At least one generator must be configured.")
+    if nb_gen != nb_ship_gen:
+        raise ValueError(
+            "Generator model count does not match configured generators: "
+            f"{nb_gen} model(s) for {nb_ship_gen} configured generator(s). "
+            "Rebuild generator models after changing config/ship.toml."
+        )
+
+    for i, (model, generator) in enumerate(zip(generator_models, ship.generators)):
+        model_generator = getattr(model, "generator", None)
+        if model_generator is not None:
+            if getattr(model_generator, "name", None) != generator.name:
+                raise ValueError(
+                    f"Generator model {i} is for {getattr(model_generator, 'name', None)!r}, "
+                    f"but config generator {i} is {generator.name!r}. "
+                    "Rebuild generator models after changing config/ship.toml."
+                )
+            model_power = np.asarray(getattr(model_generator, "power", []), dtype=float)
+            config_power = np.asarray(generator.power, dtype=float)
+            if model_power.shape != config_power.shape or not np.allclose(model_power, config_power):
+                raise ValueError(
+                    f"Generator model {i} does not match configured power curve for {generator.name!r}. "
+                    "Rebuild generator models after changing config/ship.toml."
+                )
+            model_eff = np.asarray(getattr(model_generator, "eff", []), dtype=float)
+            config_eff = np.asarray(generator.eff, dtype=float)
+            if model_eff.shape != config_eff.shape or not np.allclose(model_eff, config_eff):
+                raise ValueError(
+                    f"Generator model {i} does not match configured efficiency curve for {generator.name!r}. "
+                    "Rebuild generator models after changing config/ship.toml."
+                )
+            if not np.isclose(
+                float(getattr(model_generator, "iddle_fuel", np.nan)),
+                float(generator.iddle_fuel),
+            ):
+                raise ValueError(
+                    f"Generator model {i} does not match configured idle fuel for {generator.name!r}. "
+                    "Rebuild generator models after changing config/ship.toml."
+                )
+
+    coeffs = np.array([gm.power_coeffs for gm in generator_models], dtype=float)
+    if coeffs.shape != (nb_gen, 3) or not np.all(np.isfinite(coeffs)):
+        raise ValueError("Generator models must be fitted before optimization.")
+
+    max_p = np.array([g.max_power for g in ship.generators], dtype=float)[:, None]
+    max_p = np.repeat(max_p, horizon, axis=1)
+
+    c = np.repeat(coeffs[:, 0][:, None], horizon, axis=1)
+    b = np.repeat(coeffs[:, 1][:, None], horizon, axis=1)
+    a = np.repeat(coeffs[:, 2][:, None], horizon, axis=1)
+
+    return nb_gen, max_p, a, b, c
 
 
 def _future_interval_port_idx(itinerary, states, T_future: int, port_idx: np.ndarray) -> np.ndarray:
@@ -349,9 +410,9 @@ class EnergyOnlyOptimizer:
             raise ValueError("Cannot optimize energy dispatch: no positive-duration segments found.")
 
         nb_seg = len(records)
-        nb_gen = len(self.generator_models)
-        if nb_gen <= 0:
-            raise ValueError("EnergyOnlyOptimizer requires at least one generator model.")
+        nb_gen, max_p, a, b, c = _generator_dispatch_data(
+            self.ship, self.generator_models, nb_seg
+        )
 
         dt_flat = np.array([segment_dt_h[t, h] for t, h in records], dtype=float)
         prop_flat = np.array([prop_power[t, h] for t, h in records], dtype=float)
@@ -407,14 +468,6 @@ class EnergyOnlyOptimizer:
                     shore_power[i] >= 0,
                     shore_power[i] <= shore_max_flat[i],
                 ]
-
-        max_p = np.array([g.max_power for g in self.ship.generators], dtype=float)[:, None]
-        max_p = np.repeat(max_p, nb_seg, axis=1)
-
-        coeffs = np.array([gm.power_coeffs for gm in self.generator_models], dtype=float)
-        c = np.repeat(coeffs[:, 0][:, None], nb_seg, axis=1)
-        b = np.repeat(coeffs[:, 1][:, None], nb_seg, axis=1)
-        a = np.repeat(coeffs[:, 2][:, None], nb_seg, axis=1)
 
         gen_on_fixed = np.zeros((nb_gen, nb_seg), dtype=float)
         gen_on_fixed[:, sail_flat] = 1.0
@@ -593,7 +646,6 @@ class DJPE_TSO:
         timestep_dt_h = _future_dt_h(self.itinerary, self.states, T_future)
         auxiliary_power = _future_auxiliary_power(self.itinerary, self.states, T_future)
         half_dt_h = 0.5 * timestep_dt_h
-        half_dt_s = half_dt_h * 3600.0
         ship_speed_limit = _ship_speed_limit_matrix(
             self.map, self.itinerary, self.states, self.ship, T_future
         )
@@ -853,30 +905,6 @@ class DJPE_TSO:
                     )
                 ]
 
-        # ================================================= ACCELERATION ===============================================
-        acc = cp.Variable((T_future, H))
-        acc_force = cp.Variable((T_future, H))
-        half_dt_s_TH = np.repeat(half_dt_s[:, None], H, axis=1)
-
-
-        constraints += [acc <= self.ship.info.max_speed / half_dt_s_TH]
-        constraints += [acc >= -self.ship.info.max_speed / half_dt_s_TH]
-
-
-        constraints += [
-            acc[0, 0] == (speed_mag[0, 0] - self.itinerary.init_speed) / half_dt_s[0],
-            acc[0, 1] == (speed_mag[0, 1] - speed_mag[0, 0]) / half_dt_s[0],
-        ]
-
-        for t in range(1, T_future):
-            constraints += [
-                acc[t, 0] == (speed_mag[t, 0] - speed_mag[t - 1, 1]) / half_dt_s[t],
-                acc[t, 1] == (speed_mag[t, 1] - speed_mag[t, 0]) / half_dt_s[t],
-            ]
-
-        constraints += [acc_force >= 0]
-        constraints += [acc_force >= acc * self.ship.info.weight / 1_000_000]
-
         # ================================================ RELATIVE SPEEDS =============================================
         speed_rel_water_x = cp.Variable((T_future, H))
         speed_rel_water_y = cp.Variable((T_future, H))
@@ -1008,7 +1036,7 @@ class DJPE_TSO:
         constraints += [total_resistance >= 0]
         constraints += [wave_resistance >= 0]
         constraints += [
-            total_resistance >= wave_resistance + wind_resistance + calm_water_resistance + acc_force
+            total_resistance >= wave_resistance + wind_resistance + calm_water_resistance
         ]
 
         # ================================================= PROPULSION =================================================
@@ -1099,22 +1127,12 @@ class DJPE_TSO:
         constraints += [SOC[-1] >= self.itinerary.soc_f]
 
         # ================================================= GENERATORS =================================================
-        nb_gen = len(self.generator_models)
+        nb_gen, max_p, a, b, c = _generator_dispatch_data(
+            self.ship, self.generator_models, 2 * T_future
+        )
 
         generation_power = cp.Variable((nb_gen, 2 * T_future))
         gen_costs = cp.Variable((nb_gen, 2 * T_future))
-
-        coeffs = np.array([gm.power_coeffs for gm in self.generator_models])
-        c = coeffs[:, 0][:, None]
-        b = coeffs[:, 1][:, None]
-        a = coeffs[:, 2][:, None]
-
-        c = np.repeat(c, 2 * T_future, axis=1)
-        b = np.repeat(b, 2 * T_future, axis=1)
-        a = np.repeat(a, 2 * T_future, axis=1)
-
-        max_p = np.array([g.max_power for g in self.ship.generators])[:, None]
-        max_p = np.repeat(max_p, 2 * T_future, axis=1)
 
         constraints += [generation_power >= 0]
 
@@ -1240,7 +1258,6 @@ class DJPE_TSO:
                 auxiliary_power         = auxiliary_power,
                 wave_resistance         = np.array(wave_resistance.value),
                 wind_resistance         = np.array(wind_resistance.value),
-                acc_force               = np.array(acc_force.value),
                 calm_water_resistance   = np.array(calm_water_resistance.value),
                 total_resistance        = np.array(total_resistance.value),
 
@@ -1274,7 +1291,6 @@ class DJPE_TSO:
                         "wave_resistance": wave_resistance.value,
                         "calm_water_resistance": calm_water_resistance.value,
                         "total_resistance": total_resistance.value,
-                        "acc_force": acc_force.value,
                         "prop_power": prop_power.value,
                         "generation_power": gen_power_out,
                         "gen_costs": gen_costs_out,
@@ -1328,7 +1344,6 @@ class CJPE_TSO:
         T_future = self.itinerary.nb_timesteps - self.states.timesteps_completed
         timestep_dt_h = _future_dt_h(self.itinerary, self.states, T_future)
         auxiliary_power = _future_auxiliary_power(self.itinerary, self.states, T_future)
-        timestep_dt_s = timestep_dt_h * 3600.0
         half_dt_h = 0.5 * timestep_dt_h
         ship_speed_limit = _ship_speed_limit_matrix(
             self.map, self.itinerary, self.states, self.ship, T_future
@@ -1591,18 +1606,6 @@ class CJPE_TSO:
                 ]
         constraints += [speed_mag >=cp.sum(speed_mag_split,axis=1)/2]
 
-        # ================================================= ACCELERATION ===============================================
-        acc = cp.Variable(T_future)
-        acc_force = cp.Variable(T_future)
-
-        constraints += [acc <= self.ship.info.max_speed / timestep_dt_s]
-        constraints += [acc >= -self.ship.info.max_speed / timestep_dt_s]
-        constraints += [acc[0] == (speed_mag[0] - self.itinerary.init_speed) / timestep_dt_s[0]]
-        for t in range(1, T_future):
-            constraints += [acc[t] == (speed_mag[t] - speed_mag[t - 1]) / timestep_dt_s[t]]
-        constraints += [acc_force >= 0]
-        constraints += [acc_force >= acc * self.ship.info.weight / 1_000_000]
-
         # ================================================ RELATIVE SPEEDS =============================================
         ship_speed_x_split_rel_water = cp.Variable((T_future, 2))
         ship_speed_y_split_rel_water = cp.Variable((T_future, 2))
@@ -1776,7 +1779,7 @@ class CJPE_TSO:
         constraints += [total_resistance >= 0]
         constraints += [wave_resistance >= 0]
         constraints += [
-            total_resistance >= wave_resistance + wind_resistance + calm_water_resistance + acc_force
+            total_resistance >= wave_resistance + wind_resistance + calm_water_resistance
         ]
 
         # ================================================= PROPULSION =================================================
@@ -1859,32 +1862,25 @@ class CJPE_TSO:
         constraints += [SOC[-1] >= self.itinerary.soc_f]
 
         # ================================================= GENERATORS =================================================
-        generation_power = cp.Variable((len(self.generator_models),T_future)) #[nb_gen, nb_timsetep]
-        gen_costs = cp.Variable((len(self.generator_models),T_future)) #[nb_gen, nb_timesteps]
+        nb_gen, max_p, a, b, c = _generator_dispatch_data(
+            self.ship, self.generator_models, T_future
+        )
 
-        max_p = np.array([g.max_power for g in self.ship.generators])[:, None]  # [nb_gen, 1]
-        max_p = np.repeat(max_p, T_future, axis=1)  # [nb_gen, T_future]
-
-        coeffs = np.array([gm.power_coeffs for gm in self.generator_models])   # [nb_gen, 3]
-        c = coeffs[:, 0][:, None]  # [nb_gen, 1]
-        b = coeffs[:, 1][:, None]  # [nb_gen, 1]
-        a = coeffs[:, 2][:, None]  # [nb_gen, 1]
-        c = np.repeat(c, T_future, axis=1)  # [nb_gen, T_future]
-        b = np.repeat(b, T_future, axis=1)  # [nb_gen, T_future]
-        a = np.repeat(a, T_future, axis=1)  # [nb_gen, T_future]
+        generation_power = cp.Variable((nb_gen,T_future)) #[nb_gen, nb_timsetep]
+        gen_costs = cp.Variable((nb_gen,T_future)) #[nb_gen, nb_timesteps]
 
         constraints += [generation_power >= 0]
 
         if unit_commitment:
             M= 1000000
-            gen_on = cp.Variable((len(self.generator_models),T_future), boolean=True) #[nb_gen, nb_timesteps]
+            gen_on = cp.Variable((nb_gen,T_future), boolean=True) #[nb_gen, nb_timesteps]
             constraints += [generation_power <= cp.multiply(max_p,gen_on)]
             constraints += [gen_costs >=(cp.multiply(a, cp.square(generation_power)) +cp.multiply(b, generation_power) +c)*self.itinerary.fuel_price -M*(1-gen_on)] # $/h
             constraints += [gen_costs >=0]
         else:
-            constraints += [generation_power <= max_p]
-            gen_on_fixed = np.zeros((len(self.generator_models), T_future), dtype=float)
+            gen_on_fixed = np.zeros((nb_gen, T_future), dtype=float)
             gen_on_fixed[:, interval_sail.astype(bool)] = 1.0
+            constraints += [generation_power <= cp.multiply(max_p, gen_on_fixed)]
 
             constraints += [
                 gen_costs >= (
@@ -1908,7 +1904,7 @@ class CJPE_TSO:
             ]
 
         # ================================================= OBJECTIVE ==================================================
-        gen_dt = np.repeat(timestep_dt_h[None, :], len(self.generator_models), axis=0)
+        gen_dt = np.repeat(timestep_dt_h[None, :], nb_gen, axis=0)
 
         objective = cp.Minimize(
             cp.sum(cp.multiply(gen_costs, gen_dt))
@@ -1933,7 +1929,6 @@ class CJPE_TSO:
 
         # ================================================= RESULTS ====================================================
         if problem.status not in ["infeasible", "unbounded"]:
-            nb_gen = len(self.generator_models)
             gen_on_out = np.array(gen_on.value) if unit_commitment else gen_on_fixed
 
             ship_speed_out = np.stack(
@@ -1967,7 +1962,6 @@ class CJPE_TSO:
                 auxiliary_power         = auxiliary_power,
                 wave_resistance         = np.array(wave_resistance.value),
                 wind_resistance         = np.array(wind_resistance.value),
-                acc_force               = np.array(acc_force.value),
                 calm_water_resistance   = np.array(calm_water_resistance.value),
                 total_resistance        = np.array(total_resistance.value),
 
@@ -2018,7 +2012,6 @@ class CJPE_TSO:
                         "wave_resistance": wave_resistance.value,
                         "calm_water_resistance": calm_water_resistance.value,
                         "total_resistance": total_resistance.value,
-                        "acc_force": acc_force.value,
                         "prop_power": prop_power.value,
                         "generation_power": generation_power.value,
                         "gen_costs": gen_costs.value,
@@ -2071,7 +2064,6 @@ class FR_TSO:
         T_future = self.itinerary.nb_timesteps - self.states.timesteps_completed
         timestep_dt_h = _future_dt_h(self.itinerary, self.states, T_future)
         auxiliary_power = _future_auxiliary_power(self.itinerary, self.states, T_future)
-        timestep_dt_s = timestep_dt_h * 3600.0
         ship_speed_limit = _ship_speed_limit_matrix(
             self.map, self.itinerary, self.states, self.ship, T_future
         )
@@ -2244,24 +2236,6 @@ class FR_TSO:
         constraints += [ship_speed_x_split >= -self.ship.info.max_speed]
         constraints += [ship_speed_y_split >= -self.ship.info.max_speed]
 
-        # ================================= ACCELERATION =================================
-        acc = cp.Variable(T_future)
-        acc_force = cp.Variable(T_future)
-
-        init_speed = float(getattr(self.itinerary, "init_speed", 0.0))
-
-        constraints += [acc <= self.ship.info.max_speed / timestep_dt_s]
-        constraints += [acc >= -self.ship.info.max_speed / timestep_dt_s]
-
-        constraints += [acc[0] == (speed_mag[0] - init_speed) / timestep_dt_s[0]]
-
-        for t in range(1, T_future):
-            constraints += [acc[t] == (speed_mag[t] - speed_mag[t - 1]) / timestep_dt_s[t]]
-
-        constraints += [acc_force == acc * self.ship.info.weight / 1_000_000]
-        constraints += [acc_force <= (self.ship.info.max_speed / timestep_dt_s) * self.ship.info.weight / 1_000_000]
-        constraints += [acc_force >= -(self.ship.info.max_speed / timestep_dt_s) * self.ship.info.weight / 1_000_000]
-
         # ================================= WATER-RELATIVE SPEED =================================
         ship_speed_x_split_rel_water = cp.Variable((T_future, 2))
         ship_speed_y_split_rel_water = cp.Variable((T_future, 2))
@@ -2425,7 +2399,7 @@ class FR_TSO:
                 ]
 
         constraints += [
-            total_resistance >= wave_resistance + wind_resistance + calm_water_resistance + acc_force
+            total_resistance >= wave_resistance + wind_resistance + calm_water_resistance
         ]
 
         # ================================= PROPULSION =================================
@@ -2510,18 +2484,12 @@ class FR_TSO:
         constraints += [SOC[-1] >= self.itinerary.soc_f]
 
         # ================================= GENERATORS =================================
-        nb_gen = len(self.generator_models)
+        nb_gen, max_p, a, b, c = _generator_dispatch_data(
+            self.ship, self.generator_models, T_future
+        )
 
         generation_power = cp.Variable((nb_gen, T_future))
         gen_costs = cp.Variable((nb_gen, T_future))
-
-        max_p = np.array([g.max_power for g in self.ship.generators])[:, None]
-        max_p = np.repeat(max_p, T_future, axis=1)
-
-        coeffs = np.array([gm.power_coeffs for gm in self.generator_models])
-        c = np.repeat(coeffs[:, 0][:, None], T_future, axis=1)
-        b = np.repeat(coeffs[:, 1][:, None], T_future, axis=1)
-        a = np.repeat(coeffs[:, 2][:, None], T_future, axis=1)
 
         constraints += [generation_power >= 0]
 
@@ -2659,7 +2627,6 @@ class FR_TSO:
             wave_resistance=np.asarray(wave_resistance.value),
             wind_resistance=np.asarray(wind_resistance.value),
             calm_water_resistance=np.asarray(calm_water_resistance.value),
-            acc_force=np.asarray(acc_force.value),
             total_resistance=np.asarray(total_resistance.value),
 
             generation_power=np.asarray(generation_power.value),
@@ -2709,7 +2676,6 @@ class FR_TSO:
                     "wave_resistance": wave_resistance.value,
                     "calm_water_resistance": calm_water_resistance.value,
                     "total_resistance": total_resistance.value,
-                    "acc_force": acc_force.value,
                     "prop_power": prop_power.value,
                     "generation_power": generation_power.value,
                     "gen_costs": gen_costs.value,
@@ -2882,7 +2848,6 @@ class FR_O:
         self._precompute_timesampled_weather_models(debug=debug)
         timestep_dt_h = _future_dt_h(self.itinerary, self.states, T_future)
         auxiliary_power = _future_auxiliary_power(self.itinerary, self.states, T_future)
-        timestep_dt_s = timestep_dt_h * 3600.0
 
         instant_sail, port_idx, interval_sail_fraction = classify_timesteps(self.itinerary)
         instant_sail = instant_sail[self.states.timesteps_completed:]
@@ -2950,24 +2915,6 @@ class FR_O:
 
         ship_speed_x = cp.multiply(speed_mag, cos_t)
         ship_speed_y = cp.multiply(speed_mag, sin_t)
-
-        # ================================= ACCELERATION =================================
-        acc = cp.Variable(T_future)
-        acc_force = cp.Variable(T_future)
-
-        init_speed = float(getattr(self.itinerary, "init_speed", 0.0))
-
-        constraints += [acc <= self.ship.info.max_speed / timestep_dt_s]
-        constraints += [acc >= -self.ship.info.max_speed / timestep_dt_s]
-
-        constraints += [acc[0] == (speed_mag[0] - init_speed) / timestep_dt_s[0]]
-
-        for t in range(1, T_future):
-            constraints += [acc[t] == (speed_mag[t] - speed_mag[t - 1]) / timestep_dt_s[t]]
-
-        constraints += [acc_force == acc * self.ship.info.weight / 1_000_000]
-        constraints += [acc_force <= (self.ship.info.max_speed / timestep_dt_s) * self.ship.info.weight / 1_000_000]
-        constraints += [acc_force >= -(self.ship.info.max_speed / timestep_dt_s) * self.ship.info.weight / 1_000_000]
 
         # ================================= WATER-RELATIVE SPEED =================================
         speed_rel_water_x = cp.Variable(T_future)
@@ -3053,7 +3000,6 @@ class FR_O:
             wave_resistance
             + wind_resistance
             + calm_water_resistance
-            + acc_force
         )
 ]
 
@@ -3134,18 +3080,12 @@ class FR_O:
         constraints += [SOC[-1] >= self.itinerary.soc_f]
 
         # ================================= GENERATORS =================================
-        nb_gen = len(self.generator_models)
+        nb_gen, max_p, a, b, c = _generator_dispatch_data(
+            self.ship, self.generator_models, T_future
+        )
 
         generation_power = cp.Variable((nb_gen, T_future))
         gen_costs = cp.Variable((nb_gen, T_future))
-
-        max_p = np.array([g.max_power for g in self.ship.generators])[:, None]
-        max_p = np.repeat(max_p, T_future, axis=1)
-
-        coeffs = np.array([gm.power_coeffs for gm in self.generator_models])
-        c = np.repeat(coeffs[:, 0][:, None], T_future, axis=1)
-        b = np.repeat(coeffs[:, 1][:, None], T_future, axis=1)
-        a = np.repeat(coeffs[:, 2][:, None], T_future, axis=1)
 
         constraints += [generation_power >= 0]
         gen_on_fixed = np.zeros((nb_gen, T_future), dtype=float)
@@ -3254,7 +3194,6 @@ class FR_O:
             wave_resistance=np.asarray(wave_resistance.value),
             wind_resistance=np.asarray(wind_resistance.value),
             calm_water_resistance=np.asarray(calm_water_resistance.value),
-            acc_force=np.asarray(acc_force.value),
             total_resistance=np.asarray(total_resistance.value),
 
             generation_power=np.asarray(generation_power.value),
@@ -3293,7 +3232,6 @@ class FR_O:
                     "wave_resistance": wave_resistance.value,
                     "calm_water_resistance": calm_water_resistance.value,
                     "total_resistance": total_resistance.value,
-                    "acc_force": acc_force.value,
                     "prop_power": prop_power.value,
                     "generation_power": generation_power.value,
                     "gen_costs": gen_costs.value,
@@ -3449,7 +3387,6 @@ class NaiveController:
             wave_resistance=zeros.copy(),
             wind_resistance=zeros.copy(),
             calm_water_resistance=zeros.copy(),
-            acc_force=zeros.copy(),
             total_resistance=zeros.copy(),
 
             generation_power=generation_power,

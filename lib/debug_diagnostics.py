@@ -308,11 +308,12 @@ def _eval_weather_samples(runner, sol, nc_sources=None) -> Dict[int, List[Dict[s
                 continue
             if uses_two_setpoints:
                 for h, (a, b) in enumerate(pieces):
-                    direction, dist = _safe_unit(b - a)
+                    _, dist = _safe_unit(b - a)
                     if dist <= EPS:
                         continue
-                    speed_mps = float(max(0.0, speed_cmd[t, h]))
-                    add(t, 0.5 * dt_vec[t], dist, speed_mps * direction, 0.5 * (a + b), (0.25 if h == 0 else 0.75) * dt_vec[t])
+                    dt_h = 0.5 * dt_vec[t]
+                    speed_vec = ((b - a) / dt_h) * 1000.0 / 3600.0
+                    add(t, dt_h, dist, speed_vec, 0.5 * (a + b), (0.25 if h == 0 else 0.75) * dt_vec[t])
             else:
                 tau = 0.0
                 speed_mps = total / dt_vec[t] * 1000.0 / 3600.0
@@ -472,8 +473,7 @@ def _record_common_slacks(report: OptimizerDebugReport, ctx: Dict[str, Any]) -> 
     wave = _as_2d_time(ctx["wave_resistance"])
     wind = _as_2d_time(ctx["wind_resistance"])
     calm = _as_2d_time(ctx["calm_water_resistance"])
-    acc = _as_2d_time(ctx["acc_force"])
-    diff = total - (wave + wind + calm + acc)
+    diff = total - (wave + wind + calm)
     if sol is not None:
         report.add("slack.total_resistance_minus_components", diff[_sail_mask(sol, total.shape[1])])
     else:

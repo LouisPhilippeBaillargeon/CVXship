@@ -42,7 +42,7 @@ init_speed          = 0
 [[transit]]
 city                = "Halifax"
 arrival_datetime    = "2024-03-22T00:00"
-departure_datetime  = "2024-03-22T03:30"
+departure_datetime  = "2024-03-22T04:00"
 lat                 = 47.047967#44.5513889
 lon                 = -60.698573#-63.384444
 power_cost          = 183
@@ -50,7 +50,7 @@ max_charge_power    = 5
 
 [[transit]]
 city                = "GrandeEntree"
-arrival_datetime    = "2024-03-22T12:30"#"2024-03-22T08:30"
+arrival_datetime    = "2024-03-22T12:00"#"2024-03-22T08:30"
 departure_datetime  = "2024-03-22T18:00"
 lat                 = 45.970663
 lon                 = -62.350969

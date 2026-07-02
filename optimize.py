@@ -6,7 +6,7 @@ from lib.load_params import load_config
 from lib.models import FitRange, PropulsionModel, BaseWaveModel, WaveModel1D, WaveModel2D, WaveModelPathAligned2D, BaseWindModel, WindModel1D, WindModel2D, WindModelPathAligned2D, GeneratorModel, CalmWaterModel, save_obj, load_obj
 from lib.paths import WIND_MODEL_1D, WIND_MODEL_2D, WIND_MODEL_PATH_ALIGNED_2D, WAVE_MODEL_1D, WAVE_MODEL_2D, WAVE_MODEL_PATH_ALIGNED_2D, PROPULSION_MODEL, GENERATOR_MODEL, CALM_MODEL
 from lib.plotting import plot_solutions, plot_zones_and_points
-from lib.optimizers import DJPE_TSO, NaiveController, FR_TSO, ShortestPath, CJPE_TSO, FR_O
+from lib.optimizers import DJPE_TSO, NaiveController, FR_TSO, ShortestPath, CJPE_TSO, FR_O, _generator_dispatch_data
 from lib.utils import point_in_zones, dx_dy_km, classify_timesteps, _assert_finite
 from lib.evaluation import compute_non_convex_cost_all_timesteps_nc_interpolated
 from lib.weather_interpolation import prepare_nc_interp_source
@@ -142,7 +142,13 @@ if __name__ == "__main__":
         save_obj(PROPULSION_MODEL, propulsion_model)
 
     else:
-        generatorModels = load_obj(GENERATOR_MODEL)
+        cached_generator_models = load_obj(GENERATOR_MODEL)
+        try:
+            _generator_dispatch_data(ship, cached_generator_models, 1)
+            generatorModels = cached_generator_models
+        except ValueError as exc:
+            print(f"Cached generator models ignored: {exc}")
+            print("Using freshly fitted generator models from config/ship.toml.")
         calm_model = load_obj(CALM_MODEL)
         propulsion_model = load_obj(PROPULSION_MODEL)
         print("Saved ship model loaded")
@@ -246,14 +252,20 @@ if __name__ == "__main__":
             runner,
             debug=debug,
             nc_sources=nc_sources,
-            redispatch_energy=False,
+            redispatch_energy=True,
         )
         sol = result[1]
+        energy_solve_time = getattr(sol, "energy_solve_time", None)
+        energy_solve_label = (
+            "n/a"
+            if energy_solve_time is None
+            else f"{float(energy_solve_time):.2f} s"
+        )
         print(
             f"{label} re-evaluated: "
             f"first_stage={sol.first_stage_optimizer}, "
             f"power_management={sol.power_management_optimizer}, "
-            f"energy_solve_time={sol.energy_solve_time:.2f} s, "
+            f"energy_solve_time={energy_solve_label}, "
             f"cost={sol.estimated_cost:.6f} $"
         )
         return result
@@ -486,7 +498,6 @@ if __name__ == "__main__":
             "wave_resistance",
             "wind_resistance",
             "calm_water_resistance",
-            "acc_force",
             "total_resistance",
             "speed_rel_water_mag",
         ]:

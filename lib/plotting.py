@@ -593,7 +593,6 @@ def plot_solutions(
         ("wind_resistance", "Wind resistance"),
         ("calm_water_resistance", "Calm-water resistance"),
         ("total_resistance", "Total resistance"),
-        ("acc_force", "Acceleration force"),
     ]:
         _plot_attr(attr, title, "force / resistance [MN]", f"cmp_{attr}")
 

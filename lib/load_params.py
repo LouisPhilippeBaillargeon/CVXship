@@ -489,7 +489,6 @@ class States:
     timesteps_completed: int
     current_x_pos      : float
     current_y_pos      : float
-    current_speed      : float
     soc                : float
     zone               : float
     current_heading    : float
@@ -502,7 +501,6 @@ def load_states(map, itinerary) -> States:
         timesteps_completed = 0,
         current_x_pos = current_x_pos,
         current_y_pos = current_y_pos,
-        current_speed = itinerary.init_speed,
         soc = itinerary.soc_i,
         zone = zone,
         current_heading = 0,

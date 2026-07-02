@@ -100,7 +100,7 @@ nb_blades       = 6
 nb_propellers   = 2
 max_n           = 3.0
 min_pow         = 0.0
-max_pow         = 20.0
+max_pow         = 6.0
 wake_fraction   = 0.3
 # ============================
 # BATTERY
@@ -143,18 +143,6 @@ iddle_fuel      = 9.52
 
 [[generators]]
 name            = "Gen2"
-power           = [0.28, 0.56, 1.4, 1.96, 2.08, 2.4, 2.8]
-eff             = [232, 215, 185, 180, 183, 185, 190]
-iddle_fuel      = 9.52
-
-[[generators]]
-name            = "Gen3"
-power           = [0.28, 0.56, 1.4, 1.96, 2.08, 2.4, 2.8]
-eff             = [232, 215, 185, 180, 183, 185, 190]
-iddle_fuel      = 9.52
-
-[[generators]]
-name            = "Gen4"
 power           = [0.28, 0.56, 1.4, 1.96, 2.08, 2.4, 2.8]
 eff             = [232, 215, 185, 180, 183, 185, 190]
 iddle_fuel      = 9.52

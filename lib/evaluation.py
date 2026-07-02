@@ -4,6 +4,7 @@ from lib.optimizers import (
     Solution,
     _future_auxiliary_power,
     _future_interval_port_idx,
+    _generator_dispatch_data,
     EnergyOnlyOptimizer,
 )
 from lib.weather_interpolation import (
@@ -60,7 +61,9 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
 
     P = np.asarray(sol.ship_pos, dtype=float)
     T = P.shape[0] - 1
-    nb_gen = len(generator_models)
+    nb_gen, _gen_max_p_matrix, a0_matrix, b0_matrix, c0_matrix = _generator_dispatch_data(
+        ship, generator_models, 1
+    )
 
     dt_source = getattr(sol, "timestep_dt_h", None)
     if dt_source is None:
@@ -84,7 +87,6 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         if auxiliary_power.shape != (T,):
             raise ValueError(f"Expected auxiliary_power shape {(T,)}, got {auxiliary_power.shape}.")
 
-    dt_s_vec = dt_vec * 3600.0
     mask_sail = np.asarray(sol.interval_sail_fraction, dtype=float).reshape(-1) > 0.5
     zone_mat = np.asarray(sol.zone, dtype=float)
     interval_port_idx_eval = getattr(sol, "interval_port_idx", None)
@@ -257,11 +259,10 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
                 for h_cmd, (a, b), dist in [(0, pieces_geom[0], dists[0]), (1, pieces_geom[1], dists[1])]:
                     if dist <= eps:
                         continue
-                    direction, _ = _safe_unit(b - a)
-                    speed_mps = float(max(0.0, speed_cmd[t, h_cmd]))
                     dt_seg_h = 0.5 * dt_vec[t]
+                    speed_vec = ((b - a) / dt_seg_h) * 1000.0 / 3600.0
                     mid_off = (0.25 if h_cmd == 0 else 0.75) * dt_vec[t]
-                    _add_segment(segments_by_t, t, dt_seg_h, dist, speed_mps * direction, h_cmd, 0.5 * (a + b), mid_off, "q_TH")
+                    _add_segment(segments_by_t, t, dt_seg_h, dist, speed_vec, h_cmd, 0.5 * (a + b), mid_off, "q_TH")
             else:
                 speed_mps = total_d / dt_vec[t] * 1000.0 / 3600.0
                 effective_speed_cmd[t] = speed_mps
@@ -341,7 +342,6 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
     wave_resistance = np.zeros((T, Hmax))
     wind_resistance = np.zeros((T, Hmax))
     calm_water_resistance = np.zeros((T, Hmax))
-    acc_force = np.zeros((T, Hmax))
     total_resistance = np.zeros((T, Hmax))
     generation_power = np.zeros((nb_gen, T, Hmax))
     gen_costs = np.zeros((nb_gen, T, Hmax))
@@ -356,11 +356,11 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
     best_pitch = np.zeros((T, Hmax))
     total_cost_all = np.zeros((T, Hmax))
 
-    coeffs = np.array([gm.power_coeffs for gm in generator_models], dtype=float)
-    c0, b0, a0 = coeffs[:, 0], coeffs[:, 1], coeffs[:, 2]
+    a0 = a0_matrix[:, 0]
+    b0 = b0_matrix[:, 0]
+    c0 = c0_matrix[:, 0]
     gen_min_power = np.array([g.min_power for g in ship.generators], dtype=float)
     gen_max_power = np.array([g.max_power for g in ship.generators], dtype=float)
-    speed_before = float(getattr(runner.states, "current_speed", 0.0))
     battery_capacity = float(ship.battery.capacity)
     battery_charge_eff = float(ship.battery.charge_eff)
     battery_discharge_eff = float(ship.battery.discharge_eff)
@@ -410,10 +410,21 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         if remaining_load <= eps:
             return gp, np.zeros(nb_gen, dtype=float), 0.0
 
+        online = gen_on_cmd > 0.5
+        off_command = (~online) & (gen_cmd > eps)
+        if np.any(off_command):
+            _record_message(
+                validation_warnings,
+                "generator_command_while_off",
+                "Generator command was ignored because the generator was off.",
+                float(np.max(gen_cmd[off_command])),
+            )
+            gen_cmd[off_command] = 0.0
+
         commanded_total = float(np.sum(gen_cmd))
 
         if commanded_total >= remaining_load - eps:
-            on = gen_cmd > eps
+            on = online & (gen_cmd > eps)
             if not np.any(on):
                 _record_message(
                     validation_errors,
@@ -461,7 +472,8 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
             return gp, (gp > eps).astype(float), 0.0
 
         increase_needed = remaining_load - commanded_total
-        room_up = np.maximum(gen_max_power - gen_cmd, 0.0)
+        room_up = np.zeros(nb_gen, dtype=float)
+        room_up[online] = np.maximum(gen_max_power[online] - gen_cmd[online], 0.0)
         room_total = float(np.sum(room_up))
 
         if room_total + eps < increase_needed:
@@ -481,28 +493,6 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
             gp = gen_cmd
 
         return gp, (gp > eps).astype(float), 0.0
-
-    def _cmd_speed_for_acc(t, h_cmd):
-        if uses_two_setpoints:
-            return float(effective_speed_cmd[t, h_cmd])
-        return float(effective_speed_cmd[t])
-
-    def _previous_cmd_speed_for_acc(t, h_cmd):
-        if uses_two_setpoints:
-            if t == 0 and h_cmd == 0:
-                return speed_before
-            if h_cmd == 0:
-                return float(speed_cmd[t - 1, 1])
-            return float(speed_cmd[t, 0])
-        if t == 0:
-            return speed_before
-        return float(speed_cmd[t - 1])
-
-    def _acc_for(t, h_cmd, dt_h):
-        if uses_two_setpoints:
-            denom_s = max(float(dt_h) * 3600.0, eps)
-            return (_cmd_speed_for_acc(t, h_cmd) - _previous_cmd_speed_for_acc(t, h_cmd)) / denom_s
-        return (_cmd_speed_for_acc(t, 0) - _previous_cmd_speed_for_acc(t, 0)) / dt_s_vec[t]
 
     for t in range(T):
         for h, seg in enumerate(segments_by_t[t]):
@@ -554,11 +544,9 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
                 )
                 calm_water_resistance[t, h] = float(calm_model.compute_resistance(speed_rel_water_mag[t, h]))
 
-                a = _acc_for(t, h_cmd, dt_h)
-                acc_force[t, h] = a * ship.info.weight / 1_000_000
                 total_resistance[t, h] = max(
                     0.0,
-                    wind_resistance[t, h] + wave_resistance[t, h] + calm_water_resistance[t, h] + acc_force[t, h],
+                    wind_resistance[t, h] + wave_resistance[t, h] + calm_water_resistance[t, h],
                 )
 
                 ua = (1.0 - ship.propulsion.wake_fraction) * speed_rel_water_mag[t, h]
@@ -691,7 +679,18 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
                         feasible_cmd_discharge - actual_discharge,
                     )
 
-                actual_shore = min(feasible_cmd_shore, remaining_load)
+                if mask_sail[t]:
+                    actual_shore = min(feasible_cmd_shore, remaining_load)
+                else:
+                    actual_shore = min(shore_limit, remaining_load)
+                    if actual_shore > feasible_cmd_shore + eps:
+                        _record_message(
+                            validation_warnings,
+                            "shore_power_increased_at_port",
+                            "Shore power was increased at port to meet load without generators.",
+                            actual_shore - feasible_cmd_shore,
+                        )
+
                 remaining_load -= actual_shore
                 if actual_shore + eps < feasible_cmd_shore:
                     _record_message(
@@ -701,7 +700,27 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
                         feasible_cmd_shore - actual_shore,
                     )
 
-                if remaining_load > eps:
+                if remaining_load > eps and not mask_sail[t]:
+                    charge_reduction = min(actual_charge, remaining_load)
+                    if charge_reduction > eps:
+                        actual_charge -= charge_reduction
+                        remaining_load -= charge_reduction
+                        _record_message(
+                            validation_warnings,
+                            "port_battery_charge_reduced_no_generators",
+                            "Battery charge was reduced at port instead of starting generators.",
+                            charge_reduction,
+                        )
+
+                    if remaining_load > eps:
+                        _record_message(
+                            validation_errors,
+                            "port_power_shortfall",
+                            "Port interval load could not be met without generators.",
+                            remaining_load,
+                        )
+
+                if remaining_load > eps and mask_sail[t]:
                     gp, gen_on_actual, _unmet = _dispatch_generators(
                         remaining_load,
                         gen_sched,
@@ -745,7 +764,6 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         wave_resistance[t, n_real:Hmax] = wave_resistance[t, last]
         wind_resistance[t, n_real:Hmax] = wind_resistance[t, last]
         calm_water_resistance[t, n_real:Hmax] = calm_water_resistance[t, last]
-        acc_force[t, n_real:Hmax] = acc_force[t, last]
         total_resistance[t, n_real:Hmax] = total_resistance[t, last]
         generation_power[:, t, n_real:Hmax] = generation_power[:, t, last:last + 1]
         gen_costs[:, t, n_real:Hmax] = gen_costs[:, t, last:last + 1]
@@ -784,7 +802,6 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         wave_resistance=wave_resistance,
         wind_resistance=wind_resistance,
         calm_water_resistance=calm_water_resistance,
-        acc_force=acc_force,
         total_resistance=total_resistance,
         generation_power=generation_power,
         gen_costs=gen_costs,
