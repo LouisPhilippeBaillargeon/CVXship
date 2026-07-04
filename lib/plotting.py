@@ -477,6 +477,86 @@ def _print_cost_summary_vs_benchmark(solutions, labels, benchmark_label):
 
     print("=" * 80 + "\n")
 
+    def _segment_dt(sol, T, H):
+        segment_dt = getattr(sol, "segment_dt_h", None)
+        if segment_dt is not None:
+            arr = np.asarray(segment_dt, dtype=float)
+            if arr.shape == (T, H):
+                return arr
+            if arr.shape == (T,) and H == 1:
+                return arr[:, None]
+
+        timestep_dt = getattr(sol, "timestep_dt_h", None)
+        if timestep_dt is None:
+            return np.ones((T, H), dtype=float)
+
+        timestep_dt = np.asarray(timestep_dt, dtype=float).reshape(-1)
+        if timestep_dt.shape != (T,):
+            return np.ones((T, H), dtype=float)
+
+        if H == 1:
+            return timestep_dt[:, None]
+        return np.repeat((timestep_dt / H)[:, None], H, axis=1)
+
+    def _time_weighted_sum(sol, value):
+        arr = np.asarray(value, dtype=float)
+        if arr.ndim == 3:
+            T, H = arr.shape[1], arr.shape[2]
+            dt = _segment_dt(sol, T, H)
+            return float(np.sum(arr * dt[None, :, :]))
+        if arr.ndim == 2:
+            T, H = arr.shape
+            dt = _segment_dt(sol, T, H)
+            return float(np.sum(arr * dt))
+        if arr.ndim == 1:
+            T = arr.shape[0]
+            dt = _segment_dt(sol, T, 1)[:, 0]
+            return float(np.sum(arr * dt))
+        return float(np.sum(arr))
+
+    def _generator_time_weighted_sum(sol, value):
+        arr = np.asarray(value, dtype=float)
+        if arr.ndim == 3:
+            T, H = arr.shape[1], arr.shape[2]
+            dt = _segment_dt(sol, T, H)
+            return float(np.sum(arr * dt[None, :, :]))
+        if arr.ndim == 2:
+            T = arr.shape[1]
+            dt = _segment_dt(sol, T, 1)[:, 0]
+            return float(np.sum(arr * dt[None, :]))
+        return _time_weighted_sum(sol, arr)
+
+    print("COMPONENT SUMMARY")
+    print("-" * 80)
+    print(
+        f"{'Label':<35s} "
+        f"{'dist km':>10s} "
+        f"{'prop MWh':>10s} "
+        f"{'gen $':>12s} "
+        f"{'shore $':>10s} "
+        f"{'SOC f':>10s} "
+        f"{'EMS':>18s}"
+    )
+
+    for label, sol in zip(labels, solutions):
+        gen_cost = _generator_time_weighted_sum(sol, sol.gen_costs)
+        shore_cost = _time_weighted_sum(sol, sol.shore_power_cost)
+        prop_energy = _time_weighted_sum(sol, sol.prop_power)
+        final_soc = float(np.asarray(sol.SOC, dtype=float).reshape(-1)[-1])
+        total_distance = float(getattr(sol, "total_distance", np.nan))
+        ems = str(getattr(sol, "power_management_optimizer", "") or "")
+        print(
+            f"{label:<35s} "
+            f"{total_distance:>10.3f} "
+            f"{prop_energy:>10.3f} "
+            f"{gen_cost:>12.3f} "
+            f"{shore_cost:>10.3f} "
+            f"{final_soc:>10.3f} "
+            f"{ems:>18s}"
+        )
+
+    print("=" * 80 + "\n")
+
 def plot_solutions(
     solutions,
     labels=None,
@@ -589,11 +669,10 @@ def plot_solutions(
     _plot_attr("prop_power", "Propulsion power", "propulsion power [MW]", "cmp_prop_power")
 
     for attr, title in [
-        ("wave_resistance", "Wave resistance"),
         ("wind_resistance", "Wind resistance"),
         ("calm_water_resistance", "Calm-water resistance"),
-        ("total_resistance", "Total resistance"),
         ("acc_force", "Acceleration force"),
+        ("total_resistance", "Total resistance"),
     ]:
         _plot_attr(attr, title, "force / resistance [MN]", f"cmp_{attr}")
 
@@ -788,8 +867,7 @@ def plot_weather_snapshot(map, weather, variable="current_x", t_index=0, show: b
 
     variable: one of [
         "current_x", "current_y", "wind_x", "wind_y",
-        "irradiance", "temperature",
-        "mean_wave_amplitude", "mean_wave_frequency", "mean_wave_length"
+        "irradiance", "temperature"
     ]
 
     Figure is saved in PLOTS.

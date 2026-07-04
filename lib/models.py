@@ -1,13 +1,12 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from matplotlib.patches import Patch
-from typing import Optional, Dict, Any
+from typing import Optional
 import numpy as np
 import pandas as pd
 import cvxpy as cp
 import matplotlib.pyplot as plt
 import pickle
-import math
 import os
 from lib.load_params import Ship, Generator
 from lib.paths import B_SERIES_CQ, B_SERIES_CT, PLOTS
@@ -121,7 +120,7 @@ def save_obj(path, obj):
 def load_obj(path):
     with open(path, "rb") as f:
         return pickle.load(f)
-    
+
 def compute_rel_wind_speed_and_rel_attack_angle(wind_speed_vector,ship_speed_vector):
     heading = np.pi/2-np.atan2(ship_speed_vector[1],ship_speed_vector[0]) #heading in the north=0, clockwise referential
     Beta_Vw = np.pi/2-np.atan2(wind_speed_vector[1],wind_speed_vector[0]) #wind_angle in the north=0, clockwise referential
@@ -140,312 +139,35 @@ def compute_rel_wind_speed_and_rel_attack_angle(wind_speed_vector,ship_speed_vec
 
     return V_rw, gamma_rw
 
-def holtrop_wave_resistance(
-    v_rel: float,
-    L_wl: float,
-    B: float,
-    T: float,
-    disp_volume: float,
-    Cp: float,
-    Cm: float,
-    Cwp: float,
-    rho: float = 1025.0,
-    g: float = 9.81,
-    At: float = 0.0,
-    Abt: float = 0.0,
-    h_B: float = 0.0,
-    T_f: Optional[float] = None,
-    i_E_deg: Optional[float] = None,
-    lcb_percent: float = 0.0,
-    return_debug: bool = False,
-) -> float | tuple[float, Dict[str, Any]]:
-    """
-    Compute Holtrop (1984) calm-water wave resistance R_w [N].
-
-    Parameters
-    ----------
-    v_rel : float
-        Ship speed relative to water [m/s].
-    L_wl : float
-        Waterline length L [m].
-    B : float
-        Beam [m].
-    T : float
-        Mean draft [m].
-    disp_volume : float
-        Displacement volume ∇ [m^3].
-    Cp : float
-        Prismatic coefficient [-].
-    Cm : float
-        Midship section coefficient [-].
-    Cwp : float
-        Waterplane area coefficient [-].
-    rho : float, default=1025.0
-        Water density [kg/m^3].
-    g : float, default=9.81
-        Gravitational acceleration [m/s^2].
-    At : float, default=0.0
-        Immersed transom area at zero speed A_T [m^2].
-    Abt : float, default=0.0
-        Transverse bulb area at still-water intersection A_BT [m^2].
-        Set to 0.0 if no bulbous bow.
-    h_B : float, default=0.0
-        Vertical position of the center of A_BT above keel [m].
-    T_f : float, optional
-        Forward draft [m]. If omitted, T_f = T.
-    i_E_deg : float, optional
-        Half entrance angle i_E [deg]. If omitted, Holtrop regression is used.
-    lcb_percent : float, default=0.0
-        Longitudinal center of buoyancy forward of 0.5L, as % of L.
-        Keep the sign convention consistent with your hydrostatics source.
-    return_debug : bool, default=False
-        If True, also return a dict of intermediate values.
-
-    Returns
-    -------
-    R_w : float
-        Wave resistance [N].
-
-    Notes
-    -----
-    - This implements the Holtrop 1984 wave-resistance formula visible in the source pages.
-    - It is the calm-water wave-making/wave-breaking term, not added resistance in real sea waves.
-    - For v_rel <= 0, returns 0.
-    """
-
-    # ----------------------------
-    # Basic validation
-    # ----------------------------
-    if v_rel <= 0.0:
-        if return_debug:
-            return 0.0, {"Fn": 0.0, "note": "v_rel <= 0 => R_w = 0"}
-        return 0.0
-
-    for name, val in {
-        "L_wl": L_wl,
-        "B": B,
-        "T": T,
-        "disp_volume": disp_volume,
-        "Cp": Cp,
-        "Cm": Cm,
-        "Cwp": Cwp,
-        "rho": rho,
-        "g": g,
-    }.items():
-        if val <= 0.0:
-            raise ValueError(f"{name} must be > 0. Got {val}.")
-
-    if T_f is None:
-        T_f = T
-
-    # ----------------------------
-    # Froude number based on L_wl
-    # ----------------------------
-    Fn = v_rel / math.sqrt(g * L_wl)
-
-    # ----------------------------
-    # L_R used in Holtrop entrance-angle regression
-    # OCR-cleaned from the source page:
-    # L_R / L = 1 - C_p + 0.06 * C_p * lcb / (4*C_p - 1)
-    # where lcb is forward of 0.5L as % of L
-    # ----------------------------
-    denom = 4.0 * Cp - 1.0
-    if abs(denom) < 1e-12:
-        raise ValueError("Invalid Cp too close to 0.25 for Holtrop L_R formula.")
-
-    L_R = L_wl * (1.0 - Cp + 0.06 * Cp * lcb_percent / denom)
-    if L_R <= 0.0:
-        raise ValueError(f"Computed L_R <= 0 ({L_R}). Check Cp and lcb_percent.")
-
-    # ----------------------------
-    # Entrance angle i_E [deg]
-    # If not supplied, use Holtrop regression.
-    # ----------------------------
-    if i_E_deg is None:
-        term = (
-            -(L_wl / B) ** 0.80856
-            * (1.0 - Cwp) ** 0.30484
-            * (1.0 - Cp - 0.0225 * lcb_percent) ** 0.6367
-            * (L_R / B) ** 0.34574
-            * (100.0 * disp_volume / (L_wl ** 3)) ** 0.16302
-        )
-        i_E_deg = 1.0 + 89.0 * math.exp(term)
-
-    # Guard against bad inputs / roundoff
-    i_E_deg = max(1e-6, min(i_E_deg, 89.999999))
-
-    # ----------------------------
-    # c7
-    # ----------------------------
-    B_over_L = B / L_wl
-    if B_over_L < 0.11:
-        c7 = 0.229577 * (B_over_L ** (1.0 / 3.0))
-    elif B_over_L <= 0.25:
-        c7 = B_over_L
-    else:
-        c7 = 0.5 - 0.0625 * (L_wl / B)
-
-    # ----------------------------
-    # c3, c2
-    # c3 accounts for bulbous bow effect.
-    # If no bulb, set c3 = 0 => c2 = 1
-    # ----------------------------
-    if Abt > 0.0:
-        denom_c3 = B * T * (0.31 * math.sqrt(Abt) + T_f - h_B)
-        if denom_c3 <= 0.0:
-            raise ValueError(
-                "Invalid bulb geometry: denominator of c3 <= 0. "
-                "Check Abt, T_f, h_B, B, T."
-            )
-        c3 = 0.56 * (Abt ** 1.5) / denom_c3
-    else:
-        c3 = 0.0
-
-    c2 = math.exp(-1.89 * math.sqrt(c3))
-
-    # ----------------------------
-    # c5 : transom effect on wave resistance
-    # ----------------------------
-    c5 = 1.0 - 0.8 * At / (B * T * Cm)
-
-    # ----------------------------
-    # lambda
-    # ----------------------------
-    if L_wl / B < 12.0:
-        lam = 1.446 * Cp - 0.03 * (L_wl / B)
-    else:
-        lam = 1.446 * Cp - 0.36
-
-    # ----------------------------
-    # c16
-    # ----------------------------
-    if Cp < 0.80:
-        c16 = 8.07981 * Cp - 13.8673 * (Cp ** 2) + 6.984388 * (Cp ** 3)
-    else:
-        c16 = 1.73014 - 0.7067 * Cp
-
-    # ----------------------------
-    # m1
-    # ----------------------------
-    m1 = (
-        0.0140407 * (L_wl / T)
-        - 1.75254 * (disp_volume ** (1.0 / 3.0) / L_wl)
-        - 4.79323 * (B / L_wl)
-        - c16
-    )
-
-    # ----------------------------
-    # c15
-    # ----------------------------
-    L3_over_disp = (L_wl ** 3) / disp_volume
-    if L3_over_disp < 512.0:
-        c15 = -1.69385
-    elif L3_over_disp > 1727.0:
-        c15 = 0.0
-    else:
-        c15 = -1.69385 + ((L3_over_disp ** (1.0 / 3.0)) - 8.0) / 2.36
-
-    # Source page uses m2 = c15 * Cp^2 * exp(-0.1 * Fn^-2)
-    m2 = c15 * (Cp ** 2) * math.exp(-0.1 * (Fn ** -2))
-
-    # ----------------------------
-    # c1
-    # ----------------------------
-    c1 = (
-        2223105.0
-        * (c7 ** 3.78613)
-        * ((T / B) ** 1.07961)
-        * ((90.0 - i_E_deg) ** -1.37565)
-    )
-
-    # ----------------------------
-    # d
-    # ----------------------------
-    d = -0.9
-
-    # ----------------------------
-    # Wave resistance
-    # R_w = c1 c2 c5 ∇ ρ g exp(m1 Fn^d + m2 cos(lambda Fn^-2))
-    # ----------------------------
-    exponent = m1 * (Fn ** d) + m2 * math.cos(lam * (Fn ** -2))
-    R_w = c1 * c2 * c5 * disp_volume * rho * g * math.exp(exponent)
-
-    # Numerical safety: wave resistance should not be negative here
-    R_w = max(0.0, R_w)
-
-    if return_debug:
-        debug = {
-            "Fn": Fn,
-            "L_R": L_R,
-            "i_E_deg": i_E_deg,
-            "c1": c1,
-            "c2": c2,
-            "c3": c3,
-            "c5": c5,
-            "c7": c7,
-            "lambda": lam,
-            "c15": c15,
-            "c16": c16,
-            "m1": m1,
-            "m2": m2,
-            "d": d,
-            "exponent": exponent,
-            "R_w": R_w,
-        }
-        return R_w, debug
-
-    return R_w
-
 @dataclass
 class CalmWaterModel:
     "Uses Moland et al. 2017 model F = 0.5*rho*A_hull*C(v')v'^2. C(v') is evaluated at expected nominal speed in the convex optimizer and computed exactly in the evaluator."
-    "C = (1+k)C_F + delta C_F + C_W"
+    "C = (1+k)C_F + delta C_F"
     ship: Ship
     fit_range : Optional[FitRange] = field(default=None) #A good fit is often possible over 1 m/s to max speed, so its often preferable to not give a fit range and fit over all possible speed values above 1m/s
     fitted_Cx : Optional[float] = field(default=None, init=False)
     res_coeffs: Optional[np.ndarray] = field(default=None, init=False)
-    
+
     def compute_C(self, speed):
         #speed = relative speed through water in m/s
 
         if speed < 1e-6:
             return 0.0
-        
+
         Re = speed*self.ship.hull.LWL/(1.19e-6)
         ks = 150*1e-6
         LWL = self.ship.hull.LWL
         CF = 0.075/np.square((np.log10(Re)-2))
         delta_CF = 0.044*((ks/LWL)**(1/3)-10*Re**(-1/3)) + 0.000125
 
-        Rw, dbg = holtrop_wave_resistance(
-            v_rel=speed,
-            L_wl=self.ship.hull.LWL,
-            B=self.ship.hull.B,
-            T=self.ship.hull.T,
-            disp_volume=self.ship.info.displacement,
-            Cp=self.ship.hull.CB/self.ship.hull.CM,
-            Cm=self.ship.hull.CM,
-            Cwp=self.ship.hull.CWP,
-            rho=self.ship.info.rho_water,
-            g=self.ship.info.g,
-            At=self.ship.hull.AT,
-            Abt=self.ship.hull.ABT,
-            h_B=self.ship.hull.h_B,
-            T_f=self.ship.hull.TF,
-            i_E_deg=np.degrees(self.ship.hull.E1),
-            lcb_percent=self.ship.hull.LCB_percent,
-            return_debug=True,
-        )
-        CW = Rw / (0.5 * self.ship.info.rho_water * self.ship.hull.total_wet_area * np.square(speed))
-
         k = 0.017 + 20.0 * self.ship.hull.CB / ((self.ship.hull.LWL / self.ship.hull.B) ** 2 * np.sqrt(self.ship.hull.B / self.ship.hull.T))
-        return (1+k)*CF+delta_CF+CW
-    
+        return (1+k)*CF+delta_CF
+
     def compute_resistance(self, speed):
         C = self.compute_C(speed)
         Fcalm = 0.5*C*self.ship.hull.total_wet_area*self.ship.info.rho_water*np.square(speed)/1000000
         return Fcalm
-    
+
     def fit_constant_C(self, nb_points: int = 100) -> float:
         """
         Fit a constant calm-water resistance coefficient self.fitted_Cx over the
@@ -530,7 +252,7 @@ class CalmWaterModel:
 
         for i in range(len(speeds)):
             constraints += [R_fit[i] == intercept + param_v_4*v_vals_norm_4[i] + param_v_3*v_vals_norm_3[i] + param_v_2*v_vals_norm_2[i] + param_v*v_vals_norm[i]]
-        
+
         objective = cp.Minimize(cp.sum_squares(R_fit-Resistance))
         problem = cp.Problem(objective, constraints)
         problem.solve(solver="MOSEK", verbose=debug)
@@ -550,7 +272,7 @@ class CalmWaterModel:
         ])
         self.res_coeffs = coeffs
         return np.nanmax(abs_err),coeffs, max(R_fit.value)
-    
+
     def plot_calm_water_models_ieee(
         self,
         nb_points: int = 200,
@@ -707,7 +429,7 @@ class BaseWindModel:
     max_convex_resistance: Optional[np.ndarray] = field(default=None, init=False)
     min_convex_resistance: Optional[np.ndarray] = field(default=None, init=False)
     big_m_resistance: Optional[float] = field(default=None, init=False)
-    
+
     def compute_resistance(self,
                     wind_speed_vector, #eastward, northward wind speed m/s [vx, vy]
                     ship_speed_vector, #eastward, northward ship speed m/s [vx, vy]
@@ -718,17 +440,17 @@ class BaseWindModel:
             CDlAF = self.ship.hull.CDlAF_bow
         else:
             CDlAF = self.ship.hull.CDlAF_stern
-        
+
         CDl = CDlAF * self.ship.hull.AF_air / self.ship.hull.AL_air
         den = 1 - 0.5 * self.ship.hull.delta * (1-CDl/self.ship.hull.CDt) * np.sin(2 * gamma_rw)**2
         CX = -CDlAF * np.cos(gamma_rw) / den
         tauX = 0.5 * CX * self.ship.info.rho_air * V_rw**2 * self.ship.hull.AF_air
         return -tauX/1000000
-    
-    
+
+
 @dataclass
 class WindModel2D(BaseWindModel):
-    
+
     def fit_convex_model(
         #fit a convex model for a specific weather, based on directional vx, vy speed
         self,
@@ -793,7 +515,7 @@ class WindModel2D(BaseWindModel):
                                     param_vy_4*vy_vals_norm_4[i_y]+param_vy_2*vy_vals_norm_2[i_y]+param_vy*vy_vals_norm[i_y]+
                                     param_vs_4*vs_vals_norm_4[i_y,i_x]+param_vs_3*vs_vals_norm_3[i_y,i_x]+param_vs_2*vs_vals_norm_2[i_y,i_x]+param_vs*vs_vals_norm[i_y,i_x]]
                     #constraints+=[R_fit[i_y,i_x] >= Resistance[i_y,i_x]]
-        
+
         objective = cp.Minimize(cp.sum_squares(cp.multiply(R_fit-Resistance,mask)))
         problem = cp.Problem(objective, constraints)
         problem.solve(solver="MOSEK", verbose=debug)
@@ -801,7 +523,7 @@ class WindModel2D(BaseWindModel):
         # Check solve status
         if problem.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
             raise RuntimeError(f"Power fit problem not solved optimally: {problem.status}")
-        
+
         if debug:
             # Prepare masked data for wireframe
             VX_m   = VX.copy()
@@ -895,7 +617,7 @@ class WindModel2D(BaseWindModel):
 
 @dataclass
 class WindModel1D(BaseWindModel):
-    
+
     def fit_convex_model(
         #fit a convex model for a specific weather, based on directional vx, vy speed
         self,
@@ -934,7 +656,7 @@ class WindModel1D(BaseWindModel):
 
         for i in range(len(vs_vals)):
             constraints += [R_fit[i] == intercept + param_vs_4*vs_vals_norm_4[i] + param_vs_3*vs_vals_norm_3[i] + param_vs_2*vs_vals_norm_2[i] + param_vs*vs_vals_norm[i]]
-        
+
         objective = cp.Minimize(cp.sum_squares(R_fit-Resistance))
         problem = cp.Problem(objective, constraints)
         problem.solve(solver="MOSEK", verbose=debug)
@@ -1252,689 +974,6 @@ class WindModelPathAligned2D(BaseWindModel):
 
 
 @dataclass
-class BaseWaveModel:
-    """
-    ITTC recommanded approach to compute wave loads https://www.sciencedirect.com/science/article/pii/S0029801821013020, returns MN
-    """
-    ship: Ship
-    fit_range : FitRange
-    thrust_coeffs: Optional[np.ndarray] = field(default=None, init=False)
-    relative_errors: Optional[np.ndarray] = field(default=None, init=False)
-    max_convex_resistance : Optional[np.ndarray] = field(default=None, init=False)
-    min_convex_resistance : Optional[np.ndarray] = field(default=None, init=False)
-    big_m_resistance : Optional[float] = field(default=None, init=False)
-
-    @staticmethod
-    def compute_wave_relative_angle_encounter(
-        ship_speed_vector,      # [vx, vy] m/s, speed through water
-        mean_wave_direction,    # ERA5 convention, degrees, "from" direction
-        eps: float = 1e-9,
-    ):
-        """
-        Compute wave encounter angle in radians in [0, pi].
-
-        Convention used here:
-        - mean_wave_direction follows ERA5 "from" convention:
-            0 deg = from north, 90 deg = from east
-        - ship_speed_vector is [vx, vy] in east/north coordinates
-        - returned angle is:
-            0   -> waves coming straight against ship motion (head seas)
-            pi/2 -> beam seas
-            pi   -> following seas
-        """
-        mwd_rad = np.deg2rad(mean_wave_direction)
-
-        # Unit vector pointing FROM where waves come
-        wx_from = np.sin(mwd_rad)   # east component
-        wy_from = np.cos(mwd_rad)   # north component
-
-        Vs = float(np.hypot(ship_speed_vector[0], ship_speed_vector[1]))
-
-        # Undefined heading at zero speed. Keep a deterministic fallback.
-        if Vs < eps:
-            sx, sy = 1.0, 0.0
-        else:
-            sx = float(ship_speed_vector[0]) / Vs
-            sy = float(ship_speed_vector[1]) / Vs
-
-        dot = np.clip(wx_from * sx + wy_from * sy, -1.0, 1.0)
-        return float(np.arccos(dot))
-
-    def compute_resistance(self,
-                    mean_wave_amplitude,            # m
-                    mean_wave_frequency,            # rad/s
-                    mean_wave_length,               # m
-                    Vs,                             # speed through water #m/s
-                    wave_relative_angle_encounter   # rad, 0 is opposite to ship's heading, we assume heading=course
-                    ):
-        T_deep = max(self.ship.hull.TF,self.ship.hull.TA)
-        Fr = Vs/np.sqrt(self.ship.info.g*self.ship.hull.LPP)
-        alpha = wave_relative_angle_encounter
-
-        if(alpha>np.pi or alpha<0):
-            print("Invalid encounter angle check this out")
-
-        log_factor = 1 - 0.111/self.ship.hull.CB * (np.log(self.ship.hull.B/T_deep) - np.log(2.75))   
-        angle_factor = ((-1.377 * Fr**2 + 1.157 * Fr) * np.abs(np.cos(alpha)) +0.618 * (13 + np.cos(alpha)**2) / 14)
-        w_hat = (2.142 * self.ship.hull.kyy**(1/3) * np.sqrt(self.ship.hull.LPP/mean_wave_length) *(self.ship.hull.CB/0.65)**0.17 * log_factor * angle_factor)
-        Vg = self.ship.info.g/(2*mean_wave_frequency)
-        Fr_rel = (Vs-Vg)/np.sqrt(self.ship.info.g*self.ship.hull.LPP)
-
-        if(0<=alpha<=np.pi/2):
-            a1 = ((0.87/self.ship.hull.CB)**((1+Fr)*np.cos(alpha))) * (1/(np.log(self.ship.hull.B/T_deep)))*(1+2*np.cos(alpha))/3
-
-        elif((np.pi-eps)<alpha < (np.pi+eps)):
-
-            if((Vs > Vg) and (Fr_rel>= 0.12)):
-                a1 = ((0.87/self.ship.hull.CB)**(1+Fr_rel))*(1/(np.log(self.ship.hull.B/T_deep)))
-            else:
-                a1 = (0.87/self.ship.hull.CB)*(1/(np.log(self.ship.hull.B/T_deep)))
-
-        else: #linear interpolation between beam and following waves
-            a1_beam = ((0.87/self.ship.hull.CB)**((1+Fr)*np.cos(np.pi/2))) * (1/(np.log(self.ship.hull.B/T_deep)))*(1+2*np.cos(np.pi/2))/3
-            if((Vs > Vg) and (Fr_rel>= 0.12)):
-                a1_follow = ((0.87/self.ship.hull.CB)**(1+Fr_rel))*(1/(np.log(self.ship.hull.B/T_deep)))
-            else:
-                a1_follow = (0.87/self.ship.hull.CB)*(1/(np.log(self.ship.hull.B/T_deep)))
-            t = (alpha-np.pi/2)/(np.pi/2)
-            a1 = a1_beam + t*(a1_follow-a1_beam)
-           
-        if(0<=alpha<=np.pi/2):
-            if(Fr<0.12):
-                a2 = 0.0072 + 0.1676*Fr
-            else:
-                a2 = Fr**1.5*np.exp(-3.5*Fr)
-        elif((np.pi-eps)<alpha < (np.pi+eps)):
-            if(Vs<=Vg/2):
-                a2 = 0.0072*(2*Vs/Vg -1)
-            elif(Vs>Vg/2 and Fr_rel < 0.12):
-                a2 = 0.0072+0.1676*Fr_rel
-            else:
-                a2 = Fr_rel**(1.5)*np.exp(-3.5*Fr_rel)
-
-        else: #linear interpolation between beam and following waves
-            if(Fr<0.12):
-                a2_beam = 0.0072 + 0.1676*Fr
-            else:
-                a2_beam = Fr**1.5*np.exp(-3.5*Fr)
-
-            if(Vs<=Vg/2):
-                a2_follow = 0.0072*(2*Vs/Vg -1)
-            elif(Vs>Vg/2 and Fr_rel < 0.12):
-                a2_follow = 0.0072+0.1676*Fr_rel
-            else:
-                a2_follow = Fr_rel**(1.5)*np.exp(-3.5*Fr_rel)
-
-            t = (alpha-np.pi/2)/(np.pi/2)
-            a2 = a2_beam + t*(a2_follow-a2_beam)
-        
-        a3 = 1 + 28.7*np.arctan(np.abs(self.ship.hull.TA-self.ship.hull.TF)/self.ship.hull.LPP)
-
-        if(w_hat<1):
-            b1 = 11
-            d1 = 566*(self.ship.hull.LPP*self.ship.hull.CB/self.ship.hull.B)**(-2.66)
-        else:
-            b1 = -8.5
-            d1 = -566*(self.ship.hull.LPP/self.ship.hull.B)**(-2.66)*(4-125*np.arctan(np.abs(self.ship.hull.TA-self.ship.hull.TF)/self.ship.hull.LPP))
-        
-        R_AWM_1 = 3859.2*self.ship.info.rho_water*(mean_wave_amplitude**2)
-        R_AWM_2 = (self.ship.hull.B**2/self.ship.hull.LPP)*(self.ship.hull.CB**1.34)*(self.ship.hull.kyy**2)
-        R_AWM_3 = a1*a2*a3*(w_hat**b1)
-        R_AWM_4 = np.exp((b1/d1)*(1-w_hat**d1))
-        R_AWM = R_AWM_1*R_AWM_2*R_AWM_3*R_AWM_4
-
-        T_star_12 = T_deep
-        
-        if(self.ship.hull.CB<=0.75):
-            T_star_34 = T_deep*(4+np.sqrt(np.abs(np.cos(alpha))))/5
-        else:
-            T_star_34 = T_deep*(2+np.sqrt(np.abs(np.cos(alpha))))/3
-        if(mean_wave_length/self.ship.hull.LPP <= 2.5):
-            draft_coefficient_12 = 1-np.exp(-4*np.pi*(T_star_12/mean_wave_length-T_star_12/(2.5*self.ship.hull.LPP)))
-            draft_coefficient_34 = 1-np.exp(-4*np.pi*(T_star_34/mean_wave_length-T_star_34/(2.5*self.ship.hull.LPP)))
-        else:
-            draft_coefficient_12 = 0
-            draft_coefficient_34 = 0
-
-        if(0<=alpha<=self.ship.hull.E1):
-            f_phi = np.cos(alpha)
-        else : 
-            f_phi = 0
-
-        if(0<alpha<(np.pi - self.ship.hull.E1)):
-            R_AWR_1 = 2.25/4*self.ship.info.rho_water*self.ship.info.g*self.ship.hull.B*mean_wave_amplitude**2*draft_coefficient_12*(np.sin(self.ship.hull.E1+alpha)**2+2*mean_wave_frequency*Vs*(np.cos(alpha)-np.cos(self.ship.hull.E1)*np.cos(self.ship.hull.E1+alpha))/self.ship.info.g)*(0.87/self.ship.hull.CB)**((1+4*np.sqrt(Fr))*f_phi)
-        else:
-            R_AWR_1 = 0 #?
-        if(0<alpha<self.ship.hull.E1):
-            R_AWR_2 = 2.25/4*self.ship.info.rho_water*self.ship.info.g*self.ship.hull.B*mean_wave_amplitude**2*draft_coefficient_12*(np.sin(self.ship.hull.E1-alpha)**2+2*mean_wave_frequency*Vs*(np.cos(alpha)-np.cos(self.ship.hull.E1)*np.cos(self.ship.hull.E1-alpha))/self.ship.info.g)*(0.87/self.ship.hull.CB)**((1+4*np.sqrt(Fr))*f_phi)
-        else:
-            R_AWR_2 = 0 #?
-        if(self.ship.hull.E2<alpha<np.pi):
-            R_AWR_3 = -2.25/4*self.ship.info.rho_water*self.ship.info.g*self.ship.hull.B*mean_wave_amplitude**2*draft_coefficient_34*(np.sin(self.ship.hull.E2-alpha)**2+2*mean_wave_frequency*Vs*(np.cos(alpha)-np.cos(self.ship.hull.E2)*np.cos(self.ship.hull.E2-alpha))/self.ship.info.g)
-        else:
-            R_AWR_3 = 0 #?
-        if(np.pi-self.ship.hull.E2<alpha<np.pi):
-            R_AWR_4 = -2.25/4*self.ship.info.rho_water*self.ship.info.g*self.ship.hull.B*mean_wave_amplitude**2*draft_coefficient_34*(np.sin(self.ship.hull.E2+alpha)**2+2*mean_wave_frequency*Vs*(np.cos(alpha)-np.cos(self.ship.hull.E2)*np.cos(self.ship.hull.E2+alpha))/self.ship.info.g)
-        else:
-            R_AWR_4 = 0 #?
-
-        R_AWR = R_AWR_1+R_AWR_2+R_AWR_3+R_AWR_4
-        R_WAVE = R_AWM + R_AWR
-        return R_WAVE/1000000
-
-
-@dataclass
-class WaveModel1D(BaseWaveModel):
-    def fit_convex_model(
-        #fit a convex model for a specific weather, based on directional vx, vy speed
-        self,
-        mean_wave_amplitude : float,        # m
-        mean_wave_frequency : float,        # rad/s
-        mean_wave_length    : float,        # m
-        mean_wave_direction : float,        # ERA5 convention, 0 deg = from north, 90deg = from est
-        course_angle        : float, 
-        nb_steps : int = 40,                # amount of points used in the fit in both axis
-        debug: bool = False
-    ):
-        vs_vals = np.arange(self.fit_range.min_speed, self.fit_range.max_speed + 1e-12, (self.fit_range.max_speed-self.fit_range.min_speed)/nb_steps)
-
-        Resistance = np.zeros_like(vs_vals, dtype=float)
-        for i in range(vs_vals.shape[0]):
-            vx = vs_vals[i]*np.cos(course_angle)
-            vy = vs_vals[i]*np.sin(course_angle)
-            ship_speed_vector = np.array([vx, vy], dtype=float)
-
-            wave_relative_angle_encounter = self.compute_wave_relative_angle_encounter(
-                ship_speed_vector=ship_speed_vector,
-                mean_wave_direction=mean_wave_direction,
-            )
-
-            Resistance[i] = self.compute_resistance(
-                mean_wave_amplitude,
-                mean_wave_frequency,
-                mean_wave_length,
-                vs_vals[i],
-                wave_relative_angle_encounter,
-            )
-        #Fit a convex power model
-        vs_vals_norm = vs_vals/self.ship.info.max_speed
-        vs_vals_norm_2 = vs_vals_norm**2
-        vs_vals_norm_3 = vs_vals_norm**3
-        vs_vals_norm_4 = vs_vals_norm**4
-
-        R_fit = cp.Variable(vs_vals_norm.shape)
-        param_vs = cp.Variable()
-        param_vs_2 = cp.Variable()
-        param_vs_3 = cp.Variable()
-        param_vs_4 = cp.Variable()
-        intercept = cp.Variable()
-
-        constraints = []
-        constraints += [param_vs>=eps]
-        constraints += [param_vs_2>=eps]
-        constraints += [param_vs_3>=eps]
-        constraints += [param_vs_4>=eps]
-
-        for i in range(len(vs_vals)):
-            constraints += [R_fit[i]== intercept + param_vs_4*vs_vals_norm_4[i]+param_vs_3*vs_vals_norm_3[i]+param_vs_2*vs_vals_norm_2[i]+param_vs*vs_vals_norm[i]]
-        
-        objective = cp.Minimize(cp.sum_squares(R_fit-Resistance))
-        problem = cp.Problem(objective, constraints)
-        problem.solve(solver="MOSEK", verbose=debug)
-
-        # Check solve status
-        if problem.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-            raise RuntimeError(f"Power fit problem not solved optimally: {problem.status}")
-
-        abs_err = np.abs(R_fit.value - Resistance)
-
-        coeffs = np.array([
-            intercept.value,
-            param_vs.value,
-            param_vs_2.value,
-            param_vs_3.value,
-            param_vs_4.value,
-        ])
-
-        return np.nanmax(abs_err),coeffs, min(R_fit.value), max(R_fit.value)
-
-    def fit_convex_models(
-        #fit convex wave models for every zone and timestep combination based on weather
-        self,
-        mean_wave_amplitudes, # [nb_zones, nb_timestep]
-        mean_wave_frequency, # [nb_zones, nb_timestep]
-        mean_wave_length, # [nb_zones, nb_timestep]
-        mean_wave_direction, # [nb_zones, nb_timestep]
-        course_angles, #angle of the ship [nb_zones, nb_timestep]
-    ):
-        nb_zones                = mean_wave_amplitudes.shape[0]
-        nb_timesteps            = mean_wave_amplitudes.shape[1]
-        self.thrust_coeffs      = np.zeros((nb_zones,nb_timesteps,5))
-        self.relative_errors    = np.zeros((nb_zones,nb_timesteps))
-        self.max_convex_resistance = np.zeros((nb_zones,nb_timesteps))
-        self.min_convex_resistance = np.zeros((nb_zones,nb_timesteps))
-
-        for iz in range(nb_zones):
-            for it in range(nb_timesteps):
-                self.relative_errors[iz,it], self.thrust_coeffs[iz,it,:], self.min_convex_resistance[iz,it], self.max_convex_resistance[iz,it] = self.fit_convex_model(mean_wave_amplitudes[iz,it],mean_wave_frequency[iz,it],mean_wave_length[iz,it],mean_wave_direction[iz,it], course_angles[iz,it], debug=False)
-            print("zone", iz, "fitted")
-        _finalize_resistance_big_m(self)
-
-@dataclass
-class WaveModel2D(BaseWaveModel):
-    def fit_convex_model(
-        #fit a convex model for a specific weather, based on directional vx, vy speed
-        self,
-        mean_wave_amplitude : float,        # m
-        mean_wave_frequency : float,        # rad/s
-        mean_wave_length    : float,        # m
-        mean_wave_direction : float,        # ERA5 convention, 0 deg = from north, 90deg = from est
-        nb_steps : int = 40,                # amount of points used in the fit in both axis
-        debug: bool = False
-    ):
-        vx_vals = np.arange(-self.ship.info.max_speed, self.ship.info.max_speed + 1e-12, 2*(self.ship.info.max_speed)/nb_steps)
-        vy_vals = np.arange(-self.ship.info.max_speed, self.ship.info.max_speed + 1e-12, 2*(self.ship.info.max_speed)/nb_steps)
-        VX, VY = np.meshgrid(vx_vals, vy_vals)
-        VS = np.sqrt(np.square(VX)+np.square(VY))
-
-        mask = (VS <= self.ship.info.max_speed) & (VS >= eps) #exclude too big speed and speed = 0, because of undefined course, assumed to be equal to heading.
-
-        Resistance = np.zeros_like(VX, dtype=float)
-        for i in range(VX.shape[0]):
-            for j in range(VX.shape[1]):
-                if(mask[i,j]):
-                    ship_speed_vector = np.array([VX[i, j], VY[i, j]], dtype=float)
-                    Vs = float(np.hypot(ship_speed_vector[0], ship_speed_vector[1]))
-
-                    wave_relative_angle_encounter = self.compute_wave_relative_angle_encounter(
-                        ship_speed_vector=ship_speed_vector,
-                        mean_wave_direction=mean_wave_direction,
-                    )
-
-                    Resistance[i, j] = self.compute_resistance(
-                        mean_wave_amplitude,
-                        mean_wave_frequency,
-                        mean_wave_length,
-                        Vs,
-                        wave_relative_angle_encounter,
-                    )
-        #Fit a convex power model
-        vx_vals_norm = vx_vals/self.ship.info.max_speed
-        vy_vals_norm = vy_vals/self.ship.info.max_speed
-        vs_vals_norm = VS/self.ship.info.max_speed
-
-        vx_vals_norm_2 = vx_vals_norm**2
-        vx_vals_norm_4 = vx_vals_norm**4
-        vy_vals_norm_2 = vy_vals_norm**2
-        vy_vals_norm_4 = vy_vals_norm**4
-        vs_vals_norm_2 = vs_vals_norm**2
-        vs_vals_norm_3 = vs_vals_norm**3
-        vs_vals_norm_4 = vs_vals_norm**4
-
-        R_fit = cp.Variable(VX.shape)
-        param_vx = cp.Variable()
-        param_vx_2 = cp.Variable()
-        param_vx_4 = cp.Variable()
-        param_vy = cp.Variable()
-        param_vy_2 = cp.Variable()
-        param_vy_4 = cp.Variable()
-        param_vs = cp.Variable()
-        param_vs_2 = cp.Variable()
-        param_vs_3 = cp.Variable()
-        param_vs_4 = cp.Variable()
-        intercept = cp.Variable()
-
-        constraints = []
-        constraints += [param_vx_2>=eps]
-        constraints += [param_vy_2>=eps]
-        constraints += [param_vx_4>=eps]
-        constraints += [param_vy_4>=eps]
-        constraints += [param_vs>=eps]
-        constraints += [param_vs_2>=eps]
-        constraints += [param_vs_3>=eps]
-        constraints += [param_vs_4>=eps]
-
-        for i_y in range(len(vy_vals)):
-            for i_x in range(len(vx_vals)):
-                if(mask[i_y,i_x]):
-                    constraints += [R_fit[i_y,i_x]== intercept+
-                                    param_vx_4*vx_vals_norm_4[i_x]+param_vx_2*vx_vals_norm_2[i_x]+param_vx*vx_vals_norm[i_x]+
-                                    param_vy_4*vy_vals_norm_4[i_y]+param_vy_2*vy_vals_norm_2[i_y]+param_vy*vy_vals_norm[i_y]+
-                                    param_vs_4*vs_vals_norm_4[i_y,i_x]+param_vs_3*vs_vals_norm_3[i_y,i_x]+param_vs_2*vs_vals_norm_2[i_y,i_x]+param_vs*vs_vals_norm[i_y,i_x]]
-                    #constraints+=[R_fit[i_y,i_x] >= Resistance[i_y,i_x]]
-        
-        objective = cp.Minimize(cp.sum_squares(cp.multiply(R_fit-Resistance,mask)))
-        problem = cp.Problem(objective, constraints)
-        problem.solve(solver="MOSEK", verbose=debug)
-
-        # Check solve status
-        if problem.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-            raise RuntimeError(f"Power fit problem not solved optimally: {problem.status}")
-        
-        if debug:
-
-            # Prepare masked data for wireframe
-            VX_m   = VX.copy()
-            VY_m   = VY.copy()
-            Rtrue  = Resistance.copy()
-            Rfit   = R_fit.value.copy()
-
-            VX_m[~mask]  = np.nan
-            VY_m[~mask]  = np.nan
-            Rtrue[~mask] = np.nan
-            Rfit[~mask]  = np.nan
-
-            fig = plt.figure(figsize=(8,6))
-            ax = fig.add_subplot(111, projection="3d")
-
-            # True resistance (default color)
-            ax.plot_wireframe(VX_m, VY_m, Rtrue, rstride=2, cstride=2, linewidth=0.5)
-
-            # Fitted resistance (orange)
-            ax.plot_wireframe(VX_m, VY_m, Rfit, rstride=2, cstride=2, color="orange", linewidth=0.8)
-
-            ax.set_xlabel("vx [m/s]")
-            ax.set_ylabel("vy [m/s]")
-            ax.set_zlabel("Resistance")
-            ax.set_title("True vs Fitted Resistance (Wireframe)")
-
-            plt.show()
-
-        abs_err = np.abs(R_fit.value[mask] - Resistance[mask])
-
-        coeffs = np.array([
-            intercept.value,
-            param_vs.value,
-            param_vs_2.value,
-            param_vs_3.value,
-            param_vs_4.value,
-            param_vx.value,
-            param_vx_2.value,
-            param_vx_4.value,
-            param_vy.value,
-            param_vy_2.value,
-            param_vy_4.value,
-        ])
-
-        return np.nanmax(abs_err),coeffs, min(R_fit.value[mask]), max(R_fit.value[mask])
-
-    def fit_convex_models(
-        #fit convex wave models for every zone and timestep combination based on weather
-        self,
-        mean_wave_amplitudes, # [nb_zones, nb_timestep]
-        mean_wave_frequency, # [nb_zones, nb_timestep]
-        mean_wave_length, # [nb_zones, nb_timestep]
-        mean_wave_direction, # [nb_zones, nb_timestep]
-    ):
-        nb_zones                = mean_wave_amplitudes.shape[0]
-        nb_timesteps            = mean_wave_amplitudes.shape[1]
-        self.thrust_coeffs      = np.zeros((nb_zones,nb_timesteps,11))
-        self.relative_errors    = np.zeros((nb_zones,nb_timesteps))
-        self.max_convex_resistance = np.zeros((nb_zones,nb_timesteps))
-        self.min_convex_resistance = np.zeros((nb_zones,nb_timesteps))
-
-        for iz in range(nb_zones):
-            for it in range(nb_timesteps):
-                self.relative_errors[iz,it], self.thrust_coeffs[iz,it,:], self.min_convex_resistance[iz,it], self.max_convex_resistance[iz,it] = self.fit_convex_model(mean_wave_amplitudes[iz,it],mean_wave_frequency[iz,it],mean_wave_length[iz,it],mean_wave_direction[iz,it],debug=False)
-            print("zone", iz, "fitted")
-        _finalize_resistance_big_m(self)
-
-@dataclass
-class WaveModelPathAligned2D(BaseWaveModel):
-    heading_half_angle_deg: float = 45.0
-
-    def _sector_linear_constraints(self, course_angle: float):
-        theta = np.deg2rad(self.heading_half_angle_deg)
-
-        u_left = np.array([
-            np.cos(course_angle + theta),
-            np.sin(course_angle + theta),
-        ])
-        u_right = np.array([
-            np.cos(course_angle - theta),
-            np.sin(course_angle - theta),
-        ])
-
-        n_left = np.array([u_left[1], -u_left[0]])
-        n_right = np.array([-u_right[1], u_right[0]])
-
-        A = np.vstack([n_left, n_right])
-        b = np.zeros(2)
-
-        return A, b
-
-    def fit_convex_model(
-        self,
-        mean_wave_amplitude,
-        mean_wave_frequency,
-        mean_wave_length,
-        mean_wave_direction,
-        course_angle,
-        nb_speed_steps: int = 40,
-        nb_angle_steps: int = 21,
-        debug: bool = False,
-        conservative: bool = False,
-    ):
-        theta_max = np.deg2rad(self.heading_half_angle_deg)
-
-        speed_vals = np.linspace(
-            self.fit_range.min_speed,
-            self.fit_range.max_speed,
-            nb_speed_steps,
-        )
-        angle_offsets = np.linspace(
-            -theta_max,
-            theta_max,
-            nb_angle_steps,
-        )
-
-        V, DA = np.meshgrid(speed_vals, angle_offsets)
-        ANG = course_angle + DA
-
-        VX = V * np.cos(ANG)
-        VY = V * np.sin(ANG)
-        VS = np.sqrt(VX**2 + VY**2)
-
-        Resistance = np.zeros_like(VX, dtype=float)
-
-        for iy in range(VX.shape[0]):
-            for ix in range(VX.shape[1]):
-                v_vec = np.array([VX[iy, ix], VY[iy, ix]], dtype=float)
-                alpha = self.compute_wave_relative_angle_encounter(
-                    ship_speed_vector=v_vec,
-                    mean_wave_direction=mean_wave_direction,
-                )
-                Resistance[iy, ix] = self.compute_resistance(
-                    mean_wave_amplitude,
-                    mean_wave_frequency,
-                    mean_wave_length,
-                    float(VS[iy, ix]),
-                    alpha,
-                )
-
-        scale = self.ship.info.max_speed
-        vx_n = VX / scale
-        vy_n = VY / scale
-        vs_n = VS / scale
-
-        R_fit = cp.Variable(VX.shape)
-
-        intercept = cp.Variable()
-        param_vs = cp.Variable()
-        param_vs_2 = cp.Variable()
-        param_vs_3 = cp.Variable()
-        param_vs_4 = cp.Variable()
-        param_vx = cp.Variable()
-        param_vx_2 = cp.Variable()
-        param_vx_4 = cp.Variable()
-        param_vy = cp.Variable()
-        param_vy_2 = cp.Variable()
-        param_vy_4 = cp.Variable()
-
-        constraints = [
-            param_vs >= eps,
-            param_vs_2 >= eps,
-            param_vs_3 >= eps,
-            param_vs_4 >= eps,
-            param_vx_2 >= eps,
-            param_vx_4 >= eps,
-            param_vy_2 >= eps,
-            param_vy_4 >= eps,
-        ]
-
-        expr = (
-            intercept
-            + param_vs * vs_n
-            + param_vs_2 * vs_n**2
-            + param_vs_3 * vs_n**3
-            + param_vs_4 * vs_n**4
-            + param_vx * vx_n
-            + param_vx_2 * vx_n**2
-            + param_vx_4 * vx_n**4
-            + param_vy * vy_n
-            + param_vy_2 * vy_n**2
-            + param_vy_4 * vy_n**4
-        )
-
-        constraints += [R_fit == expr]
-
-        if conservative:
-            constraints += [R_fit >= Resistance]
-
-        problem = cp.Problem(cp.Minimize(cp.sum_squares(R_fit - Resistance)), constraints)
-        problem.solve(solver="MOSEK", verbose=debug)
-
-        if problem.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-            raise RuntimeError(f"Wave fit problem not solved optimally: {problem.status}")
-
-        abs_err = np.abs(R_fit.value - Resistance)
-
-        coeffs = np.array([
-            intercept.value,
-            param_vs.value,
-            param_vs_2.value,
-            param_vs_3.value,
-            param_vs_4.value,
-            param_vx.value,
-            param_vx_2.value,
-            param_vx_4.value,
-            param_vy.value,
-            param_vy_2.value,
-            param_vy_4.value,
-        ], dtype=float)
-
-        A, b = self._sector_linear_constraints(course_angle)
-
-        return (
-            float(np.nanmax(abs_err)),
-            coeffs,
-            float(np.nanmin(R_fit.value)),
-            float(np.nanmax(R_fit.value)),
-            float(np.nanmean(np.abs(Resistance))),
-            float(np.nanmax(np.abs(Resistance))),
-            A,
-            b,
-            VX,
-            VY,
-            Resistance,
-            R_fit.value,
-            abs_err,
-        )
-
-    def fit_convex_models(
-        self,
-        mean_wave_amplitudes,
-        mean_wave_frequency,
-        mean_wave_length,
-        mean_wave_direction,
-        course_angles,
-        nb_speed_steps: int = 40,
-        nb_angle_steps: int = 21,
-        debug: bool = False,
-        conservative: bool = False,
-    ):
-        nb_segments = mean_wave_amplitudes.shape[0]
-        nb_timesteps = mean_wave_amplitudes.shape[1]
-
-        self.thrust_coeffs = np.zeros((nb_segments, nb_timesteps, 11))
-        self.relative_errors = np.zeros((nb_segments, nb_timesteps))
-        self.max_convex_resistance = np.zeros((nb_segments, nb_timesteps))
-        self.min_convex_resistance = np.zeros((nb_segments, nb_timesteps))
-        self.mean_true_resistance = np.zeros((nb_segments, nb_timesteps))
-        self.max_true_resistance = np.zeros((nb_segments, nb_timesteps))
-
-        self.speed_constraint_A = np.zeros((nb_segments, 2, 2))
-        self.speed_constraint_b = np.zeros((nb_segments, 2))
-
-        worst = {"err": -np.inf}
-
-        for s in range(nb_segments):
-            A, b = self._sector_linear_constraints(course_angles[s, 0])
-            self.speed_constraint_A[s, :, :] = A
-            self.speed_constraint_b[s, :] = b
-
-            for t in range(nb_timesteps):
-                out = self.fit_convex_model(
-                    mean_wave_amplitudes[s, t],
-                    mean_wave_frequency[s, t],
-                    mean_wave_length[s, t],
-                    mean_wave_direction[s, t],
-                    course_angles[s, t],
-                    nb_speed_steps=nb_speed_steps,
-                    nb_angle_steps=nb_angle_steps,
-                    debug=False,
-                    conservative=conservative,
-                )
-
-                err, coeffs, min_fit, max_fit, mean_true, max_true, A, b, VX, VY, Rtrue, Rfit, E = out
-
-                self.relative_errors[s, t] = err
-                self.thrust_coeffs[s, t, :] = coeffs
-                self.min_convex_resistance[s, t] = min_fit
-                self.max_convex_resistance[s, t] = max_fit
-                self.mean_true_resistance[s, t] = mean_true
-                self.max_true_resistance[s, t] = max_true
-
-                if err > worst["err"]:
-                    worst = {
-                        "err": err,
-                        "s": s,
-                        "t": t,
-                        "VX": VX,
-                        "VY": VY,
-                        "Rtrue": Rtrue,
-                        "Rfit": Rfit,
-                        "E": E,
-                    }
-
-            print("path segment", s, "wave fitted")
-
-        if debug:
-            print("\n[WaveModelPathAligned2D debug]")
-            print("Worst absolute fit error:", worst["err"])
-            print("Worst segment:", worst["s"])
-            print("Worst timestep:", worst["t"])
-            print("Average true wave resistance:", np.nanmean(np.abs(self.mean_true_resistance)))
-            print("Max true wave resistance:", np.nanmax(np.abs(self.max_true_resistance)))
-
-            for Z, title in [
-                (worst["Rtrue"], "True wave resistance"),
-                (worst["Rfit"], "Fitted wave resistance"),
-                (worst["E"], "Absolute wave fit error"),
-            ]:
-                fig, ax = plt.subplots(figsize=(6, 5))
-                pcm = ax.pcolormesh(worst["VX"], worst["VY"], Z, shading="auto")
-                fig.colorbar(pcm, ax=ax, label="MN")
-                ax.set_xlabel("speed rel. water x [m/s]")
-                ax.set_ylabel("speed rel. water y [m/s]")
-                ax.set_title(f"{title} - segment {worst['s']}, timestep {worst['t']}")
-                ax.set_aspect("equal", adjustable="box")
-                fig.tight_layout()
-                plt.show()
-
-        _finalize_resistance_big_m(self)
-
-@dataclass
 class PropulsionModel:
     """
     Propulsion B-series model and its convex approximation.
@@ -1942,7 +981,7 @@ class PropulsionModel:
     ship: Ship
     grid_granularity : np.int
     pitch_granularity : np.int
-    fit_range : FitRange 
+    fit_range : FitRange
     show_initial_power_surface: bool = False
 
     # B-series coefficients
@@ -2024,7 +1063,7 @@ class PropulsionModel:
             plt.tight_layout()
             plt.show()
 
-        
+
     #=======================================Physical computations===================================================
     def compute_KT(self, J, pitch):
         PD = pitch/self.ship.propulsion.D
@@ -2037,7 +1076,7 @@ class PropulsionModel:
             v = row['v']
             KT = KT + CT*(J**s)*(PD**t)*(self.ship.propulsion.AE_AO**u)*(self.ship.propulsion.nb_blades**v)
         return KT
-    
+
     def compute_KQ(self, J, pitch):
         PD = pitch/self.ship.propulsion.D
         KQ = np.zeros_like(J)
@@ -2049,14 +1088,14 @@ class PropulsionModel:
             v = row['v']
             KQ = KQ + CQ*(J**s)*(PD**t)*(self.ship.propulsion.AE_AO**u)*(self.ship.propulsion.nb_blades**v)
         return KQ
-    
+
     def compute_thrust(self, ua, n, pitch):
         #Computes thust in Mega newtons using B-series based on the ship's internal parameters and its current advance speed in m/s (ua) and rotational speed in rotations per second (n)
         J = np.abs(ua)/(np.abs(self.ship.propulsion.D*n))
         KT = self.compute_KT(J,pitch)
         Thrust = (self.ship.info.rho_water * self.ship.propulsion.D**4 * KT * abs(n) * n)/1000000
         return Thrust
-    
+
     def compute_power(self, ua, n, pitch):
         #Computes power in MW using B-series based on the ship's internal parameters and its current advance speed in m/s (ua) and rotational speed in rotations per second (n)
         J = np.abs(ua)/(np.abs(self.ship.propulsion.D*n))
@@ -2064,15 +1103,15 @@ class PropulsionModel:
         Q = self.ship.info.rho_water * (self.ship.propulsion.D**5) * KQ * abs(n) * n    # torque
         Power = (2*np.pi * n * Q)/1000000
         return max(Power,0)
-    
+
     def compute_max_J(self,pitch, debug=False):
         #compute max J (0 thrust value)
         U, N = np.meshgrid(self.ua_vals, self.n_vals)
         J = U/(N*self.ship.propulsion.D)
         j_vals = np.linspace(np.min(J), np.max(J), num=self.grid_granularity*2, endpoint=True, retstep=False, dtype=None)
         KT = self.compute_KT(j_vals,pitch)
-        
-        # Find indices where KT crosses zero 
+
+        # Find indices where KT crosses zero
         sign_change_indices = np.where(np.diff(np.sign(KT)))[0]
 
         # Interpolate to find more accurate J values where KT crosses 0
@@ -2100,7 +1139,7 @@ class PropulsionModel:
             feasible = False
             if(eval_infeasible==False):
                 return 0,0, feasible
-        
+
         if(R_req<eps):
             if debug:
                 print("negative R_req : ", R_req, "0 power required. Still feasible.")
@@ -2123,13 +1162,13 @@ class PropulsionModel:
 
         P = self.compute_power(ua, n_solution,pitch)
         return P, n_solution, feasible
-        
+
     def compute_power_from_ua_res(self, ua, R_req, eval_infeasible=False, debug=False):
 
         if(abs(self.ship.propulsion.min_pitch-self.ship.propulsion.max_pitch)<eps):
             P, n_solution, feasible = self.power_from_ua_res_fixed_pitch(ua, R_req, self.ship.propulsion.max_pitch, self.max_J[-1], eval_infeasible=eval_infeasible, debug=False)
             return P, n_solution, feasible, self.ship.propulsion.max_pitch
-        
+
         min_power = 100000000000000000000000000
         best_pitch = -1
         best_n = -1
@@ -2141,12 +1180,12 @@ class PropulsionModel:
                 min_power = P
                 best_pitch = p
                 best_n = n_solution
-        
+
         if not feas:
             return 0.0, 0.0, False, -1
         else:
             return min_power, best_n, True, best_pitch
-        
+
     #=======================================Convex approximation===================================================
     def fit_feasibility_boundary(
         self,
@@ -2180,8 +1219,8 @@ class PropulsionModel:
                 else:
                     constraints += [a*ua_vals[i_s]+thrust_vals[i_t] + b>=0]
                     constraints += [included[i_s,i_t] == 0]
-                    
-                
+
+
         objective = cp.Maximize(cp.sum(included))
 
         prob = cp.Problem(objective, constraints)
@@ -2195,7 +1234,7 @@ class PropulsionModel:
         self.constraint_params = constraint_params
         return constraint_params
 
-    
+
     def fit_convex_model(
         self,
         debug: bool = False
@@ -2237,7 +1276,7 @@ class PropulsionModel:
         param_s = cp.Variable()
         param_s_2 = cp.Variable()
         param_s_3 = cp.Variable()
-        
+
         constraints = []
         constraints += [param_r_2>=eps]
         constraints += [param_r_3>=eps]
@@ -2252,7 +1291,7 @@ class PropulsionModel:
                     constraints += [Pow_fit[i_s,i_r]== intercept +
                             param_r_3*r_vals_norm_3[i_r]+param_r_2*r_vals_norm_2[i_r]+param_r*r_vals_norm[i_r]+
                             param_s_3*ua_vals_norm_3[i_s]+param_s_2*ua_vals_norm_2[i_s]+param_s*ua_vals_norm[i_s]]
-        
+
         objective = cp.Minimize(cp.sum_squares(cp.multiply(Pow_fit-self.P_real,mask_fit)))
         problem = cp.Problem(objective, constraints)
         problem.solve(solver="MOSEK", verbose=debug)
@@ -2279,7 +1318,7 @@ class PropulsionModel:
         self.mask_fit = mask_fit
 
         return 100*np.nanmax(abs_err_P)/np.nanmax(self.P_real[mask_fit]), 100*np.nanmean(abs_err_P)/np.nanmax(self.P_real[mask_fit])
-    
+
 
     #=======================================Plots===================================================
     from matplotlib.patches import Patch
@@ -2397,7 +1436,7 @@ class PropulsionModel:
 
         plt.tight_layout()  # <-- key fix
         plt.show()
-     
+
     def _require_fit_data(self):
         if self.mask_fit is None or self.ua_vals is None or self.thrust_vals is None:
             raise ValueError("Missing grid data. Run fit_convex_model() first.")
@@ -2536,9 +1575,9 @@ class PropulsionModel:
         plt.tight_layout()
         plt.show()
 
-    
 
-    
+
+
 
 @dataclass
 class GeneratorModel:
@@ -2548,7 +1587,7 @@ class GeneratorModel:
     generator: Generator
 
     # Internal storage for coefficients
-    power_coeffs: Optional[np.ndarray] = field(default=None, init=False) 
+    power_coeffs: Optional[np.ndarray] = field(default=None, init=False)
 
     def compute_fuel_consumption(self, p_mw):
         #returns fuel consumption in kg/h based on the output power in MW
@@ -2560,7 +1599,7 @@ class GeneratorModel:
                 right=self.generator.eff[-1],
             )
         return fuel_rate*p_mw
-    
+
     def fit_convex_model(
         self,
         debug: bool = False
@@ -2583,7 +1622,7 @@ class GeneratorModel:
         for ip in range(nb_breakpoints):
             power_i = self.generator.power[ip]
             constraints += [fuel_fit[ip+1]==param_2*(power_i**2)+param*power_i+intercept]
-        
+
         objective = cp.Minimize(cp.sum_squares(fuel_fit-fuel_real))
         problem = cp.Problem(objective, constraints)
         problem.solve(solver="MOSEK", verbose=debug)
