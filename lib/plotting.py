@@ -669,7 +669,6 @@ def plot_solutions(
     _plot_attr("prop_power", "Propulsion power", "propulsion power [MW]", "cmp_prop_power")
 
     for attr, title in [
-        ("wave_resistance", "Wave resistance"),
         ("wind_resistance", "Wind resistance"),
         ("calm_water_resistance", "Calm-water resistance"),
         ("acc_force", "Acceleration force"),
@@ -868,8 +867,7 @@ def plot_weather_snapshot(map, weather, variable="current_x", t_index=0, show: b
 
     variable: one of [
         "current_x", "current_y", "wind_x", "wind_y",
-        "irradiance", "temperature",
-        "mean_wave_amplitude", "mean_wave_frequency", "mean_wave_length"
+        "irradiance", "temperature"
     ]
 
     Figure is saved in PLOTS.

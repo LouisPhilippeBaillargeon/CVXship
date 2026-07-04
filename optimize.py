@@ -3,8 +3,8 @@ from typing import List
 import time
 
 from lib.load_params import load_config
-from lib.models import FitRange, PropulsionModel, BaseWaveModel, WaveModel1D, WaveModel2D, WaveModelPathAligned2D, BaseWindModel, WindModel1D, WindModel2D, WindModelPathAligned2D, GeneratorModel, CalmWaterModel, save_obj, load_obj
-from lib.paths import WIND_MODEL_1D, WIND_MODEL_2D, WIND_MODEL_PATH_ALIGNED_2D, WAVE_MODEL_1D, WAVE_MODEL_2D, WAVE_MODEL_PATH_ALIGNED_2D, PROPULSION_MODEL, GENERATOR_MODEL, CALM_MODEL
+from lib.models import FitRange, PropulsionModel, BaseWindModel, WindModel1D, WindModel2D, WindModelPathAligned2D, GeneratorModel, CalmWaterModel, save_obj, load_obj
+from lib.paths import WIND_MODEL_1D, WIND_MODEL_2D, WIND_MODEL_PATH_ALIGNED_2D, PROPULSION_MODEL, GENERATOR_MODEL, CALM_MODEL
 from lib.plotting import plot_solutions, plot_zones_and_points
 from lib.optimizers import DJPE_TSO, NaiveController, FR_TSO, ShortestPath, CJPE_TSO, FR_O, _generator_dispatch_data
 from lib.utils import point_in_zones, dx_dy_km, classify_timesteps, _assert_finite
@@ -15,6 +15,7 @@ from lib.debug_diagnostics import clear_debug_reports, print_debug_report
 new_weather = True
 new_ship = True
 dimensions = "both"  # "1D", "2D" or "both"
+solver_verbose = False
 
 
 if __name__ == "__main__":
@@ -35,19 +36,14 @@ if __name__ == "__main__":
         states              = states,
         weather             = weather,
         ship                = ship,)
-    path.compute([x,y])
+    path.compute([x,y], verbose=solver_verbose)
 
     course_angles = path.compute_course_angles()
     course_angles = np.repeat(course_angles[:, None], weather.wind_x.shape[1], axis=1)
     path_zone_ids = np.asarray(path.sol.zone_sequence, dtype=int)
     base_wind_model = BaseWindModel(ship, fit_range)
-    base_wave_model = BaseWaveModel(ship, fit_range)
     wind_x_path = weather.wind_x[path_zone_ids, :]
     wind_y_path = weather.wind_y[path_zone_ids, :]
-    wave_amp_path = weather.mean_wave_amplitude[path_zone_ids, :]
-    wave_freq_path = weather.mean_wave_frequency[path_zone_ids, :]
-    wave_len_path = weather.mean_wave_length[path_zone_ids, :]
-    wave_dir_path = weather.mean_wave_direction[path_zone_ids, :]
 
     # ============================================================
     # 1) Initialize models
@@ -61,7 +57,6 @@ if __name__ == "__main__":
         generatorModels.append(gen)
 
     base_wind_model = BaseWindModel(ship, fit_range_initial)
-    base_wave_model = BaseWaveModel(ship, fit_range_initial)
     calm_model_initial = CalmWaterModel(ship=ship, fit_range=fit_range_initial)
     calm_model_initial.fit_convex_model(debug=False)
 
@@ -87,7 +82,6 @@ if __name__ == "__main__":
     )
     naive.compute(debug=False)
     naive.wind_model = base_wind_model
-    naive.wave_model = base_wave_model
     naive.propulsion_model = propulsion_model_initial
     naive.generator_models = generatorModels
     naive.calm_model = calm_model_initial
@@ -95,6 +89,7 @@ if __name__ == "__main__":
     _, naive_fit_sol, _, _ = compute_non_convex_cost_all_timesteps_nc_interpolated(
         naive,
         debug=False,
+        verbose=solver_verbose,
         nc_sources=nc_sources,
     )
     # ============================================================
@@ -164,20 +159,9 @@ if __name__ == "__main__":
             )
             print("average max error wind 1D", np.mean(wind_model_1D.relative_errors) , "%")
 
-            wave_model_1D = WaveModel1D(ship = ship,fit_range = fit_range)
-            wave_model_1D.fit_convex_models(
-            wave_amp_path,
-            wave_freq_path,
-            wave_len_path,
-            wave_dir_path,
-            course_angles,
-            )
-            print("average max error wave 1D", np.mean(wave_model_1D.relative_errors) , "%")
-            save_obj(WAVE_MODEL_1D, wave_model_1D)
             save_obj(WIND_MODEL_1D, wind_model_1D)
 
         naive.wind_model = base_wind_model
-        naive.wave_model = base_wave_model
         naive.propulsion_model = propulsion_model
         naive.generator_models = generatorModels
         naive.calm_model = calm_model
@@ -188,14 +172,6 @@ if __name__ == "__main__":
             wind_model_2D.fit_convex_models(weather.wind_x, weather.wind_y)
             print("average max error wind 2D", np.mean(wind_model_2D.relative_errors) , "%")
 
-            wave_model_2D = WaveModel2D(
-            ship = ship,
-            fit_range = fit_range,
-            )
-            wave_model_2D.fit_convex_models(weather.mean_wave_amplitude,weather.mean_wave_frequency,weather.mean_wave_length,weather.mean_wave_direction)
-            print("average max error wave 2D", np.mean(wave_model_2D.relative_errors) , "%")
-
-            save_obj(WAVE_MODEL_2D, wave_model_2D)
             save_obj(WIND_MODEL_2D, wind_model_2D)
             '''
             wind_model_path_2D = WindModelPathAligned2D(ship, fit_range)
@@ -206,40 +182,26 @@ if __name__ == "__main__":
                 debug=False,
             )
 
-            wave_model_path_2D = WaveModelPathAligned2D(ship, fit_range)
-            wave_model_path_2D.fit_convex_models(
-                wave_amp_path,
-                wave_freq_path,
-                wave_len_path,
-                wave_dir_path,
-                course_angles,
-                debug=False,
-            )
             save_obj(WIND_MODEL_PATH_ALIGNED_2D, wind_model_path_2D)
-            save_obj(WAVE_MODEL_PATH_ALIGNED_2D, wave_model_path_2D)
         end = time.time()
         print("Weather model fit took :", end - start, "seconds")
 
     else:
         if dimensions == "1D" or dimensions == "both":
-            wave_model_1D = load_obj(WAVE_MODEL_1D)
             wind_model_1D = load_obj(WIND_MODEL_1D)
         if dimensions == "2D" or dimensions == "both":
-            #wave_model_2D = load_obj(WAVE_MODEL_2D)
             #wind_model_2D = load_obj(WIND_MODEL_2D)
             wind_model_path_2D = load_obj(WIND_MODEL_PATH_ALIGNED_2D)
-            wave_model_path_2D = load_obj(WAVE_MODEL_PATH_ALIGNED_2D)
         print("Saved weather model loaded")
 
     naive.wind_model = base_wind_model
-    naive.wave_model = base_wave_model
     naive.propulsion_model = propulsion_model
     naive.generator_models = generatorModels
     naive.calm_model = calm_model
 
     if path.sol is None:
         raise RuntimeError("ShortestPath did not produce a solution.")
-    
+
     T_future = itinerary.nb_timesteps - states.timesteps_completed
     instant_sail, port_idx, interval_sail_fraction = classify_timesteps(itinerary)
     instant_sail = instant_sail[states.timesteps_completed:]
@@ -247,10 +209,11 @@ if __name__ == "__main__":
     sail_time = float(np.sum(interval_sail_fraction[states.timesteps_completed:] * timestep_dt_h))
     ref_speed = (path.sol.total_distance/sail_time)*1000/3600
 
-    def evaluate_with_updated_power_management(runner, label, debug=False):
+    def evaluate_with_updated_power_management(runner, label, debug=False, verbose=solver_verbose):
         result = compute_non_convex_cost_all_timesteps_nc_interpolated(
             runner,
             debug=debug,
+            verbose=verbose,
             nc_sources=nc_sources,
             redispatch_energy=True,
         )
@@ -270,10 +233,11 @@ if __name__ == "__main__":
         )
         return result
 
-    def evaluate_with_rule_based_power_management(runner, label, debug=False):
+    def evaluate_with_rule_based_power_management(runner, label, debug=False, verbose=solver_verbose):
         result = compute_non_convex_cost_all_timesteps_nc_interpolated(
             runner,
             debug=debug,
+            verbose=verbose,
             nc_sources=nc_sources,
             redispatch_energy=False,
         )
@@ -307,7 +271,6 @@ if __name__ == "__main__":
 
     if dimensions == "1D" or dimensions == "both":
         optimizer = FR_TSO(
-            wave_model          = wave_model_1D,
             wind_model          = wind_model_1D,
             propulsion_model    = propulsion_model,
             calm_model          = calm_model,
@@ -328,6 +291,7 @@ if __name__ == "__main__":
             restrict_to_base    = True,
             base_solution       = naive.sol,
             base_segment_radius = 1,
+            verbose             = solver_verbose,
         )
         if ok:
             print("Optimization succeeded.")
@@ -395,7 +359,6 @@ if __name__ == "__main__":
         ref_speed = path.sol.total_distance / remaining_sail_time_h * 1000 / 3600
         FR_O_runner = FR_O(
             wind_model=wind_model_1D,
-            wave_model=wave_model_1D,
             propulsion_model=propulsion_model,
             calm_model=calm_model,
             generator_models=generatorModels,
@@ -411,6 +374,7 @@ if __name__ == "__main__":
         FR_O_runner.nc_sources = nc_sources
         FR_O_runner.optimize(
             debug=True,
+            verbose=solver_verbose,
         )
         _, FR_O_rule_sol, _, _ = evaluate_with_rule_based_power_management(
             FR_O_runner,
@@ -430,10 +394,9 @@ if __name__ == "__main__":
                 subfolder="All sol compared",
                 map=optimizer.map,
             )
-    
+
     if dimensions == "2D" or dimensions == "both":
         optimizer = DJPE_TSO(
-            wave_model          = wave_model_path_2D,
             wind_model          = wind_model_path_2D,
             propulsion_model    = propulsion_model,
             calm_model          = calm_model,
@@ -445,7 +408,7 @@ if __name__ == "__main__":
             ship                = ship,
             ref_speed           = ref_speed,
             path_zone_ids       = path.sol.zone_sequence,)
-        
+
         # Plot current position and destination
         init_pos = np.array([optimizer.states.current_x_pos, optimizer.states.current_y_pos])
         optimizer.states.zone = point_in_zones(init_pos, optimizer.map.zone_ineq)
@@ -459,6 +422,7 @@ if __name__ == "__main__":
             restrict_to_base=False,
             base_solution=naive.sol,
             base_zone_radius=1,
+            verbose=solver_verbose,
         )
         plot_zones_and_points(optimizer.sol.ship_pos, optimizer.map.zone_ineq)
         _, DJPE_TSO_rule_sol, _, _ = evaluate_with_rule_based_power_management(
@@ -481,13 +445,11 @@ if __name__ == "__main__":
                 subfolder="All sol compared",
                 map=optimizer.map,
             )
-    
+
     if dimensions == "both":
         glob_cont_opt = CJPE_TSO(
-            wave_model          = wave_model_path_2D,
             wind_model          = wind_model_path_2D,
             wind_model_nd       = wind_model_1D,
-            wave_model_nd       = wave_model_1D,
             propulsion_model    = propulsion_model,
             calm_model          = calm_model,
             generator_models    = generatorModels,
@@ -498,7 +460,7 @@ if __name__ == "__main__":
             ship                = ship,
             ref_speed           = ref_speed,
             path_zone_ids       = path.sol.zone_sequence,)
-        
+
         # Plot current position and destination
         init_pos = np.array([glob_cont_opt.states.current_x_pos, glob_cont_opt.states.current_y_pos])
         glob_cont_opt.states.zone = point_in_zones(init_pos, glob_cont_opt.map.zone_ineq)
@@ -512,6 +474,7 @@ if __name__ == "__main__":
             restrict_to_base=False,
             base_solution=naive.sol,
             base_zone_radius=1,
+            verbose=solver_verbose,
         )
         plot_zones_and_points(glob_cont_opt.sol.ship_pos, glob_cont_opt.map.zone_ineq)
         _, CJTE_TSO_rule_sol, _, _ = evaluate_with_rule_based_power_management(
@@ -524,7 +487,6 @@ if __name__ == "__main__":
         )
         for name in [
             "prop_power",
-            "wave_resistance",
             "wind_resistance",
             "calm_water_resistance",
             "total_resistance",

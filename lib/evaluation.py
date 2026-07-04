@@ -33,6 +33,7 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
     runner,
     eps=1e-9,
     debug=False,
+    verbose=False,
     nc_sources=None,
     redispatch_energy=False,
     energy_solver=None,
@@ -51,7 +52,6 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
     ship = runner.ship
     itinerary = runner.itinerary
     wind_model = runner.wind_model
-    wave_model = runner.wave_model
     calm_model = runner.calm_model
     propulsion_model = runner.propulsion_model
     generator_models = runner.generator_models
@@ -339,7 +339,6 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
     speed_rel_water = np.zeros((T, 2, Hmax))
     speed_rel_water_mag = np.zeros((T, Hmax))
     prop_power = np.zeros((T, Hmax))
-    wave_resistance = np.zeros((T, Hmax))
     wind_resistance = np.zeros((T, Hmax))
     calm_water_resistance = np.zeros((T, Hmax))
     acc_force = np.zeros((T, Hmax))
@@ -554,19 +553,6 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
 
                 wind_vec = w["wind"]
                 wind_resistance[t, h] = float(wind_model.compute_resistance(wind_vec, v_ship))
-                wave_angle = wave_model.compute_wave_relative_angle_encounter(
-                    ship_speed_vector=v_rel,
-                    mean_wave_direction=w["wave_dir"],
-                )
-                wave_resistance[t, h] = float(
-                    wave_model.compute_resistance(
-                        w["wave_amp"],
-                        w["wave_freq"],
-                        w["wave_len"],
-                        speed_rel_water_mag[t, h],
-                        wave_angle,
-                    )
-                )
                 calm_water_resistance[t, h] = float(calm_model.compute_resistance(speed_rel_water_mag[t, h]))
 
                 a = _acc_for(t, h_cmd, dt_h)
@@ -574,7 +560,6 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
                 total_resistance[t, h] = max(
                     0.0,
                     wind_resistance[t, h]
-                    + wave_resistance[t, h]
                     + calm_water_resistance[t, h]
                     + acc_force[t, h],
                 )
@@ -603,7 +588,6 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
                         "latlon", (w["lat"], w["lon"]),
                         "current", current,
                         "wind", wind_vec,
-                        "mwd", w["wave_dir"],
                         "prop", prop_power[t, h],
                     )
 
@@ -916,7 +900,6 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         speed_rel_water[t, :, n_real:Hmax] = speed_rel_water[t, :, last:last + 1]
         speed_rel_water_mag[t, n_real:Hmax] = speed_rel_water_mag[t, last]
         prop_power[t, n_real:Hmax] = prop_power[t, last]
-        wave_resistance[t, n_real:Hmax] = wave_resistance[t, last]
         wind_resistance[t, n_real:Hmax] = wind_resistance[t, last]
         calm_water_resistance[t, n_real:Hmax] = calm_water_resistance[t, last]
         acc_force[t, n_real:Hmax] = acc_force[t, last]
@@ -955,7 +938,6 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         speed_rel_water_mag=speed_rel_water_mag,
         prop_power=prop_power,
         auxiliary_power=auxiliary_power,
-        wave_resistance=wave_resistance,
         wind_resistance=wind_resistance,
         calm_water_resistance=calm_water_resistance,
         acc_force=acc_force,
@@ -1011,6 +993,7 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
             "evaluated_solution": non_conv_sol,
             "solar_power_available": solar_power_available,
             "debug": debug,
+            "verbose": verbose,
         }
         if energy_solver is not None:
             solve_kwargs["solver"] = energy_solver

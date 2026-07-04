@@ -8,7 +8,7 @@ import faulthandler
 faulthandler.enable()
 
 from lib.load_params import Ship, Map, Itinerary, States
-from lib.models import BaseWaveModel, WaveModel1D, WaveModel2D, WaveModelPathAligned2D, BaseWindModel, WindModel1D, WindModel2D, WindModelPathAligned2D, PropulsionModel, GeneratorModel, CalmWaterModel
+from lib.models import BaseWindModel, WindModel1D, WindModel2D, WindModelPathAligned2D, PropulsionModel, GeneratorModel, CalmWaterModel
 from lib.weather import Weather
 from lib.utils import classify_timesteps, dx_dy_km, compute_port_zone_indices, point_in_zones, _compute_tight_big_M_zone, _compute_min_zone_timesteps, _compute_min_crossing_distance_per_zone, build_constant_speed_path_reference, xy_from_path_distance, _ordered_zone_corner_ids, _zone_edges_from_corner_ids
 from lib.weather_interpolation import prepare_nc_interp_source, interpolated_weather_at, query_time_for_segment
@@ -36,7 +36,6 @@ class Solution:
 
     prop_power              : np.ndarray #[T_future]
     auxiliary_power         : np.ndarray #[T_future]
-    wave_resistance         : np.ndarray #[T_future]
     wind_resistance         : np.ndarray #[T_future]
     calm_water_resistance      : np.ndarray #[T_future]
     acc_force               : np.ndarray #[T_future]
@@ -377,6 +376,7 @@ class EnergyOnlyOptimizer:
         solar_power_available: Optional[np.ndarray] = None,
         debug: bool = False,
         solver=cp.MOSEK,
+        verbose: bool = False,
     ) -> int:
         prop_power_raw = np.asarray(evaluated_solution.prop_power, dtype=float)
 
@@ -571,7 +571,7 @@ class EnergyOnlyOptimizer:
         start_solve = time.time()
         problem.solve(
             solver=solver,
-            verbose=debug,
+            verbose=verbose,
         )
         solve_time = time.time() - start_solve
 
@@ -677,7 +677,6 @@ class EnergyOnlyOptimizer:
 class DJPE_TSO:
     # Left point indexing
     # Convex non-linear least-squares models
-    wave_model          : WaveModel2D
     wind_model          : WindModel2D
     propulsion_model    : PropulsionModel
     calm_model          : CalmWaterModel
@@ -704,6 +703,7 @@ class DJPE_TSO:
         restrict_to_base=False,
         base_solution=None,
         base_zone_radius=1,
+        verbose=False,
     ):
         constraints = []
 
@@ -1020,7 +1020,6 @@ class DJPE_TSO:
                 ]
 
         # ================================================= RESISTANCE =================================================
-        wave_resistance = cp.Variable((T_future, H), nonneg = True)
         wind_resistance = cp.Variable((T_future, H))
         calm_water_resistance = cp.Variable((T_future, H), nonneg = True)
         total_resistance = cp.Variable((T_future, H), nonneg = True)
@@ -1028,10 +1027,7 @@ class DJPE_TSO:
         normalized_speed = cp.Variable((T_future, H))
 
         WIND_BIG_M = float(self.wind_model.big_m_resistance)
-        WAVE_BIG_M = float(self.wave_model.big_m_resistance)
 
-
-        constraints += [wave_resistance <= WAVE_BIG_M]
         constraints += [wind_resistance <= WIND_BIG_M]
         constraints += [-WIND_BIG_M <= wind_resistance]
 
@@ -1041,7 +1037,6 @@ class DJPE_TSO:
         constraints += [normalized_speed == speed_mag / self.ship.info.max_speed]
 
         wind_model_future = self.wind_model.thrust_coeffs[:, self.states.timesteps_completed : self.states.timesteps_completed + T_future, :]
-        wave_model_future = self.wave_model.thrust_coeffs[:, self.states.timesteps_completed : self.states.timesteps_completed + T_future, :]
 
         zone_to_segment = {z: s for s, z in enumerate(self.path_zone_ids)}
 
@@ -1050,7 +1045,7 @@ class DJPE_TSO:
             for h in range(H):
                 active_zone = zone[t + h, :]
                 if interval_sail_fraction[t] > 0.01:
-                                            
+
                     for z in range(self.map.nb_zones):
                         if z not in zone_to_segment:
                             continue
@@ -1066,7 +1061,6 @@ class DJPE_TSO:
                             ]
                         s = zone_to_segment[z]
                         c = wind_model_future[s, t, :]
-                        cw = wave_model_future[s, t, :]
 
 
                         constraints += [
@@ -1085,21 +1079,6 @@ class DJPE_TSO:
                             - WIND_BIG_M* (1 - active_zone[z])
                         ]
 
-                        constraints += [
-                            wave_resistance[t, h] >=
-                            cw[0]
-                            + cw[1] * normalized_rel_speed[t, h]
-                            + cw[2] * cp.square(normalized_rel_speed[t, h])
-                            + cw[3] * cp.power(normalized_rel_speed[t, h], 3)
-                            + cw[4] * cp.power(normalized_rel_speed[t, h], 4)
-                            + cw[5] * speed_rel_water_x[t, h] / self.ship.info.max_speed
-                            + cw[6] * cp.square(speed_rel_water_x[t, h] / self.ship.info.max_speed)
-                            + cw[7] * cp.power(speed_rel_water_x[t, h] / self.ship.info.max_speed, 4)
-                            + cw[8] * speed_rel_water_y[t, h] / self.ship.info.max_speed
-                            + cw[9] * cp.square(speed_rel_water_y[t, h] / self.ship.info.max_speed)
-                            + cw[10] * cp.power(speed_rel_water_y[t, h] / self.ship.info.max_speed, 4)
-                            - WAVE_BIG_M * (1 - active_zone[z])
-                        ]
 
                     constraints += [
                         calm_water_resistance[t, h] >=
@@ -1111,16 +1090,14 @@ class DJPE_TSO:
                     ]
                 else:
                     constraints += [
-                        wave_resistance[t, h] == 0,
-                        wind_resistance[t, h] == 0,
+                            wind_resistance[t, h] == 0,
                         calm_water_resistance[t, h] == 0,
                         total_resistance[t, h] == 0,
                     ]
 
         constraints += [total_resistance >= 0]
-        constraints += [wave_resistance >= 0]
         constraints += [
-            total_resistance >= wave_resistance + wind_resistance + calm_water_resistance + acc_force
+            total_resistance >= wind_resistance + calm_water_resistance + acc_force
         ]
 
         # ================================================= PROPULSION =================================================
@@ -1282,7 +1259,7 @@ class DJPE_TSO:
 
         problem.solve(
             solver=cp.MOSEK,
-            verbose=debug,
+            verbose=verbose,
         )
 
         solve_time = time.time() - start_solve
@@ -1354,7 +1331,6 @@ class DJPE_TSO:
 
                 prop_power              = np.array(prop_power.value),
                 auxiliary_power         = auxiliary_power,
-                wave_resistance         = np.array(wave_resistance.value),
                 wind_resistance         = np.array(wind_resistance.value),
                 calm_water_resistance   = np.array(calm_water_resistance.value),
                 acc_force               = np.array(acc_force.value),
@@ -1387,7 +1363,6 @@ class DJPE_TSO:
                         "speed_mag": speed_mag.value,
                         "speed_rel_water_mag": speed_rel_water_mag.value,
                         "wind_resistance": wind_resistance.value,
-                        "wave_resistance": wave_resistance.value,
                         "calm_water_resistance": calm_water_resistance.value,
                         "total_resistance": total_resistance.value,
                         "acc_force": acc_force.value,
@@ -1396,7 +1371,6 @@ class DJPE_TSO:
                         "gen_costs": gen_costs_out,
                         "gen_on": gen_on_out,
                         "wind_model_future": wind_model_future,
-                        "wave_model_future": wave_model_future,
                     },
                 )
             return 1
@@ -1407,10 +1381,8 @@ class DJPE_TSO:
 
 @dataclass
 class CJPE_TSO:
-    wave_model          : WaveModel2D
     wind_model          : WindModel2D
     wind_model_nd       : WindModel1D
-    wave_model_nd       : WaveModel1D
     propulsion_model    : PropulsionModel
     calm_model          : CalmWaterModel
     generator_models    : List[GeneratorModel]
@@ -1436,6 +1408,7 @@ class CJPE_TSO:
         restrict_to_base=False,
         base_solution=None,
         base_zone_radius=1,
+        verbose=False,
     ):
         constraints = []
 
@@ -1752,7 +1725,6 @@ class CJPE_TSO:
                 ]
         constraints += [speed_rel_water_mag >= cp.sum(ship_speed_rel_water_mag_split,axis=1)/2]
         # ================================================= RESISTANCE =================================================
-        wave_resistance = cp.Variable(T_future, nonneg = True)
         wind_resistance = cp.Variable(T_future)
         calm_water_resistance = cp.Variable(T_future, nonneg = True)
         total_resistance = cp.Variable(T_future, nonneg = True)
@@ -1760,9 +1732,6 @@ class CJPE_TSO:
         normalized_speed = cp.Variable(T_future)
 
         WIND_BIG_M = float(self.wind_model.big_m_resistance)
-        WAVE_BIG_M = float(self.wave_model.big_m_resistance)
-
-        constraints += [wave_resistance <= WAVE_BIG_M]
         constraints += [wind_resistance <= WIND_BIG_M]
         constraints += [-WIND_BIG_M <= wind_resistance]
 
@@ -1771,14 +1740,12 @@ class CJPE_TSO:
 
         wind_model_future = self.wind_model.thrust_coeffs[:, self.states.timesteps_completed : self.states.timesteps_completed + T_future, :]
         wind_model_nd_future = self.wind_model_nd.thrust_coeffs[:, self.states.timesteps_completed : self.states.timesteps_completed + T_future, :]
-        wave_model_future = self.wave_model.thrust_coeffs[:, self.states.timesteps_completed : self.states.timesteps_completed + T_future, :]
-        wave_model_nd_future = self.wave_model_nd.thrust_coeffs[:, self.states.timesteps_completed : self.states.timesteps_completed + T_future, :]
 
         zone_to_segment = {z: s for s, z in enumerate(self.path_zone_ids)}
 
         for t in range(T_future):
             if interval_sail_fraction[t] > 0.01:
-                                        
+
                 for z in range(self.map.nb_zones):
                     if z not in zone_to_segment:
                         continue
@@ -1789,13 +1756,10 @@ class CJPE_TSO:
                     else:
                         s_plus_1 = s
                         z_next = z
-                    
+
                     c = wind_model_future[s, t, :]
-                    cw = wave_model_future[s, t, :]
                     cnd1 = wind_model_nd_future[s, t, :]
                     cnd2 = wind_model_nd_future[s_plus_1, t, :]
-                    cw1 = wave_model_nd_future[s, t, :]
-                    cw2 = wave_model_nd_future[s_plus_1, t, :]
 
                     zone_to_segment = {z: s for s, z in enumerate(self.path_zone_ids)}
 
@@ -1814,21 +1778,6 @@ class CJPE_TSO:
                         + c[9] * cp.square(ship_speed_y[t] / self.ship.info.max_speed)
                         + c[10] * cp.power(ship_speed_y[t] / self.ship.info.max_speed, 4)
                         - WIND_BIG_M * (2 - zone[t, z] - zone[t+1, z])
-                    ]
-                    constraints += [#Wave constraints applied when there is no transitions
-                        wave_resistance[t] >=
-                        cw[0]
-                        + cw[1] * normalized_rel_speed[t]
-                        + cw[2] * cp.square(normalized_rel_speed[t])
-                        + cw[3] * cp.power(normalized_rel_speed[t], 3)
-                        + cw[4] * cp.power(normalized_rel_speed[t], 4)
-                        + cw[5] * ship_speed_x_rel_water[t] / self.ship.info.max_speed
-                        + cw[6] * cp.square(ship_speed_x_rel_water[t] / self.ship.info.max_speed)
-                        + cw[7] * cp.power(ship_speed_x_rel_water[t] / self.ship.info.max_speed, 4)
-                        + cw[8] * ship_speed_y_rel_water[t] / self.ship.info.max_speed
-                        + cw[9] * cp.square(ship_speed_y_rel_water[t] / self.ship.info.max_speed)
-                        + cw[10] * cp.power(ship_speed_y_rel_water[t] / self.ship.info.max_speed, 4)
-                        - WAVE_BIG_M * (2 - zone[t, z] - zone[t+1, z])
                     ]
 
                     # Transition to next segment in path order
@@ -1851,22 +1800,6 @@ class CJPE_TSO:
                             ) / 2
                             - WIND_BIG_M * (2 - zone[t, z] - zone[t+1, z_next])
                         ]
-                        constraints += [
-                            wave_resistance[t] >=
-                            (
-                                cw1[0]
-                                + cw1[1] * normalized_rel_speed[t]
-                                + cw1[2] * cp.square(normalized_rel_speed[t])
-                                + cw1[3] * cp.power(normalized_rel_speed[t], 3)
-                                + cw1[4] * cp.power(normalized_rel_speed[t], 4)
-                                + cw2[0]
-                                + cw2[1] * normalized_rel_speed[t]
-                                + cw2[2] * cp.square(normalized_rel_speed[t])
-                                + cw2[3] * cp.power(normalized_rel_speed[t], 3)
-                                + cw2[4] * cp.power(normalized_rel_speed[t], 4)
-                            ) / 2
-                            - WAVE_BIG_M * (2 - zone[t, z] - zone[t+1, z_next])
-                        ]
 
                 constraints += [
                     calm_water_resistance[t] >=
@@ -1878,16 +1811,14 @@ class CJPE_TSO:
                 ]
             else:
                 constraints += [
-                    wave_resistance[t] == 0,
                     wind_resistance[t] == 0,
                     calm_water_resistance[t] == 0,
                     total_resistance[t] == 0,
                 ]
 
         constraints += [total_resistance >= 0]
-        constraints += [wave_resistance >= 0]
         constraints += [
-            total_resistance >= wave_resistance + wind_resistance + calm_water_resistance + acc_force
+            total_resistance >= wind_resistance + calm_water_resistance + acc_force
         ]
 
         # ================================================= PROPULSION =================================================
@@ -2026,7 +1957,7 @@ class CJPE_TSO:
 
         problem.solve(
             solver=cp.MOSEK,
-            verbose=debug,
+            verbose=verbose,
         )
 
         solve_time = time.time() - start_solve
@@ -2092,7 +2023,6 @@ class CJPE_TSO:
 
                 prop_power              = np.array(prop_power.value),
                 auxiliary_power         = auxiliary_power,
-                wave_resistance         = np.array(wave_resistance.value),
                 wind_resistance         = np.array(wind_resistance.value),
                 calm_water_resistance   = np.array(calm_water_resistance.value),
                 acc_force               = np.array(acc_force.value),
@@ -2142,7 +2072,6 @@ class CJPE_TSO:
                         "speed_mag": speed_mag.value,
                         "speed_rel_water_mag": speed_rel_water_mag.value,
                         "wind_resistance": wind_resistance.value,
-                        "wave_resistance": wave_resistance.value,
                         "calm_water_resistance": calm_water_resistance.value,
                         "total_resistance": total_resistance.value,
                         "acc_force": acc_force.value,
@@ -2151,9 +2080,7 @@ class CJPE_TSO:
                         "gen_costs": gen_costs.value,
                         "gen_on": gen_on_out,
                         "wind_model_future": wind_model_future,
-                        "wave_model_future": wave_model_future,
                         "wind_model_nd_future": wind_model_nd_future,
-                        "wave_model_nd_future": wave_model_nd_future,
                     },
                 )
             return 1
@@ -2161,10 +2088,9 @@ class CJPE_TSO:
         else:
             print(f"Optimization status: {problem.status}")
             return 0
-        
+
 @dataclass
 class FR_TSO:
-    wave_model          : WaveModel1D
     wind_model          : WindModel1D
     propulsion_model    : PropulsionModel
     calm_model          : CalmWaterModel
@@ -2190,6 +2116,7 @@ class FR_TSO:
         restrict_to_base=False,
         base_solution=None,
         base_segment_radius=1,
+        verbose=False,
     ):
         constraints = []
 
@@ -2490,20 +2417,17 @@ class FR_TSO:
             speed_rel_water_mag >= cp.sum(ship_speed_rel_water_mag_split, axis=1) / 2
         ]
         # ================================= RESISTANCE =================================
-        wave_resistance = cp.Variable(T_future, nonneg=True)
         wind_resistance = cp.Variable(T_future)
         calm_water_resistance = cp.Variable(T_future, nonneg=True)
         total_resistance = cp.Variable(T_future, nonneg=True)
         normalized_speed = cp.Variable(T_future)
         normalized_rel_speed = cp.Variable(T_future)
 
-        
+
         WIND_BIG_M = float(self.wind_model.big_m_resistance)
-        WAVE_BIG_M = float(self.wave_model.big_m_resistance)
 
         constraints += [wind_resistance <= WIND_BIG_M]
         constraints += [wind_resistance >= -WIND_BIG_M]
-        constraints += [wave_resistance <= WAVE_BIG_M]
 
         constraints += [normalized_speed == speed_mag / self.ship.info.max_speed]
         constraints += [normalized_rel_speed == speed_rel_water_mag / self.ship.info.max_speed]
@@ -2511,15 +2435,11 @@ class FR_TSO:
         wind_model_future = self.wind_model.thrust_coeffs[
             :, self.states.timesteps_completed : self.states.timesteps_completed + T_future, :
         ]
-        wave_model_future = self.wave_model.thrust_coeffs[
-            :, self.states.timesteps_completed : self.states.timesteps_completed + T_future, :
-        ]
 
         for t in range(T_future):
             if interval_sail_fraction[t] > 0.01:
                 for s in range(nb_path_zones):
                     c1 = wind_model_future[s, t, :]
-                    cw1 = wave_model_future[s, t, :]
 
                     # Same-segment case: s at t and s at t+1
                     constraints += [
@@ -2532,20 +2452,10 @@ class FR_TSO:
                         - WIND_BIG_M * (2 - seg[t, s] - seg[t + 1, s])
                     ]
 
-                    constraints += [
-                        wave_resistance[t] >=
-                        cw1[0]
-                        + cw1[1] * normalized_rel_speed[t]
-                        + cw1[2] * cp.square(normalized_rel_speed[t])
-                        + cw1[3] * cp.power(normalized_rel_speed[t], 3)
-                        + cw1[4] * cp.power(normalized_rel_speed[t], 4)
-                        - WAVE_BIG_M * (2 - seg[t, s] - seg[t + 1, s])
-                    ]
 
                     # Transition case: s -> s+1
                     if s < nb_path_zones - 1:
                         c2 = wind_model_future[s + 1, t, :]
-                        cw2 = wave_model_future[s + 1, t, :]
 
                         constraints += [
                             wind_resistance[t] >=
@@ -2564,22 +2474,6 @@ class FR_TSO:
                             - WIND_BIG_M * (2 - seg[t, s] - seg[t + 1, s + 1])
                         ]
 
-                        constraints += [
-                            wave_resistance[t] >=
-                            0.5 * (
-                                cw1[0]
-                                + cw1[1] * normalized_rel_speed[t]
-                                + cw1[2] * cp.square(normalized_rel_speed[t])
-                                + cw1[3] * cp.power(normalized_rel_speed[t], 3)
-                                + cw1[4] * cp.power(normalized_rel_speed[t], 4)
-                                + cw2[0]
-                                + cw2[1] * normalized_rel_speed[t]
-                                + cw2[2] * cp.square(normalized_rel_speed[t])
-                                + cw2[3] * cp.power(normalized_rel_speed[t], 3)
-                                + cw2[4] * cp.power(normalized_rel_speed[t], 4)
-                            )
-                            - WAVE_BIG_M * (2 - seg[t, s] - seg[t + 1, s + 1])
-                        ]
 
                 constraints += [
                     calm_water_resistance[t] >=
@@ -2592,13 +2486,12 @@ class FR_TSO:
             else:
                 constraints += [
                     wind_resistance[t] == 0,
-                    wave_resistance[t] == 0,
                     calm_water_resistance[t] == 0,
                     total_resistance[t] == 0,
                 ]
 
         constraints += [
-            total_resistance >= wave_resistance + wind_resistance + calm_water_resistance + acc_force
+            total_resistance >= wind_resistance + calm_water_resistance + acc_force
         ]
 
         # ================================= PROPULSION =================================
@@ -2643,7 +2536,7 @@ class FR_TSO:
         )
 
         constraints += [solar_power <= self.ship.solarPannels.area * self.ship.solarPannels.efficiency * irr_avg]
-        
+
         # ================================= SHORE POWER =================================
         shore_power = cp.Variable(T_future)
         shore_cost = np.zeros(T_future)
@@ -2751,7 +2644,7 @@ class FR_TSO:
 
         problem.solve(
             solver=cp.MOSEK,
-            verbose=debug,
+            verbose=verbose,
         )
 
         solve_time = time.time() - start_solve
@@ -2823,7 +2716,6 @@ class FR_TSO:
 
             prop_power=np.asarray(prop_power.value),
             auxiliary_power=auxiliary_power,
-            wave_resistance=np.asarray(wave_resistance.value),
             wind_resistance=np.asarray(wind_resistance.value),
             calm_water_resistance=np.asarray(calm_water_resistance.value),
             acc_force=np.asarray(acc_force.value),
@@ -2873,7 +2765,6 @@ class FR_TSO:
                     "speed_mag": speed_mag.value,
                     "speed_rel_water_mag": speed_rel_water_mag.value,
                     "wind_resistance": wind_resistance.value,
-                    "wave_resistance": wave_resistance.value,
                     "calm_water_resistance": calm_water_resistance.value,
                     "total_resistance": total_resistance.value,
                     "acc_force": acc_force.value,
@@ -2882,12 +2773,11 @@ class FR_TSO:
                     "gen_costs": gen_costs.value,
                     "gen_on": gen_on_out,
                     "wind_model_future": wind_model_future,
-                    "wave_model_future": wave_model_future,
                 },
             )
 
         return 1
-    
+
 
 @dataclass
 class FR_O:
@@ -2899,7 +2789,6 @@ class FR_O:
     d[t], speed, propulsion, and energy management.
     """
 
-    wave_model          : WaveModel1D
     wind_model          : WindModel1D
     propulsion_model    : PropulsionModel
     calm_model          : CalmWaterModel
@@ -2918,11 +2807,9 @@ class FR_O:
     sol: Optional[Solution] = field(default=None, init=False)
     ref: Optional[dict] = field(default=None, init=False)
     wind_model_ts: Optional[WindModel1D] = field(default=None, init=False)
-    wave_model_ts: Optional[WaveModel1D] = field(default=None, init=False)
     sampled_current_x: Optional[np.ndarray] = field(default=None, init=False)
     sampled_current_y: Optional[np.ndarray] = field(default=None, init=False)
     sampled_wind: Optional[np.ndarray] = field(default=None, init=False)
-    sampled_wave: Optional[list] = field(default=None, init=False)
     sampled_irradiance: Optional[np.ndarray] = field(default=None, init=False)
     sampled_course_angle: Optional[np.ndarray] = field(default=None, init=False)
     nc_sources: Optional[dict] = field(default=None, init=False)
@@ -2955,16 +2842,11 @@ class FR_O:
 
         wind_x_ts = np.zeros((1, T_future))
         wind_y_ts = np.zeros((1, T_future))
-        wave_amp_ts = np.zeros((1, T_future))
-        wave_freq_ts = np.zeros((1, T_future))
-        wave_len_ts = np.zeros((1, T_future))
-        wave_dir_ts = np.zeros((1, T_future))
         course_ts = np.zeros((1, T_future))
 
         current_x_ts = np.zeros(T_future)
         current_y_ts = np.zeros(T_future)
         sampled_wind = np.zeros((T_future, 2), dtype=float)
-        sampled_wave = []
         irradiance_ts = np.zeros(T_future)
 
         if self.nc_sources is None:
@@ -2993,16 +2875,6 @@ class FR_O:
             wind_y_ts[0, t] = w["wind"][1]
             sampled_wind[t, :] = w["wind"]
 
-            wave_amp_ts[0, t] = w["wave_amp"]
-            wave_freq_ts[0, t] = w["wave_freq"]
-            wave_len_ts[0, t] = w["wave_len"]
-            wave_dir_ts[0, t] = w["wave_dir"]
-            sampled_wave.append({
-                "wave_amp": float(w["wave_amp"]),
-                "wave_freq": float(w["wave_freq"]),
-                "wave_len": float(w["wave_len"]),
-                "wave_dir": float(w["wave_dir"]),
-            })
 
             current_x_ts[t] = w["current"][0]
             current_y_ts[t] = w["current"][1]
@@ -3011,7 +2883,6 @@ class FR_O:
         self.sampled_current_x = current_x_ts
         self.sampled_current_y = current_y_ts
         self.sampled_wind = sampled_wind
-        self.sampled_wave = sampled_wave
         self.sampled_irradiance = irradiance_ts
         self.sampled_course_angle = course_ts.reshape(-1)
 
@@ -3022,23 +2893,15 @@ class FR_O:
             course_ts,
         )
 
-        self.wave_model_ts = WaveModel1D(self.ship, self.wave_model.fit_range)
-        self.wave_model_ts.fit_convex_models(
-            wave_amp_ts,
-            wave_freq_ts,
-            wave_len_ts,
-            wave_dir_ts,
-            course_ts,
-        )
-
         if debug:
-            print("[TimeSampled] fitted one wind/wave model per timestep")
+            print("[TimeSampled] fitted one wind model per timestep")
             print("[TimeSampled] current_x:", current_x_ts[:5])
             print("[TimeSampled] irradiance:", irradiance_ts[:5])
 
     def optimize(
         self,
         debug=False,
+        verbose=False,
     ):
         constraints = []
 
@@ -3155,31 +3018,26 @@ class FR_O:
                 )
             ]
         # ================================= RESISTANCE =================================
-        wave_resistance = cp.Variable(T_future, nonneg=True)
         wind_resistance = cp.Variable(T_future)
         calm_water_resistance = cp.Variable(T_future, nonneg=True)
         total_resistance = cp.Variable(T_future, nonneg=True)
         normalized_speed = cp.Variable(T_future)
         normalized_rel_speed = cp.Variable(T_future)
 
-        
+
         WIND_BIG_M = float(self.wind_model_ts.big_m_resistance)
-        WAVE_BIG_M = float(self.wave_model_ts.big_m_resistance)
 
         constraints += [wind_resistance <= WIND_BIG_M]
         constraints += [wind_resistance >= -WIND_BIG_M]
-        constraints += [wave_resistance <= WAVE_BIG_M]
 
         constraints += [normalized_speed == speed_mag / self.ship.info.max_speed]
         constraints += [normalized_rel_speed == speed_rel_water_mag / self.ship.info.max_speed]
 
         wind_model_future = self.wind_model_ts.thrust_coeffs[0, :, :]
-        wave_model_future = self.wave_model_ts.thrust_coeffs[0, :, :]
 
         for t in range(T_future):
             if interval_sail_fraction[t] > 0.01:
                 c1 = wind_model_future[t, :]
-                cw1 = wave_model_future[t, :]
 
                 constraints += [
                     wind_resistance[t] >=
@@ -3190,14 +3048,6 @@ class FR_O:
                     + c1[4] * cp.power(normalized_speed[t], 4)
                 ]
 
-                constraints += [
-                    wave_resistance[t] >=
-                    cw1[0]
-                    + cw1[1] * normalized_rel_speed[t]
-                    + cw1[2] * cp.square(normalized_rel_speed[t])
-                    + cw1[3] * cp.power(normalized_rel_speed[t], 3)
-                    + cw1[4] * cp.power(normalized_rel_speed[t], 4)
-                ]
 
                 constraints += [
                     calm_water_resistance[t] >=
@@ -3210,14 +3060,12 @@ class FR_O:
             else:
                 constraints += [
                     wind_resistance[t] == 0,
-                    wave_resistance[t] == 0,
                     calm_water_resistance[t] == 0,
                     total_resistance[t] == 0,
                 ]
         constraints += [
             total_resistance >= (
-                wave_resistance
-                + wind_resistance
+                wind_resistance
                 + calm_water_resistance
                 + acc_force
             )
@@ -3350,7 +3198,7 @@ class FR_O:
         start_solve = time.time()
         problem.solve(
             solver=cp.MOSEK,
-            verbose=debug,
+            verbose=verbose,
         )
         solve_time = time.time() - start_solve
 
@@ -3411,7 +3259,6 @@ class FR_O:
 
             prop_power=np.asarray(prop_power.value),
             auxiliary_power=auxiliary_power,
-            wave_resistance=np.asarray(wave_resistance.value),
             wind_resistance=np.asarray(wind_resistance.value),
             calm_water_resistance=np.asarray(calm_water_resistance.value),
             acc_force=np.asarray(acc_force.value),
@@ -3450,7 +3297,6 @@ class FR_O:
                     "speed_mag": speed_mag.value,
                     "speed_rel_water_mag": speed_rel_water_mag.value,
                     "wind_resistance": wind_resistance.value,
-                    "wave_resistance": wave_resistance.value,
                     "calm_water_resistance": calm_water_resistance.value,
                     "total_resistance": total_resistance.value,
                     "acc_force": acc_force.value,
@@ -3459,7 +3305,6 @@ class FR_O:
                     "gen_costs": gen_costs.value,
                     "gen_on": gen_on_out,
                     "wind_model_future": wind_model_future,
-                    "wave_model_future": wave_model_future,
                 },
             )
         return 1
@@ -3476,14 +3321,13 @@ class NaiveController:
     course_angles: Optional[np.ndarray] = None
 
     sol: Optional[Solution] = field(default=None, init=False)
-    wave_model: Optional["BaseWaveModel"] = field(default=None, init=False)
     wind_model: Optional["BaseWindModel"] = field(default=None, init=False)
     propulsion_model: Optional["PropulsionModel"] = field(default=None, init=False)
     generator_models: Optional[List["GeneratorModel"]] = field(default=None, init=False)
     calm_model: Optional["CalmWaterModel"] = field(default=None, init=False)
 
     def compute(self, debug: bool = False):
-        
+
         if self.states.timesteps_completed >= self.itinerary.nb_timesteps:
             raise ValueError("No timesteps left to compute; trip is finished.")
         start_solve = time.time()
@@ -3606,7 +3450,6 @@ class NaiveController:
 
             prop_power=zeros.copy(),
             auxiliary_power=auxiliary_power,
-            wave_resistance=zeros.copy(),
             wind_resistance=zeros.copy(),
             calm_water_resistance=zeros.copy(),
             acc_force=zeros.copy(),
@@ -3826,6 +3669,7 @@ class ShortestPath:
         end_pos,
         debug: bool = False,
         solver: Optional[str] = None,
+        verbose: bool = False,
     ) -> ShortestPathSolution:
 
         start = np.asarray(
@@ -3920,6 +3764,7 @@ class ShortestPath:
         solve_kwargs = {}
         if solver is not None:
             solve_kwargs["solver"] = solver
+        solve_kwargs["verbose"] = verbose
 
         problem.solve(**solve_kwargs)
 
@@ -4089,4 +3934,4 @@ class ShortestPath:
         return float(np.sum(np.linalg.norm(np.diff(points, axis=0), axis=1)))
 
 
-            
+
