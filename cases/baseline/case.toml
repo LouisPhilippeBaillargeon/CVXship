@@ -13,5 +13,6 @@ scope = "case"
 
 [outputs]
 save_plots = true
+show_plots = false
 save_solutions = true
 save_console_log = true

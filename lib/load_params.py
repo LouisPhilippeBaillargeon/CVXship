@@ -67,11 +67,11 @@ class Hull:
 @dataclass
 class Generator:
     name            : str
-    power           : List[float]
-    eff             : List[float]
     min_power       : float
     max_power       : float
-    iddle_fuel      : float
+    fuel_intercept  : float
+    fuel_linear     : float
+    fuel_quadratic  : float
     startup_cost    : float = 0.0
     shutdown_cost   : float = 0.0
 
@@ -135,13 +135,39 @@ def load_ship(case_dir=None) -> Ship:
 
     generators: List[Generator] = []
     for g in data.get("generators", []):
-        # Ensure we get proper lists of floats
-        power_mw = [float(x) for x in g["power"]]
-        eff = [float(x) for x in g["eff"]]
-        iddle_fuel = float(g["iddle_fuel"])
+        required = (
+            "min_power",
+            "max_power",
+            "fuel_intercept",
+            "fuel_linear",
+            "fuel_quadratic",
+        )
+        missing = [key for key in required if key not in g]
+        if missing:
+            raise ValueError(
+                f"Generator {g.get('name', '<unnamed>')!r} is missing {missing}. "
+                "Use explicit min_power/max_power and quadratic fuel coefficients in ship.toml."
+            )
+
+        min_power = float(g["min_power"])
+        max_power = float(g["max_power"])
+        fuel_intercept = float(g["fuel_intercept"])
+        fuel_linear = float(g["fuel_linear"])
+        fuel_quadratic = float(g["fuel_quadratic"])
         startup_cost = float(g.get("startup_cost", 0.0))
         shutdown_cost = float(g.get("shutdown_cost", 0.0))
 
+        values = [min_power, max_power, fuel_intercept, fuel_linear, fuel_quadratic]
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"Generator {g['name']!r} numeric parameters must be finite.")
+        if min_power < 0 or max_power <= 0 or min_power > max_power:
+            raise ValueError(
+                f"Generator {g['name']!r} must satisfy 0 <= min_power <= max_power."
+            )
+        if fuel_intercept < 0:
+            raise ValueError(f"Generator {g['name']!r} fuel_intercept must be nonnegative.")
+        if fuel_quadratic < 0:
+            raise ValueError(f"Generator {g['name']!r} fuel_quadratic must be nonnegative.")
         if startup_cost < 0 or shutdown_cost < 0:
             raise ValueError(
                 f"Generator {g['name']!r} startup_cost and shutdown_cost must be nonnegative."
@@ -150,11 +176,11 @@ def load_ship(case_dir=None) -> Ship:
         generators.append(
             Generator(
                 name=g["name"],
-                power=power_mw,
-                min_power = np.min(power_mw),
-                max_power = np.max(power_mw),
-                eff=eff,
-                iddle_fuel = iddle_fuel,
+                min_power = min_power,
+                max_power = max_power,
+                fuel_intercept = fuel_intercept,
+                fuel_linear = fuel_linear,
+                fuel_quadratic = fuel_quadratic,
                 startup_cost = startup_cost,
                 shutdown_cost = shutdown_cost,
             )

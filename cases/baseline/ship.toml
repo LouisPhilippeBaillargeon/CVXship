@@ -132,23 +132,29 @@ NOCT            = 42
 
 # ============================
 # GENERATORS
-# power         : list of breakpoints (MW)
-# eff           : fuel rate at each breakpoint power (kg/MW)
+# min_power     : minimum generator output while on (MW)
+# max_power     : maximum generator output while on (MW)
+# fuel_*        : fuel consumption rate coefficients (kg/h) for
+#                 fuel_quadratic * power^2 + fuel_linear * power + fuel_intercept
 # startup_cost  : one-time startup cost ($)
 # shutdown_cost : one-time shutdown cost ($)
 # ============================
 [[generators]]
 name            = "Gen1"
-power           = [0.28, 0.56, 1.4, 1.96, 2.08, 2.4, 2.8]
-eff             = [232, 215, 185, 180, 183, 185, 190]
-iddle_fuel      = 9.52
+min_power       = 0.0
+max_power       = 2.8
+fuel_intercept  = 17.64196958
+fuel_linear     = 159.86844715
+fuel_quadratic  = 7.74852695
 startup_cost    = 100.0
 shutdown_cost   = 0.0
 
 [[generators]]
 name            = "Gen2"
-power           = [0.28, 0.56, 1.4, 1.96, 2.08, 2.4, 2.8]
-eff             = [232, 215, 185, 180, 183, 185, 190]
-iddle_fuel      = 9.52
+min_power       = 0.0
+max_power       = 2.8
+fuel_intercept  = 17.64196958
+fuel_linear     = 159.86844715
+fuel_quadratic  = 7.74852695
 startup_cost    = 100.0
 shutdown_cost   = 0.0

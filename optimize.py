@@ -8,7 +8,7 @@ import sys
 from lib.load_params import load_config
 from lib.models import FitRange, PropulsionModel, BaseWindModel, WindModel1D, WindModel2D, WindModelPathAligned2D, GeneratorModel, CalmWaterModel, save_obj, load_obj
 from lib.plotting import plot_solutions, plot_zones_and_points
-from lib.optimizers import DJPE_TSO, NaiveController, FR_TSO, ShortestPath, CJPE_TSO, FR_O, _generator_dispatch_data
+from lib.optimizers import DJPE_TSO, NaiveController, FR_TSO, ShortestPath, CJPE_TSO, FR_O
 from lib.utils import point_in_zones, dx_dy_km, classify_timesteps, _assert_finite
 from lib.evaluation import compute_non_convex_cost_all_timesteps_nc_interpolated
 from lib.weather_interpolation import prepare_nc_interp_source
@@ -48,6 +48,8 @@ def _parse_args():
     parser.add_argument("--cache-scope", choices=["case", "run", "global"], default=None)
     parser.add_argument("--no-save-plots", dest="save_plots", action="store_false", default=None)
     parser.add_argument("--save-plots", dest="save_plots", action="store_true")
+    parser.add_argument("--no-show-plots", dest="show_plots", action="store_false", default=None)
+    parser.add_argument("--show-plots", dest="show_plots", action="store_true")
     parser.add_argument("--no-save-solutions", dest="save_solutions", action="store_false", default=None)
     parser.add_argument("--save-solutions", dest="save_solutions", action="store_true")
     parser.add_argument("--no-console-log", dest="save_console_log", action="store_false", default=None)
@@ -92,6 +94,7 @@ if __name__ == "__main__":
     solver_verbose = bool(_option(args.solver_verbose, run_toml_options, "solver_verbose", solver_verbose))
     unit_commitment = bool(_option(args.unit_commitment, run_toml_options, "unit_commitment", unit_commitment))
     save_plots = bool(_option(args.save_plots, output_toml_options, "save_plots", True))
+    show_plots = bool(_option(args.show_plots, output_toml_options, "show_plots", False))
     save_solutions = bool(_option(args.save_solutions, output_toml_options, "save_solutions", True))
     save_console_log = bool(_option(args.save_console_log, output_toml_options, "save_console_log", True))
     cache_scope = str(_option(args.cache_scope, cache_toml_options, "scope", "case"))
@@ -105,6 +108,7 @@ if __name__ == "__main__":
         "solver_verbose": solver_verbose,
         "unit_commitment": unit_commitment,
         "save_plots": save_plots,
+        "show_plots": show_plots,
         "save_solutions": save_solutions,
         "save_console_log": save_console_log,
         "cache_scope": cache_scope,
@@ -135,13 +139,20 @@ if __name__ == "__main__":
         if not save_plots:
             return None
         plot_kwargs["output_root"] = run_context.plots_dir
+        plot_kwargs.setdefault("show", show_plots)
         return plot_solutions(*plot_args, **plot_kwargs)
 
     def maybe_plot_zones_and_points(*plot_args, **plot_kwargs):
         if not save_plots:
             return None
         plot_kwargs["output_root"] = run_context.plots_dir
+        plot_kwargs.setdefault("show", show_plots)
         return plot_zones_and_points(*plot_args, **plot_kwargs)
+
+    all_solution_comparison_dir = "all_sol_compared"
+
+    def relaxation_quality_dir(optimizer_name):
+        return f"relaxation_quality/{optimizer_name}"
 
     clear_debug_reports()
     map, itinerary, states, ship, weather = load_config(
@@ -184,7 +195,6 @@ if __name__ == "__main__":
     generatorModels: List[GeneratorModel] = []
     for g in ship.generators:
         gen = GeneratorModel(generator=g)
-        gen.fit_convex_model(debug=False)
         generatorModels.append(gen)
 
     base_wind_model = BaseWindModel(ship, fit_range_initial)
@@ -245,7 +255,7 @@ if __name__ == "__main__":
             calm_model.plot_calm_water_models_ieee(
                 nb_points=200,
                 fit_if_needed=True,
-                show=False,
+                show=show_plots,
                 output_root=run_context.plots_dir,
             )
         else:
@@ -265,15 +275,15 @@ if __name__ == "__main__":
 
         if save_plots:
             propulsion_model.plot_power_surface_speed_resistance(
-                show=False,
+                show=show_plots,
                 directory=run_context.plots_dir,
             )
             propulsion_model.plot_power_error_heatmap(
-                show=False,
+                show=show_plots,
                 directory=run_context.plots_dir,
             )
             propulsion_model.plot_feasibility_mask(
-                show=False,
+                show=show_plots,
                 directory=run_context.plots_dir,
             )
 
@@ -282,16 +292,9 @@ if __name__ == "__main__":
         save_obj(PROPULSION_MODEL, propulsion_model)
 
     else:
-        cached_generator_models = load_obj(GENERATOR_MODEL)
-        try:
-            _generator_dispatch_data(ship, cached_generator_models, 1)
-            generatorModels = cached_generator_models
-        except ValueError as exc:
-            print(f"Cached generator models ignored: {exc}")
-            print("Using freshly fitted generator models from config/ship.toml.")
         calm_model = load_obj(CALM_MODEL)
         propulsion_model = load_obj(PROPULSION_MODEL)
-        print("Saved ship model loaded")
+        print("Saved ship model loaded; generator cost models loaded from ship.toml.")
 
     if new_weather:
         start = time.time()
@@ -406,11 +409,11 @@ if __name__ == "__main__":
     )
 
     maybe_plot_solutions(
-        [naive_rule_sol, naive_nonconv_sol],
-        ["Naive solution + rule-based EMS", "Naive solution + energy redispatch"],
-        benchmark_label="Naive solution + rule-based EMS",
+        [naive.sol, naive_rule_sol],
+        ["Naive estimated solution", "Naive rule-based evaluator"],
+        benchmark_label="Naive rule-based evaluator",
         show=False,
-        subfolder="Naive",
+        subfolder=relaxation_quality_dir("naive"),
         map=naive.map,
     )
 
@@ -488,7 +491,14 @@ if __name__ == "__main__":
 
                 if getattr(sol, "crossing_point", None) is not None:
                     dq = _point_to_polyline_min_dist(sol.crossing_point, wp)
-            maybe_plot_solutions([optimizer.sol, FR_STO_POW_sol],["Convex FR_TSO solution", "Non-convex FR_TSO + energy redispatch"], benchmark_label="Non-convex FR_TSO + energy redispatch", show=False, subfolder="FR_TSO", map=optimizer.map)
+            maybe_plot_solutions(
+                [optimizer.sol, FR_STO_rule_sol],
+                ["Convex FR_STO solution", "FR_STO rule-based evaluator"],
+                benchmark_label="FR_STO rule-based evaluator",
+                show=False,
+                subfolder=relaxation_quality_dir("FR_STO"),
+                map=optimizer.map,
+            )
         else:
             print("Optimization failed.")
 
@@ -530,14 +540,22 @@ if __name__ == "__main__":
             FR_O_runner,
             "FR_O",
         )
+        maybe_plot_solutions(
+            [FR_O_runner.sol, FR_O_rule_sol],
+            ["Convex FR_O solution", "FR_O rule-based evaluator"],
+            benchmark_label="FR_O rule-based evaluator",
+            show=False,
+            subfolder=relaxation_quality_dir("FR_O"),
+            map=FR_O_runner.map,
+        )
         if dimensions == "1D":
             print_debug_report()
             maybe_plot_solutions(
                 [naive_rule_sol, naive_nonconv_sol, FR_O_rule_sol, FR_O_nonconv_sol_pow, FR_STO_rule_sol, FR_STO_POW_sol],
-                ["Naive + rule-based", "Naive + energy", "FR_O + rule-based", "FR_O + energy", "FR_TSO + rule-based", "FR_TSO + energy"],
+                ["Naive + rule-based", "Naive + energy", "FR_O + rule-based", "FR_O + energy", "FR_STO + rule-based", "FR_STO + energy"],
                 benchmark_label="Naive + rule-based",
                 show=False,
-                subfolder="All sol compared",
+                subfolder=all_solution_comparison_dir,
                 map=optimizer.map,
             )
 
@@ -580,7 +598,14 @@ if __name__ == "__main__":
             optimizer,
             "DJPE_TSO",
         )
-        maybe_plot_solutions([optimizer.sol, DJPE_TSO_POW_sol],["Convex Gloabal solution", "Non-convex DJPE_TSO + energy redispatch"], benchmark_label="Non-convex DJPE_TSO + energy redispatch", show=False, subfolder="DJPE_TSO Path", map=optimizer.map)
+        maybe_plot_solutions(
+            [optimizer.sol, DJPE_TSO_rule_sol],
+            ["Convex DJPE_TSO solution", "DJPE_TSO rule-based evaluator"],
+            benchmark_label="DJPE_TSO rule-based evaluator",
+            show=False,
+            subfolder=relaxation_quality_dir("DJPE_TSO"),
+            map=optimizer.map,
+        )
 
         if dimensions == "2D":
             print_debug_report()
@@ -588,8 +613,8 @@ if __name__ == "__main__":
                 [naive_rule_sol, naive_nonconv_sol, DJPE_TSO_rule_sol, DJPE_TSO_POW_sol],
                 ["Naive + rule-based", "Naive + energy", "DJPE_TSO + rule-based", "DJPE_TSO + energy"],
                 benchmark_label="Naive + rule-based",
-                show=True,
-                subfolder="All sol compared",
+                show=show_plots,
+                subfolder=all_solution_comparison_dir,
                 map=optimizer.map,
             )
 
@@ -643,7 +668,14 @@ if __name__ == "__main__":
             print(name)
             print("  optimizer:", np.asarray(glob_cont_opt.sol.__dict__[name]).shape)
             print("  evaluator:", np.asarray(CJTE_TSO_POW_sol.__dict__[name]).shape)
-        maybe_plot_solutions([glob_cont_opt.sol, CJTE_TSO_POW_sol],["Convex CJPE_TSO solution", "Non-convex CJPE_TSO + energy redispatch"], benchmark_label="Non-convex CJPE_TSO + energy redispatch", show=False, subfolder="CJPE_TSO Path", map=optimizer.map)
+        maybe_plot_solutions(
+            [glob_cont_opt.sol, CJTE_TSO_rule_sol],
+            ["Convex CJPE_TSO solution", "CJPE_TSO rule-based evaluator"],
+            benchmark_label="CJPE_TSO rule-based evaluator",
+            show=False,
+            subfolder=relaxation_quality_dir("CJPE_TSO"),
+            map=glob_cont_opt.map,
+        )
         print_debug_report()
         maybe_plot_solutions(
             [
@@ -663,16 +695,16 @@ if __name__ == "__main__":
                 "Naive Controller + energy",
                 "FR_O + rule-based",
                 "FR_O + energy",
-                "FR_TSO + rule-based",
-                "FR_TSO + energy",
+                "FR_STO + rule-based",
+                "FR_STO + energy",
                 "CJPE_TSO + rule-based",
                 "CJPE_TSO + energy",
                 "DJPE_TSO + rule-based",
                 "DJPE_TSO + energy",
             ],
             benchmark_label="Naive Controller + rule-based",
-            show=True,
-            subfolder="All sol compared",
+            show=show_plots,
+            subfolder=all_solution_comparison_dir,
             map=optimizer.map,
         )
 

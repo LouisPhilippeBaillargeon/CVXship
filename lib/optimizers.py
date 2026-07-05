@@ -37,7 +37,7 @@ class Solution:
     prop_power              : np.ndarray #[T_future]
     auxiliary_power         : np.ndarray #[T_future]
     wind_resistance         : np.ndarray #[T_future]
-    calm_water_resistance      : np.ndarray #[T_future]
+    calm_water_resistance   : np.ndarray #[T_future]
     acc_force               : np.ndarray #[T_future]
     total_resistance        : np.ndarray #[T_future]
 
@@ -243,32 +243,16 @@ def _generator_dispatch_data(ship: Ship, generator_models: List[GeneratorModel],
                     f"but config generator {i} is {generator.name!r}. "
                     "Rebuild generator models after changing config/ship.toml."
                 )
-            model_power = np.asarray(getattr(model_generator, "power", []), dtype=float)
-            config_power = np.asarray(generator.power, dtype=float)
-            if model_power.shape != config_power.shape or not np.allclose(model_power, config_power):
-                raise ValueError(
-                    f"Generator model {i} does not match configured power curve for {generator.name!r}. "
-                    "Rebuild generator models after changing config/ship.toml."
-                )
-            model_eff = np.asarray(getattr(model_generator, "eff", []), dtype=float)
-            config_eff = np.asarray(generator.eff, dtype=float)
-            if model_eff.shape != config_eff.shape or not np.allclose(model_eff, config_eff):
-                raise ValueError(
-                    f"Generator model {i} does not match configured efficiency curve for {generator.name!r}. "
-                    "Rebuild generator models after changing config/ship.toml."
-                )
-            if not np.isclose(
-                float(getattr(model_generator, "iddle_fuel", np.nan)),
-                float(generator.iddle_fuel),
-            ):
-                raise ValueError(
-                    f"Generator model {i} does not match configured idle fuel for {generator.name!r}. "
-                    "Rebuild generator models after changing config/ship.toml."
-                )
 
-    coeffs = np.array([gm.power_coeffs for gm in generator_models], dtype=float)
+    coeffs = np.array(
+        [
+            [g.fuel_intercept, g.fuel_linear, g.fuel_quadratic]
+            for g in ship.generators
+        ],
+        dtype=float,
+    )
     if coeffs.shape != (nb_gen, 3) or not np.all(np.isfinite(coeffs)):
-        raise ValueError("Generator models must be fitted before optimization.")
+        raise ValueError("Generator quadratic fuel coefficients must be finite.")
 
     max_p = np.array([g.max_power for g in ship.generators], dtype=float)[:, None]
     max_p = np.repeat(max_p, horizon, axis=1)
@@ -278,6 +262,11 @@ def _generator_dispatch_data(ship: Ship, generator_models: List[GeneratorModel],
     a = np.repeat(coeffs[:, 2][:, None], horizon, axis=1)
 
     return nb_gen, max_p, a, b, c
+
+
+def _generator_min_power_matrix(ship: Ship, horizon: int) -> np.ndarray:
+    min_p = np.array([g.min_power for g in ship.generators], dtype=float)[:, None]
+    return np.repeat(min_p, horizon, axis=1)
 
 
 def _generator_transition_cost_arrays(ship: Ship) -> Tuple[np.ndarray, np.ndarray]:
@@ -374,7 +363,11 @@ def _add_generator_dispatch_constraints(
         gen_on = cp.Variable((nb_gen, T_future), boolean=True)
         gen_on_by_slot = gen_on @ slot_map
 
-        constraints += [generation_power <= cp.multiply(max_p, gen_on_by_slot)]
+        min_p = _generator_min_power_matrix(ship, horizon_slots)
+        constraints += [
+            generation_power <= cp.multiply(max_p, gen_on_by_slot),
+            generation_power >= cp.multiply(min_p, gen_on_by_slot),
+        ]
 
         startup = cp.Variable((nb_gen, T_future), nonneg=True)
         shutdown = cp.Variable((nb_gen, T_future), nonneg=True)
@@ -731,6 +724,7 @@ class EnergyOnlyOptimizer:
         nb_gen, max_p, a, b, c = _generator_dispatch_data(
             self.ship, self.generator_models, nb_seg
         )
+        min_p = _generator_min_power_matrix(self.ship, nb_seg)
 
         gen_on_source = getattr(evaluated_solution, "gen_on", None)
         if gen_on_source is None:
@@ -830,7 +824,10 @@ class EnergyOnlyOptimizer:
         for i, (t, h) in enumerate(records):
             gen_on_fixed[:, i] = gen_on_schedule[:, t, h]
 
-        constraints += [generation_power <= cp.multiply(max_p, gen_on_fixed)]
+        constraints += [
+            generation_power <= cp.multiply(max_p, gen_on_fixed),
+            generation_power >= cp.multiply(min_p, gen_on_fixed),
+        ]
 
         for i in range(nb_seg):
             constraints += [
@@ -1945,7 +1942,7 @@ class CJPE_TSO:
                         2,
                     )
                 ]
-        constraints += [speed_mag >=cp.sum(speed_mag_split,axis=1)/2]
+        constraints += [speed_mag ==cp.sum(speed_mag_split,axis=1)/2]
 
         # ================================================= ACCELERATION ===============================================
         acc = cp.Variable(T_future)
@@ -4189,6 +4186,4 @@ class ShortestPath:
     def _polyline_length(points: np.ndarray) -> float:
         points = np.asarray(points, dtype=float)
         return float(np.sum(np.linalg.norm(np.diff(points, axis=0), axis=1)))
-
-
 

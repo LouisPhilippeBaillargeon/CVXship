@@ -1526,7 +1526,7 @@ class PropulsionModel:
     # ------------------------
     # 2) Fitted power surface (feasible only)
     # ------------------------
-    def plot_power_fit_surface(self):
+    def plot_power_fit_surface(self, show: bool = False):
         """
         3D surface plot of fitted power P_fit(thrust, speed) on feasible points only.
         """
@@ -1548,12 +1548,15 @@ class PropulsionModel:
         ax.set_zlabel("Fitted power (MW)")
         ax.set_title("Fitted convex power surface (feasible region)")
         plt.tight_layout()
-        plt.show()
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
 
     # ------------------------
     # 3) Fitted power contour map
     # ------------------------
-    def plot_power_fit_contours(self, levels: int = 20):
+    def plot_power_fit_contours(self, levels: int = 20, show: bool = False):
         """
         Contour map of fitted power over (speed, thrust), feasible region only.
         """
@@ -1561,14 +1564,17 @@ class PropulsionModel:
         Th, S, mask, ua_vals, thrust_vals = self._mesh()
         P_fit = self._power_fit_on_grid()
 
-        plt.figure()
+        fig = plt.figure()
         cs = plt.contourf(Th, S, P_fit, levels=levels)
         plt.xlabel("Thrust (MN)")
         plt.ylabel("Advance speed ua (m/s)")
         plt.title("Fitted power contours (MW) on feasible region")
         plt.colorbar(cs, label="MW")
         plt.tight_layout()
-        plt.show()
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
 
 
 
@@ -1577,94 +1583,66 @@ class PropulsionModel:
 @dataclass
 class GeneratorModel:
     """
-    Lookup table to compute fuel consumption based on power demand and convex quadratic fit.
+    Config-backed quadratic fuel-consumption model.
     """
     generator: Generator
 
     # Internal storage for coefficients
     power_coeffs: Optional[np.ndarray] = field(default=None, init=False)
 
+    def __post_init__(self):
+        self.fit_convex_model(debug=False)
+
     def compute_fuel_consumption(self, p_mw):
-        #returns fuel consumption in kg/h based on the output power in MW
-        fuel_rate = np.interp(
-                p_mw,
-                self.generator.power,
-                self.generator.eff,
-                left=self.generator.eff[0],
-                right=self.generator.eff[-1],
-            )
-        return fuel_rate*p_mw
+        # Returns fuel consumption in kg/h based on output power in MW.
+        p_mw = np.asarray(p_mw, dtype=float)
+        return (
+            self.generator.fuel_quadratic * p_mw**2
+            + self.generator.fuel_linear * p_mw
+            + self.generator.fuel_intercept
+        )
 
     def fit_convex_model(
         self,
         debug: bool = False
     ):
-        nb_breakpoints = len(self.generator.power)
-        fuel_real = np.zeros(nb_breakpoints+1)
-
-        fuel_real[0] = self.generator.iddle_fuel
-        for i in range(nb_breakpoints):
-            fuel_real[i+1] = self.compute_fuel_consumption(self.generator.power[i])
-
-        fuel_fit = cp.Variable(nb_breakpoints+1)
-        param_2 = cp.Variable()
-        param = cp.Variable()
-        intercept = cp.Variable()
-
-        constraints = []
-        constraints += [param_2>=eps]
-        constraints += [fuel_fit[0]==intercept]
-        for ip in range(nb_breakpoints):
-            power_i = self.generator.power[ip]
-            constraints += [fuel_fit[ip+1]==param_2*(power_i**2)+param*power_i+intercept]
-
-        objective = cp.Minimize(cp.sum_squares(fuel_fit-fuel_real))
-        problem = cp.Problem(objective, constraints)
-        problem.solve(solver="MOSEK", verbose=debug)
-
-        # Check solve status
-        if problem.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-            raise RuntimeError(f"Power fit problem not solved optimally: {problem.status}")
-
-        # Save coefficients in the object
         self.power_coeffs = np.array([
-            intercept.value,
-            param.value,
-            param_2.value,
-        ])
+            float(self.generator.fuel_intercept),
+            float(self.generator.fuel_linear),
+            float(self.generator.fuel_quadratic),
+        ], dtype=float)
 
         if debug:
             fig, ax = plt.subplots(figsize=(8, 6))
 
-            powers = np.zeros(len(self.generator.power)+1)
-            for ip in range(1,len(self.generator.power)+1):
-                powers[ip] = self.generator.power[ip-1]
+            powers = np.linspace(
+                float(self.generator.min_power),
+                float(self.generator.max_power),
+                100,
+            )
+            fuel = self.compute_fuel_consumption(powers)
 
             ax.plot(
                 powers,
-                fuel_real,
-                label="Actual fuel consumption (lookup)",
+                fuel,
+                label="Configured quadratic",
                 linewidth=2,
-                marker="o",
             )
 
-            ax.plot(
-                powers,
-                fuel_fit.value,
-                label="Quadratic convex fit",
-                linewidth=2,
-                linestyle="--",
-                marker="s",
-            )
-
-            ax.set_title("Generator Fuel Consumption Model Fit", fontsize=14)
+            ax.set_title("Generator Fuel Consumption Model", fontsize=14)
             ax.set_xlabel("Generator power output [MW]", fontsize=12)
             ax.set_ylabel("Fuel consumption [kg/h]", fontsize=12)
             ax.grid(True, linestyle="--", alpha=0.5)
             ax.legend(fontsize=12)
             plt.tight_layout()
             plt.show()
-            print("Fuel rate = ",param_2.value, "*power^2 + ",param.value, "*power + ", intercept.value)
+            print(
+                "Fuel rate = ",
+                self.generator.fuel_quadratic,
+                "*power^2 + ",
+                self.generator.fuel_linear,
+                "*power + ",
+                self.generator.fuel_intercept,
+            )
 
-        rel_err = 100*np.max(np.abs(fuel_fit.value - fuel_real))/(np.max(np.abs(fuel_real)))
-        return rel_err
+        return 0.0
