@@ -1,6 +1,6 @@
 # lib/map_builder.py
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 import numpy as np
@@ -822,6 +822,7 @@ class ZoneEditor:
 class MapBuilder:
     map_info: MapInfo
     ship: Ship
+    map_dir: Optional[Path | str] = None
 
     depth_df: Optional[pd.DataFrame] = None
     depth_grid: Optional[np.ndarray] = None
@@ -834,8 +835,37 @@ class MapBuilder:
     transition_ineq_from: Optional[np.ndarray] = None
     transition_ineq_to: Optional[np.ndarray] = None
 
+    depth_grid_path: Path = field(init=False)
+    navigability_map_path: Path = field(init=False)
+    corners_path: Path = field(init=False)
+    zones_path: Path = field(init=False)
+    zone_ineq_path: Path = field(init=False)
+    transition_ineq_path: Path = field(init=False)
+    adj_path: Path = field(init=False)
+
+    def __post_init__(self):
+        if self.map_dir is None:
+            self.depth_grid_path = Path(DEPTH_GRID)
+            self.navigability_map_path = Path(NAVIGABILITY_MAP)
+            self.corners_path = Path(CORNERS)
+            self.zones_path = Path(ZONES)
+            self.zone_ineq_path = Path(ZONE_INEQ)
+            self.transition_ineq_path = Path(TRANSITION_INEQ)
+            self.adj_path = Path(ADJ)
+            return
+
+        map_dir = Path(self.map_dir).resolve()
+        self.map_dir = map_dir
+        self.depth_grid_path = map_dir / "depth_grid.csv"
+        self.navigability_map_path = map_dir / "navigability_map.npy"
+        self.corners_path = map_dir / "corners.csv"
+        self.zones_path = map_dir / "zones.csv"
+        self.zone_ineq_path = map_dir / "zones_ineq.npz"
+        self.transition_ineq_path = map_dir / "transition_ineq.npz"
+        self.adj_path = map_dir / "zones_adj.npy"
+
     def fetch_or_load_depth(self, force: bool = False, gmrt_layer: str = "topo") -> pd.DataFrame:
-        out_path = Path(DEPTH_GRID)
+        out_path = self.depth_grid_path
 
         if out_path.exists() and not force:
             self.depth_df = pd.read_csv(out_path)
@@ -944,7 +974,7 @@ class MapBuilder:
         return df
 
     def build_or_load_navigability(self, force: bool = False) -> np.ndarray:
-        out_path = Path(NAVIGABILITY_MAP)
+        out_path = self.navigability_map_path
 
         if out_path.exists() and not force:
             self.navigability_map = np.load(out_path)
@@ -977,9 +1007,9 @@ class MapBuilder:
         normalize: bool = True,
     ):
         if df_corners is None:
-            df_corners = pd.read_csv(CORNERS)
+            df_corners = pd.read_csv(self.corners_path)
         if df_zones is None:
-            df_zones = pd.read_csv(ZONES)
+            df_zones = pd.read_csv(self.zones_path)
 
         df_corners = df_corners.copy()
         df_zones = df_zones.copy()
@@ -997,14 +1027,14 @@ class MapBuilder:
         if not np.array_equal(adj, adj_from_trans):
             raise RuntimeError("Adjacency mismatch between adjacency builder and transition builder.")
 
-        Path(CORNERS).parent.mkdir(parents=True, exist_ok=True)
+        self.corners_path.parent.mkdir(parents=True, exist_ok=True)
 
-        df_corners.to_csv(CORNERS, index=False)
-        df_zones.to_csv(ZONES, index=False)
-        np.savez(ZONE_INEQ, lambda_array=lambda_array)
-        np.save(ADJ, adj)
+        df_corners.to_csv(self.corners_path, index=False)
+        df_zones.to_csv(self.zones_path, index=False)
+        np.savez(self.zone_ineq_path, lambda_array=lambda_array)
+        np.save(self.adj_path, adj)
         np.savez(
-            TRANSITION_INEQ,
+            self.transition_ineq_path,
             transition_ineqs_from=trans_from,
             transition_ineqs_to=trans_to,
             adjacency=adj,
@@ -1017,11 +1047,11 @@ class MapBuilder:
         self.transition_ineq_from = trans_from
         self.transition_ineq_to = trans_to
 
-        print(f"Saved corners: {CORNERS}")
-        print(f"Saved zones: {ZONES}")
-        print(f"Saved zone inequalities: {ZONE_INEQ}")
-        print(f"Saved adjacency: {ADJ}")
-        print(f"Saved transition inequalities: {TRANSITION_INEQ}")
+        print(f"Saved corners: {self.corners_path}")
+        print(f"Saved zones: {self.zones_path}")
+        print(f"Saved zone inequalities: {self.zone_ineq_path}")
+        print(f"Saved adjacency: {self.adj_path}")
+        print(f"Saved transition inequalities: {self.transition_ineq_path}")
 
         return lambda_array, adj, trans_from, trans_to
 
@@ -1036,15 +1066,15 @@ class MapBuilder:
         editor = ZoneEditor(
             nav=nav,
             pixel_extent=extent,
-            corners_path=CORNERS,
-            zones_path=ZONES,
+            corners_path=self.corners_path,
+            zones_path=self.zones_path,
             artifact_callback=self.build_zone_artifacts,
             origin="lower",
         )
 
-        if import_existing and Path(CORNERS).exists() and Path(ZONES).exists():
+        if import_existing and self.corners_path.exists() and self.zones_path.exists():
             try:
-                editor.import_from_csv(CORNERS, ZONES)
+                editor.import_from_csv(self.corners_path, self.zones_path)
             except Exception as e:
                 print(f"[WARN] Could not import existing zone CSVs: {e}")
 

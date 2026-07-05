@@ -5,6 +5,7 @@ from lib.optimizers import (
     _future_auxiliary_power,
     _future_interval_port_idx,
     _generator_dispatch_data,
+    _generator_transition_cost_from_schedule,
     EnergyOnlyOptimizer,
 )
 from lib.weather_interpolation import (
@@ -129,6 +130,26 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
     shore_cost_cmd, shore_cost_kind = _as_T_or_TH(sol.shore_power_cost, "shore_power_cost")
     batt_ch_cmd, batt_ch_kind = _as_T_or_TH(sol.battery_charge, "battery_charge")
     batt_dis_cmd, batt_dis_kind = _as_T_or_TH(sol.battery_discharge, "battery_discharge")
+
+    gen_startup_out = getattr(sol, "gen_startup", None)
+    gen_shutdown_out = getattr(sol, "gen_shutdown", None)
+    generator_transition_cost = getattr(sol, "generator_transition_cost", None)
+    if (
+        gen_startup_out is None
+        or gen_shutdown_out is None
+        or generator_transition_cost is None
+    ):
+        gen_startup_out, gen_shutdown_out, generator_transition_cost = (
+            _generator_transition_cost_from_schedule(
+                ship,
+                sol.gen_on,
+                first_instant_sail=np.asarray(sol.instant_sail, dtype=float).reshape(-1)[0],
+            )
+        )
+    else:
+        gen_startup_out = np.asarray(gen_startup_out, dtype=float)
+        gen_shutdown_out = np.asarray(gen_shutdown_out, dtype=float)
+        generator_transition_cost = float(generator_transition_cost)
 
     def _pick_T(arr, kind, t, h_cmd):
         return float(arr[t]) if kind == "T" else float(arr[t, h_cmd])
@@ -396,6 +417,7 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         gen_cmd = np.asarray(gen_cmd, dtype=float).copy()
         gen_on_cmd = np.asarray(gen_on_cmd, dtype=float).copy()
         gp = np.zeros(nb_gen, dtype=float)
+        online_actual = (gen_on_cmd > 0.5).astype(float)
         remaining_load = float(max(0.0, remaining_load))
 
         clipped_cmd = np.clip(gen_cmd, 0.0, gen_max_power)
@@ -410,9 +432,9 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         gen_cmd = clipped_cmd
 
         if remaining_load <= eps:
-            return gp, np.zeros(nb_gen, dtype=float), 0.0
+            return gp, online_actual, 0.0
 
-        online = gen_on_cmd > 0.5
+        online = online_actual > 0.5
         off_command = (~online) & (gen_cmd > eps)
         if np.any(off_command):
             _record_message(
@@ -434,7 +456,7 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
                     "Generator dispatch is infeasible: no commanded generator can meet remaining load.",
                     remaining_load,
                 )
-                return gp, np.zeros(nb_gen, dtype=float), remaining_load
+                return gp, online_actual, remaining_load
 
             floor = np.zeros(nb_gen, dtype=float)
             floor[on] = gen_min_power[on]
@@ -458,7 +480,7 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
                         "Generator output was wasted because active generators hit minimum power.",
                         wasted,
                     )
-                return gp, (gp > eps).astype(float), 0.0
+                return gp, online_actual, 0.0
 
             reduction_needed = commanded_total - remaining_load
             room_down = np.maximum(gen_cmd - floor, 0.0)
@@ -471,7 +493,7 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
                 gp = floor
 
             gp = np.maximum(gp, floor)
-            return gp, (gp > eps).astype(float), 0.0
+            return gp, online_actual, 0.0
 
         increase_needed = remaining_load - commanded_total
         room_up = np.zeros(nb_gen, dtype=float)
@@ -487,14 +509,14 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
                 "Generator dispatch is infeasible: high limits cannot meet remaining load.",
                 shortfall,
             )
-            return gp, (gp > eps).astype(float), shortfall
+            return gp, online_actual, shortfall
 
         if room_total > eps:
             gp = gen_cmd + increase_needed * room_up / room_total
         else:
             gp = gen_cmd
 
-        return gp, (gp > eps).astype(float), 0.0
+        return gp, online_actual, 0.0
 
     def _cmd_speed_for_acc(t, h_cmd):
         if uses_two_setpoints:
@@ -647,7 +669,7 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
             actual_discharge = 0.0
             actual_shore = 0.0
             gp = np.zeros(nb_gen, dtype=float)
-            gen_on_actual = np.zeros(nb_gen, dtype=float)
+            gen_on_actual = (np.asarray(gen_on, dtype=float) > 0.5).astype(float)
 
             if solar_available >= load - eps:
                 excess_solar = max(0.0, solar_available - load)
@@ -713,6 +735,16 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
                         "Shore power command was reduced because solar or battery discharge already covered the load.",
                         feasible_cmd_shore - actual_shore,
                     )
+
+                if remaining_load > eps and not mask_sail[t] and np.any(gen_on_actual > 0.5):
+                    gp, gen_on_actual, _unmet = _dispatch_generators(
+                        remaining_load,
+                        gen_sched,
+                        gen_on,
+                        t,
+                        h,
+                    )
+                    remaining_load = _unmet
 
                 if remaining_load > eps and not mask_sail[t]:
                     charge_reduction = min(actual_charge, remaining_load)
@@ -923,7 +955,7 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
     )
 
     non_conv_sol = Solution(
-        estimated_cost=float(np.sum(total_cost_all)),
+        estimated_cost=float(np.sum(total_cost_all) + generator_transition_cost),
         solve_time=sol.solve_time,
         T_future=sol.T_future,
         instant_sail=sol.instant_sail,
@@ -962,6 +994,9 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         solar_power_available=solar_power_available,
         first_stage_optimizer=first_stage_optimizer,
         power_management_optimizer="RuleBasedSetpointRestoration",
+        gen_startup=gen_startup_out,
+        gen_shutdown=gen_shutdown_out,
+        generator_transition_cost=generator_transition_cost,
     )
 
     non_conv_sol.is_valid = len(validation_errors) == 0

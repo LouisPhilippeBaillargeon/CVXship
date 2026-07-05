@@ -279,6 +279,7 @@ class CalmWaterModel:
         fit_if_needed: bool = True,
         show: bool = False,
         subfolder: str | None = None,
+        output_root: str | None = None,
     ):
         """
         Generate IEEE-style diagnostic plots for calm-water resistance models.
@@ -317,7 +318,8 @@ class CalmWaterModel:
         # ---------------------------------
         # Plot directory
         # ---------------------------------
-        plot_dir = os.path.join(PLOTS, subfolder) if subfolder else PLOTS
+        root = output_root if output_root is not None else PLOTS
+        plot_dir = os.path.join(root, subfolder) if subfolder else root
         os.makedirs(plot_dir, exist_ok=True)
 
         # ---------------------------------
@@ -1241,8 +1243,6 @@ class PropulsionModel:
     ):
         #Compute feasibility constraints to exclude infeasible speed thrust combinations
         self.fit_feasibility_boundary(debug=debug)
-        print("constraint_params shape:", self.constraint_params.shape)
-        print(self.constraint_params)
 
         #Only include points in the power limits in the fit
         min_pow = max(self.ship.propulsion.min_pow, self.fit_range.min_prop_power/self.ship.propulsion.nb_propellers)
@@ -1323,7 +1323,7 @@ class PropulsionModel:
     #=======================================Plots===================================================
     from matplotlib.patches import Patch
 
-    def plot_power_surface_speed_resistance(self):
+    def plot_power_surface_speed_resistance(self, show: bool = False, directory=None):
         """
         Plot REAL and FITTED power as separate 2D heatmaps.
         Figure size automatically adapts to large labels/titles.
@@ -1348,10 +1348,7 @@ class PropulsionModel:
         for title, Z in plots:
 
             # Bigger adaptive figure
-            fig, ax = plt.subplots(
-                figsize=(14, 10),
-                constrained_layout=True   # <-- key fix
-            )
+            fig, ax = plt.subplots(figsize=(14, 10))
 
             heat = ax.imshow(
                 Z,
@@ -1403,19 +1400,18 @@ class PropulsionModel:
                 labelsize=20
             )
 
-            plt.show()
+            filename = title.lower().replace(" ", "_").replace("-", "_")
+            _save_and_maybe_show(fig, filename, show, directory=directory or PLOTS)
 
-    def plot_power_error_heatmap(self):
+    def plot_power_error_heatmap(self, show: bool = False, directory=None):
         """
         Show a 2D heatmap of error P_fit - P_real.
         """
-        import matplotlib.pyplot as plt
-
         error = (self.P_fit - self.P_real) * self.mask_fit
 
-        plt.figure(figsize=(10, 6))
+        fig, ax = plt.subplots(figsize=(10, 6))
 
-        heat = plt.imshow(
+        heat = ax.imshow(
             error,
             extent=[self.min_thrust, self.max_thrust, self.min_ua, self.max_ua],
             origin='lower',
@@ -1423,19 +1419,18 @@ class PropulsionModel:
             cmap="inferno"
         )
 
-        cbar = plt.colorbar(heat)
+        cbar = fig.colorbar(heat, ax=ax)
         cbar.set_label("error [MW]", fontsize=30)
         cbar.ax.tick_params(labelsize=14)
 
-        plt.xlabel("Resistance [MN]", fontsize=30)
-        plt.ylabel("Advance speed [m/s]", fontsize=30)
-        plt.title("Power Fit Error Heatmap", fontsize=30)
+        ax.set_xlabel("Resistance [MN]", fontsize=30)
+        ax.set_ylabel("Advance speed [m/s]", fontsize=30)
+        ax.set_title("Power Fit Error Heatmap", fontsize=30)
 
-        plt.xticks(fontsize=20)
-        plt.yticks(fontsize=20)
+        ax.tick_params(axis='both', labelsize=20)
 
-        plt.tight_layout()  # <-- key fix
-        plt.show()
+        fig.tight_layout()
+        _save_and_maybe_show(fig, "power_fit_error_heatmap", show, directory=directory or PLOTS)
 
     def _require_fit_data(self):
         if self.mask_fit is None or self.ua_vals is None or self.thrust_vals is None:
@@ -1486,7 +1481,7 @@ class PropulsionModel:
     # ------------------------
     # 1) Feasibility mask + boundary
     # ------------------------
-    def plot_feasibility_mask(self, show_boundary: bool = True):
+    def plot_feasibility_mask(self, show_boundary: bool = True, show: bool = False, directory=None):
         """
         Visualize the stored feasibility mask over (speed, thrust).
         Optionally overlays the fitted boundary from constraint_params.
@@ -1496,18 +1491,18 @@ class PropulsionModel:
 
         Th, S, mask, ua_vals, thrust_vals = self._mesh()
 
-        plt.figure()
+        fig, ax = plt.subplots()
         # show mask as image: x=thrust, y=speed
-        plt.imshow(
+        im = ax.imshow(
             mask.astype(int),
             origin="lower",
             aspect="auto",
             extent=[thrust_vals[0], thrust_vals[-1], ua_vals[0], ua_vals[-1]],
         )
-        plt.xlabel("Thrust (MN)")
-        plt.ylabel("Advance speed ua (m/s)")
-        plt.title("Feasibility mask (1 = feasible)")
-        plt.colorbar(label="feasible")
+        ax.set_xlabel("Thrust (MN)")
+        ax.set_ylabel("Advance speed ua (m/s)")
+        ax.set_title("Feasibility mask (1 = feasible)")
+        fig.colorbar(im, ax=ax, label="feasible")
 
         if show_boundary:
             if self.constraint_params is None or len(self.constraint_params) < 2:
@@ -1522,16 +1517,16 @@ class PropulsionModel:
                 s_line = np.linspace(ua_vals[0], ua_vals[-1], self.grid_granularity*2)
                 thrust_line = -(a * s_line + b)
 
-                plt.plot(thrust_line, s_line, linewidth=2, label="fitted boundary")
-                plt.legend()
+                ax.plot(thrust_line, s_line, linewidth=2, label="fitted boundary")
+                ax.legend()
 
-        plt.tight_layout()
-        plt.show()
+        fig.tight_layout()
+        _save_and_maybe_show(fig, "propulsion_feasibility_mask", show, directory=directory or PLOTS)
 
     # ------------------------
     # 2) Fitted power surface (feasible only)
     # ------------------------
-    def plot_power_fit_surface(self):
+    def plot_power_fit_surface(self, show: bool = False):
         """
         3D surface plot of fitted power P_fit(thrust, speed) on feasible points only.
         """
@@ -1553,12 +1548,15 @@ class PropulsionModel:
         ax.set_zlabel("Fitted power (MW)")
         ax.set_title("Fitted convex power surface (feasible region)")
         plt.tight_layout()
-        plt.show()
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
 
     # ------------------------
     # 3) Fitted power contour map
     # ------------------------
-    def plot_power_fit_contours(self, levels: int = 20):
+    def plot_power_fit_contours(self, levels: int = 20, show: bool = False):
         """
         Contour map of fitted power over (speed, thrust), feasible region only.
         """
@@ -1566,14 +1564,17 @@ class PropulsionModel:
         Th, S, mask, ua_vals, thrust_vals = self._mesh()
         P_fit = self._power_fit_on_grid()
 
-        plt.figure()
+        fig = plt.figure()
         cs = plt.contourf(Th, S, P_fit, levels=levels)
         plt.xlabel("Thrust (MN)")
         plt.ylabel("Advance speed ua (m/s)")
         plt.title("Fitted power contours (MW) on feasible region")
         plt.colorbar(cs, label="MW")
         plt.tight_layout()
-        plt.show()
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
 
 
 
@@ -1582,94 +1583,66 @@ class PropulsionModel:
 @dataclass
 class GeneratorModel:
     """
-    Lookup table to compute fuel consumption based on power demand and convex quadratic fit.
+    Config-backed quadratic fuel-consumption model.
     """
     generator: Generator
 
     # Internal storage for coefficients
     power_coeffs: Optional[np.ndarray] = field(default=None, init=False)
 
+    def __post_init__(self):
+        self.fit_convex_model(debug=False)
+
     def compute_fuel_consumption(self, p_mw):
-        #returns fuel consumption in kg/h based on the output power in MW
-        fuel_rate = np.interp(
-                p_mw,
-                self.generator.power,
-                self.generator.eff,
-                left=self.generator.eff[0],
-                right=self.generator.eff[-1],
-            )
-        return fuel_rate*p_mw
+        # Returns fuel consumption in kg/h based on output power in MW.
+        p_mw = np.asarray(p_mw, dtype=float)
+        return (
+            self.generator.fuel_quadratic * p_mw**2
+            + self.generator.fuel_linear * p_mw
+            + self.generator.fuel_intercept
+        )
 
     def fit_convex_model(
         self,
         debug: bool = False
     ):
-        nb_breakpoints = len(self.generator.power)
-        fuel_real = np.zeros(nb_breakpoints+1)
-
-        fuel_real[0] = self.generator.iddle_fuel
-        for i in range(nb_breakpoints):
-            fuel_real[i+1] = self.compute_fuel_consumption(self.generator.power[i])
-
-        fuel_fit = cp.Variable(nb_breakpoints+1)
-        param_2 = cp.Variable()
-        param = cp.Variable()
-        intercept = cp.Variable()
-
-        constraints = []
-        constraints += [param_2>=eps]
-        constraints += [fuel_fit[0]==intercept]
-        for ip in range(nb_breakpoints):
-            power_i = self.generator.power[ip]
-            constraints += [fuel_fit[ip+1]==param_2*(power_i**2)+param*power_i+intercept]
-
-        objective = cp.Minimize(cp.sum_squares(fuel_fit-fuel_real))
-        problem = cp.Problem(objective, constraints)
-        problem.solve(solver="MOSEK", verbose=debug)
-
-        # Check solve status
-        if problem.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-            raise RuntimeError(f"Power fit problem not solved optimally: {problem.status}")
-
-        # Save coefficients in the object
         self.power_coeffs = np.array([
-            intercept.value,
-            param.value,
-            param_2.value,
-        ])
+            float(self.generator.fuel_intercept),
+            float(self.generator.fuel_linear),
+            float(self.generator.fuel_quadratic),
+        ], dtype=float)
 
         if debug:
             fig, ax = plt.subplots(figsize=(8, 6))
 
-            powers = np.zeros(len(self.generator.power)+1)
-            for ip in range(1,len(self.generator.power)+1):
-                powers[ip] = self.generator.power[ip-1]
+            powers = np.linspace(
+                float(self.generator.min_power),
+                float(self.generator.max_power),
+                100,
+            )
+            fuel = self.compute_fuel_consumption(powers)
 
             ax.plot(
                 powers,
-                fuel_real,
-                label="Actual fuel consumption (lookup)",
+                fuel,
+                label="Configured quadratic",
                 linewidth=2,
-                marker="o",
             )
 
-            ax.plot(
-                powers,
-                fuel_fit.value,
-                label="Quadratic convex fit",
-                linewidth=2,
-                linestyle="--",
-                marker="s",
-            )
-
-            ax.set_title("Generator Fuel Consumption Model Fit", fontsize=14)
+            ax.set_title("Generator Fuel Consumption Model", fontsize=14)
             ax.set_xlabel("Generator power output [MW]", fontsize=12)
             ax.set_ylabel("Fuel consumption [kg/h]", fontsize=12)
             ax.grid(True, linestyle="--", alpha=0.5)
             ax.legend(fontsize=12)
             plt.tight_layout()
             plt.show()
-            print("Fuel rate = ",param_2.value, "*power^2 + ",param.value, "*power + ", intercept.value)
+            print(
+                "Fuel rate = ",
+                self.generator.fuel_quadratic,
+                "*power^2 + ",
+                self.generator.fuel_linear,
+                "*power + ",
+                self.generator.fuel_intercept,
+            )
 
-        rel_err = 100*np.max(np.abs(fuel_fit.value - fuel_real))/(np.max(np.abs(fuel_real)))
-        return rel_err
+        return 0.0

@@ -1,7 +1,7 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-CONFIG = ROOT / "config"
+CONFIG = ROOT / "cases" / "baseline"
 
 
 SHIP = CONFIG / "ship.toml"
@@ -18,9 +18,8 @@ TRANSITION_INEQ = CONFIG_MAP / "transition_ineq.npz"
 ADJ = CONFIG_MAP / "zones_adj.npy"
 
 
-WEATHER = CONFIG / "weather"
+WEATHER = ROOT / "weather_data"
 CURRENTS = WEATHER / "copernicus_marine_forecast.nc"
-WAVES = WEATHER / "data_stream-wave_stepType-instant.nc"
 ATMO = WEATHER / "data_stream-oper_stepType-instant.nc"
 SUN = WEATHER / "data_stream-oper_stepType-accum.nc"
 

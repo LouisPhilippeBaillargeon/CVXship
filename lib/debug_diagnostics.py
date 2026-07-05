@@ -375,7 +375,8 @@ def _record_power_slacks(report: OptimizerDebugReport, runner, ctx: Dict[str, An
                 if not np.asarray(runner.sol.interval_sail_fraction, dtype=float).reshape(-1)[t] > 0.01:
                     continue
                 for h in range(gp.shape[2]):
-                    fit = _gen_cost_fit(runner.generator_models, runner.itinerary.fuel_price, gp[:, t, h], gen_on[:, t, h])
+                    gen_on_t = gen_on[:, t] if gen_on.ndim == 2 else gen_on[:, t, h]
+                    fit = _gen_cost_fit(runner.generator_models, runner.itinerary.fuel_price, gp[:, t, h], gen_on_t)
                     report.add("slack.gen_costs_minus_fit", gc[:, t, h] - fit)
         elif gp.ndim == 2:
             for t in range(gp.shape[1]):
