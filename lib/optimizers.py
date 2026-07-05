@@ -67,6 +67,21 @@ class Solution:
     first_stage_optimizer   : Optional[str] = None
     power_management_optimizer: Optional[str] = None
     energy_solve_time       : Optional[float] = None
+    gen_startup             : Optional[np.ndarray] = None
+    gen_shutdown            : Optional[np.ndarray] = None
+    generator_transition_cost: Optional[float] = None
+
+
+@dataclass
+class GeneratorDispatchData:
+    nb_gen: int
+    generation_power: cp.Variable
+    gen_costs: cp.Variable
+    gen_on: object
+    gen_on_by_slot: object
+    startup: object
+    shutdown: object
+    transition_cost: object
 
 
 @dataclass
@@ -265,6 +280,226 @@ def _generator_dispatch_data(ship: Ship, generator_models: List[GeneratorModel],
     return nb_gen, max_p, a, b, c
 
 
+def _generator_transition_cost_arrays(ship: Ship) -> Tuple[np.ndarray, np.ndarray]:
+    startup_cost = np.array(
+        [float(getattr(g, "startup_cost", 0.0)) for g in ship.generators],
+        dtype=float,
+    )
+    shutdown_cost = np.array(
+        [float(getattr(g, "shutdown_cost", 0.0)) for g in ship.generators],
+        dtype=float,
+    )
+
+    if np.any(startup_cost < 0) or np.any(shutdown_cost < 0):
+        raise ValueError("Generator startup and shutdown costs must be nonnegative.")
+
+    return startup_cost, shutdown_cost
+
+
+def _default_initial_gen_on(
+    ship: Ship,
+    first_instant_sail,
+    initial_gen_on=None,
+) -> np.ndarray:
+    nb_gen = len(ship.generators)
+
+    if initial_gen_on is None:
+        return np.full(nb_gen, 1.0 if bool(first_instant_sail) else 0.0, dtype=float)
+
+    out = np.asarray(initial_gen_on, dtype=float).reshape(-1)
+    if out.shape != (nb_gen,):
+        raise ValueError(f"initial_gen_on must have shape {(nb_gen,)}, got {out.shape}.")
+
+    if np.any((out < -1e-9) | (out > 1.0 + 1e-9)):
+        raise ValueError("initial_gen_on entries must be 0/1 values.")
+
+    return (out > 0.5).astype(float)
+
+
+def _slot_timestep_matrix(
+    slot_timestep_index: np.ndarray,
+    T_future: int,
+    horizon_slots: int,
+) -> np.ndarray:
+    slot_timestep_index = np.asarray(slot_timestep_index, dtype=int).reshape(-1)
+    if slot_timestep_index.shape != (horizon_slots,):
+        raise ValueError(
+            "slot_timestep_index must have shape "
+            f"{(horizon_slots,)}, got {slot_timestep_index.shape}."
+        )
+
+    if np.any(slot_timestep_index < 0) or np.any(slot_timestep_index >= T_future):
+        raise ValueError("slot_timestep_index contains an out-of-range timestep.")
+
+    slot_map = np.zeros((T_future, horizon_slots), dtype=float)
+    for k, t in enumerate(slot_timestep_index):
+        slot_map[int(t), k] = 1.0
+
+    return slot_map
+
+
+def _add_generator_dispatch_constraints(
+    constraints: list,
+    ship: Ship,
+    generator_models: List[GeneratorModel],
+    horizon_slots: int,
+    T_future: int,
+    slot_timestep_index: np.ndarray,
+    unit_commitment: bool,
+    fuel_price: float,
+    first_instant_sail,
+    initial_gen_on=None,
+) -> GeneratorDispatchData:
+    nb_gen, max_p, a, b, c = _generator_dispatch_data(
+        ship,
+        generator_models,
+        horizon_slots,
+    )
+
+    slot_map = _slot_timestep_matrix(
+        slot_timestep_index,
+        T_future=T_future,
+        horizon_slots=horizon_slots,
+    )
+
+    generation_power = cp.Variable((nb_gen, horizon_slots))
+    gen_costs = cp.Variable((nb_gen, horizon_slots))
+
+    constraints += [
+        generation_power >= 0,
+        gen_costs >= 0,
+    ]
+
+    if unit_commitment:
+        gen_on = cp.Variable((nb_gen, T_future), boolean=True)
+        gen_on_by_slot = gen_on @ slot_map
+
+        constraints += [generation_power <= cp.multiply(max_p, gen_on_by_slot)]
+
+        startup = cp.Variable((nb_gen, T_future), nonneg=True)
+        shutdown = cp.Variable((nb_gen, T_future), nonneg=True)
+        constraints += [
+            startup <= 1,
+            shutdown <= 1,
+        ]
+
+        initial_on = _default_initial_gen_on(
+            ship,
+            first_instant_sail=first_instant_sail,
+            initial_gen_on=initial_gen_on,
+        )
+
+        for t in range(T_future):
+            previous_on = initial_on if t == 0 else gen_on[:, t - 1]
+
+            constraints += [
+                startup[:, t] >= gen_on[:, t] - previous_on,
+                startup[:, t] <= gen_on[:, t],
+                startup[:, t] <= 1 - previous_on,
+                shutdown[:, t] >= previous_on - gen_on[:, t],
+                shutdown[:, t] <= previous_on,
+                shutdown[:, t] <= 1 - gen_on[:, t],
+            ]
+
+        startup_cost, shutdown_cost = _generator_transition_cost_arrays(ship)
+        transition_cost = (
+            cp.sum(cp.multiply(startup_cost[:, None], startup))
+            + cp.sum(cp.multiply(shutdown_cost[:, None], shutdown))
+        )
+
+    else:
+        gen_on = np.ones((nb_gen, T_future), dtype=float)
+        gen_on_by_slot = gen_on @ slot_map
+        constraints += [generation_power <= cp.multiply(max_p, gen_on_by_slot)]
+
+        startup = np.zeros((nb_gen, T_future), dtype=float)
+        shutdown = np.zeros((nb_gen, T_future), dtype=float)
+        transition_cost = 0.0
+
+    gen_cost_expr = (
+        cp.multiply(a, cp.square(generation_power))
+        + cp.multiply(b, generation_power)
+        + cp.multiply(c, gen_on_by_slot)
+    ) * float(fuel_price)
+
+    constraints += [gen_costs >= gen_cost_expr]
+
+    return GeneratorDispatchData(
+        nb_gen=nb_gen,
+        generation_power=generation_power,
+        gen_costs=gen_costs,
+        gen_on=gen_on,
+        gen_on_by_slot=gen_on_by_slot,
+        startup=startup,
+        shutdown=shutdown,
+        transition_cost=transition_cost,
+    )
+
+
+def _value_array(expr, dtype=float) -> np.ndarray:
+    value = getattr(expr, "value", None)
+    if value is None:
+        value = expr
+    return np.asarray(value, dtype=dtype)
+
+
+def _generator_transition_arrays_from_schedule(
+    ship: Ship,
+    gen_on_schedule: np.ndarray,
+    first_instant_sail,
+    initial_gen_on=None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    schedule = np.asarray(gen_on_schedule, dtype=float)
+    if schedule.ndim == 3:
+        schedule = np.max(schedule, axis=2)
+
+    nb_gen = len(ship.generators)
+    if schedule.ndim != 2 or schedule.shape[0] != nb_gen:
+        raise ValueError(
+            "gen_on_schedule must have shape [nb_gen,T] or [nb_gen,T,H], "
+            f"got {schedule.shape}."
+        )
+
+    T_future = schedule.shape[1]
+    gen_on = (schedule > 0.5).astype(float)
+    initial_on = _default_initial_gen_on(
+        ship,
+        first_instant_sail=first_instant_sail,
+        initial_gen_on=initial_gen_on,
+    )
+
+    startup = np.zeros((nb_gen, T_future), dtype=float)
+    shutdown = np.zeros((nb_gen, T_future), dtype=float)
+    previous_on = initial_on
+
+    for t in range(T_future):
+        startup[:, t] = np.maximum(gen_on[:, t] - previous_on, 0.0)
+        shutdown[:, t] = np.maximum(previous_on - gen_on[:, t], 0.0)
+        previous_on = gen_on[:, t]
+
+    return startup, shutdown
+
+
+def _generator_transition_cost_from_schedule(
+    ship: Ship,
+    gen_on_schedule: np.ndarray,
+    first_instant_sail,
+    initial_gen_on=None,
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    startup, shutdown = _generator_transition_arrays_from_schedule(
+        ship,
+        gen_on_schedule,
+        first_instant_sail=first_instant_sail,
+        initial_gen_on=initial_gen_on,
+    )
+    startup_cost, shutdown_cost = _generator_transition_cost_arrays(ship)
+    transition_cost = float(
+        np.sum(startup_cost[:, None] * startup)
+        + np.sum(shutdown_cost[:, None] * shutdown)
+    )
+    return startup, shutdown, transition_cost
+
+
 def _future_interval_port_idx(itinerary, states, T_future: int, port_idx: np.ndarray) -> np.ndarray:
     p = getattr(itinerary, "interval_port_idx", None)
     if p is not None and len(p) > 0:
@@ -369,6 +604,20 @@ class EnergyOnlyOptimizer:
             return np.repeat(arr[:, None], H, axis=1)
 
         raise ValueError(f"{name} must have shape {(T,)} or {(T, H)}, got {arr.shape}.")
+
+    @staticmethod
+    def _as_generator_segment_matrix(value, nb_gen: int, T: int, H: int, name: str) -> np.ndarray:
+        arr = np.asarray(value, dtype=float)
+
+        if arr.shape == (nb_gen, T, H):
+            return arr
+
+        if arr.shape == (nb_gen, T):
+            return np.repeat(arr[:, :, None], H, axis=2)
+
+        raise ValueError(
+            f"{name} must have shape {(nb_gen, T)} or {(nb_gen, T, H)}, got {arr.shape}."
+        )
 
     def optimize(
         self,
@@ -483,6 +732,45 @@ class EnergyOnlyOptimizer:
             self.ship, self.generator_models, nb_seg
         )
 
+        gen_on_source = getattr(evaluated_solution, "gen_on", None)
+        if gen_on_source is None:
+            gen_on_source = np.ones((nb_gen, T_future), dtype=float)
+        gen_on_schedule = self._as_generator_segment_matrix(
+            gen_on_source,
+            nb_gen,
+            T_future,
+            H,
+            "gen_on",
+        )
+
+        first_instant_sail = np.asarray(
+            evaluated_solution.instant_sail,
+            dtype=float,
+        ).reshape(-1)[0]
+        gen_startup_out = getattr(evaluated_solution, "gen_startup", None)
+        gen_shutdown_out = getattr(evaluated_solution, "gen_shutdown", None)
+        generator_transition_cost = getattr(
+            evaluated_solution,
+            "generator_transition_cost",
+            None,
+        )
+        if (
+            gen_startup_out is None
+            or gen_shutdown_out is None
+            or generator_transition_cost is None
+        ):
+            gen_startup_out, gen_shutdown_out, generator_transition_cost = (
+                _generator_transition_cost_from_schedule(
+                    self.ship,
+                    gen_on_source,
+                    first_instant_sail=first_instant_sail,
+                )
+            )
+        else:
+            gen_startup_out = np.asarray(gen_startup_out, dtype=float)
+            gen_shutdown_out = np.asarray(gen_shutdown_out, dtype=float)
+            generator_transition_cost = float(generator_transition_cost)
+
         dt_flat = np.array([segment_dt_h[t, h] for t, h in records], dtype=float)
         prop_flat = np.array([prop_power[t, h] for t, h in records], dtype=float)
         aux_flat = np.array([auxiliary_power[t] for t, _h in records], dtype=float)
@@ -539,7 +827,8 @@ class EnergyOnlyOptimizer:
                 ]
 
         gen_on_fixed = np.zeros((nb_gen, nb_seg), dtype=float)
-        gen_on_fixed[:, sail_flat] = 1.0
+        for i, (t, h) in enumerate(records):
+            gen_on_fixed[:, i] = gen_on_schedule[:, t, h]
 
         constraints += [generation_power <= cp.multiply(max_p, gen_on_fixed)]
 
@@ -564,6 +853,7 @@ class EnergyOnlyOptimizer:
         objective = cp.Minimize(
             cp.sum(cp.multiply(gen_cost_expr, gen_dt))
             + cp.sum(cp.multiply(shore_power, shore_cost_flat * dt_flat))
+            + generator_transition_cost
         )
 
         problem = cp.Problem(objective, constraints)
@@ -668,6 +958,9 @@ class EnergyOnlyOptimizer:
             first_stage_optimizer=first_stage_optimizer,
             power_management_optimizer=type(self).__name__,
             energy_solve_time=solve_time,
+            gen_startup=gen_startup_out,
+            gen_shutdown=gen_shutdown_out,
+            generator_transition_cost=generator_transition_cost,
         )
 
         return 1
@@ -696,6 +989,7 @@ class DJPE_TSO:
 
     def optimize(self,
         unit_commitment = False,
+        initial_gen_on = None,
         debug = False,
         ordered_zones = False,
         min_timestep = False,
@@ -1188,44 +1482,21 @@ class DJPE_TSO:
         constraints += [SOC[-1] >= self.itinerary.soc_f]
 
         # ================================================= GENERATORS =================================================
-        nb_gen, max_p, a, b, c = _generator_dispatch_data(
-            self.ship, self.generator_models, 2 * T_future
+        generator_dispatch = _add_generator_dispatch_constraints(
+            constraints=constraints,
+            ship=self.ship,
+            generator_models=self.generator_models,
+            horizon_slots=2 * T_future,
+            T_future=T_future,
+            slot_timestep_index=np.repeat(np.arange(T_future), H),
+            unit_commitment=unit_commitment,
+            fuel_price=self.itinerary.fuel_price,
+            first_instant_sail=instant_sail[0],
+            initial_gen_on=initial_gen_on,
         )
-
-        generation_power = cp.Variable((nb_gen, 2 * T_future))
-        gen_costs = cp.Variable((nb_gen, 2 * T_future))
-
-        constraints += [generation_power >= 0]
-
-        if unit_commitment:
-            M = 1000000
-            gen_on = cp.Variable((nb_gen, 2 * T_future), boolean=True)
-            constraints += [generation_power <= cp.multiply(max_p, gen_on)]
-            constraints += [
-                gen_costs >= (
-                    cp.multiply(a, cp.square(generation_power))
-                    + cp.multiply(b, generation_power)
-                    + c
-                ) * self.itinerary.fuel_price - M * (1 - gen_on)
-            ]
-            constraints += [gen_costs >= 0]
-        else:
-            gen_on_fixed = np.zeros((nb_gen, 2 * T_future), dtype=float)
-
-            for t in range(T_future):
-                if interval_sail[t]:
-                    gen_on_fixed[:, 2 * t] = 1.0
-                    gen_on_fixed[:, 2 * t + 1] = 1.0
-
-            constraints += [
-                gen_costs >= (
-                    cp.multiply(a, cp.square(generation_power))
-                    + cp.multiply(b, generation_power)
-                    + cp.multiply(c, gen_on_fixed)
-                ) * self.itinerary.fuel_price
-            ]
-            constraints += [gen_costs >= 0]
-            constraints += [generation_power <= cp.multiply(max_p, gen_on_fixed)]
+        nb_gen = generator_dispatch.nb_gen
+        generation_power = generator_dispatch.generation_power
+        gen_costs = generator_dispatch.gen_costs
 
         # ================================================= POWER BALANCE ==============================================
         for t in range(T_future):
@@ -1250,6 +1521,7 @@ class DJPE_TSO:
         objective = cp.Minimize(
             cp.sum(cp.multiply(gen_costs, half_dt_gen))
             + cp.sum(cp.multiply(shore_power_flat, shore_cost_half * half_dt_flat))
+            + generator_dispatch.transition_cost
         )
 
         # ================================================= SOLVE ======================================================
@@ -1271,21 +1543,19 @@ class DJPE_TSO:
         # ================================================= RESULTS ====================================================
         if problem.status not in ["infeasible", "unbounded"]:
 
-            if unit_commitment:
-                gen_on_flat = np.array(gen_on.value)
-            else:
-                gen_on_flat = gen_on_fixed
+            gen_on_out = _value_array(generator_dispatch.gen_on)
+            gen_startup_out = _value_array(generator_dispatch.startup)
+            gen_shutdown_out = _value_array(generator_dispatch.shutdown)
+            generator_transition_cost = float(_value_array(generator_dispatch.transition_cost))
 
             gen_power_out = np.zeros((nb_gen, T_future, H), dtype=float)
             gen_costs_out = np.zeros((nb_gen, T_future, H), dtype=float)
-            gen_on_out = np.zeros((nb_gen, T_future, H), dtype=float)
 
             for t in range(T_future):
                 for h in range(H):
                     k = 2 * t + h
                     gen_power_out[:, t, h] = generation_power.value[:, k]
                     gen_costs_out[:, t, h] = gen_costs.value[:, k]
-                    gen_on_out[:, t, h] = gen_on_flat[:, k]
 
             ship_speed_out = np.stack(
                 [np.array(ship_speed_x.value), np.array(ship_speed_y.value)],
@@ -1350,6 +1620,9 @@ class DJPE_TSO:
                 step_distance           = step_distance_out,
                 timestep_dt_h           = timestep_dt_h,
                 interval_port_idx       = interval_port_idx,
+                gen_startup             = gen_startup_out,
+                gen_shutdown            = gen_shutdown_out,
+                generator_transition_cost= generator_transition_cost,
             )
             if debug:
                 record_optimizer_debug(
@@ -1401,6 +1674,7 @@ class CJPE_TSO:
 
     def optimize(self,
         unit_commitment = False,
+        initial_gen_on = None,
         debug = False,
         ordered_zones = False,
         min_timestep = False,
@@ -1901,34 +2175,21 @@ class CJPE_TSO:
         constraints += [SOC[-1] >= self.itinerary.soc_f]
 
         # ================================================= GENERATORS =================================================
-        nb_gen, max_p, a, b, c = _generator_dispatch_data(
-            self.ship, self.generator_models, T_future
+        generator_dispatch = _add_generator_dispatch_constraints(
+            constraints=constraints,
+            ship=self.ship,
+            generator_models=self.generator_models,
+            horizon_slots=T_future,
+            T_future=T_future,
+            slot_timestep_index=np.arange(T_future),
+            unit_commitment=unit_commitment,
+            fuel_price=self.itinerary.fuel_price,
+            first_instant_sail=instant_sail[0],
+            initial_gen_on=initial_gen_on,
         )
-
-        generation_power = cp.Variable((nb_gen,T_future)) #[nb_gen, nb_timsetep]
-        gen_costs = cp.Variable((nb_gen,T_future)) #[nb_gen, nb_timesteps]
-
-        constraints += [generation_power >= 0]
-
-        if unit_commitment:
-            M= 1000000
-            gen_on = cp.Variable((nb_gen,T_future), boolean=True) #[nb_gen, nb_timesteps]
-            constraints += [generation_power <= cp.multiply(max_p,gen_on)]
-            constraints += [gen_costs >=(cp.multiply(a, cp.square(generation_power)) +cp.multiply(b, generation_power) +c)*self.itinerary.fuel_price -M*(1-gen_on)] # $/h
-            constraints += [gen_costs >=0]
-        else:
-            gen_on_fixed = np.zeros((nb_gen, T_future), dtype=float)
-            gen_on_fixed[:, interval_sail.astype(bool)] = 1.0
-            constraints += [generation_power <= cp.multiply(max_p, gen_on_fixed)]
-
-            constraints += [
-                gen_costs >= (
-                    cp.multiply(a, cp.square(generation_power))
-                    + cp.multiply(b, generation_power)
-                    + cp.multiply(c, gen_on_fixed)
-                ) * self.itinerary.fuel_price
-            ]
-            constraints += [gen_costs >= 0]
+        nb_gen = generator_dispatch.nb_gen
+        generation_power = generator_dispatch.generation_power
+        gen_costs = generator_dispatch.gen_costs
 
         # ================================================= POWER BALANCE ==============================================
         for t in range(T_future):
@@ -1948,6 +2209,7 @@ class CJPE_TSO:
         objective = cp.Minimize(
             cp.sum(cp.multiply(gen_costs, gen_dt))
             + cp.sum(cp.multiply(shore_power, shore_cost * timestep_dt_h))
+            + generator_dispatch.transition_cost
         )
 
         # ================================================= SOLVE ======================================================
@@ -1968,7 +2230,10 @@ class CJPE_TSO:
 
         # ================================================= RESULTS ====================================================
         if problem.status not in ["infeasible", "unbounded"]:
-            gen_on_out = np.array(gen_on.value) if unit_commitment else gen_on_fixed
+            gen_on_out = _value_array(generator_dispatch.gen_on)
+            gen_startup_out = _value_array(generator_dispatch.startup)
+            gen_shutdown_out = _value_array(generator_dispatch.shutdown)
+            generator_transition_cost = float(_value_array(generator_dispatch.transition_cost))
 
             ship_speed_out = np.stack(
                 [np.array(ship_speed_x.value), np.array(ship_speed_y.value)],
@@ -2043,6 +2308,9 @@ class CJPE_TSO:
                 path_zone_ids           = np.array(self.path_zone_ids),
                 timestep_dt_h           = timestep_dt_h,
                 interval_port_idx       = interval_port_idx,
+                gen_startup             = gen_startup_out,
+                gen_shutdown            = gen_shutdown_out,
+                generator_transition_cost= generator_transition_cost,
             )
             if debug:
                 record_optimizer_debug(
@@ -2111,6 +2379,7 @@ class FR_TSO:
     def optimize(
         self,
         unit_commitment=False,
+        initial_gen_on=None,
         debug=False,
         min_timestep=False,
         restrict_to_base=False,
@@ -2576,47 +2845,21 @@ class FR_TSO:
         constraints += [SOC[-1] >= self.itinerary.soc_f]
 
         # ================================= GENERATORS =================================
-        nb_gen, max_p, a, b, c = _generator_dispatch_data(
-            self.ship, self.generator_models, T_future
+        generator_dispatch = _add_generator_dispatch_constraints(
+            constraints=constraints,
+            ship=self.ship,
+            generator_models=self.generator_models,
+            horizon_slots=T_future,
+            T_future=T_future,
+            slot_timestep_index=np.arange(T_future),
+            unit_commitment=unit_commitment,
+            fuel_price=self.itinerary.fuel_price,
+            first_instant_sail=instant_sail[0],
+            initial_gen_on=initial_gen_on,
         )
-
-        generation_power = cp.Variable((nb_gen, T_future))
-        gen_costs = cp.Variable((nb_gen, T_future))
-
-        constraints += [generation_power >= 0]
-
-        if unit_commitment:
-            M = 1_000_000
-            gen_on = cp.Variable((nb_gen, T_future), boolean=True)
-
-            constraints += [generation_power <= cp.multiply(max_p, gen_on)]
-            constraints += [
-                gen_costs >= (
-                    cp.multiply(a, cp.square(generation_power))
-                    + cp.multiply(b, generation_power)
-                    + c
-                ) * self.itinerary.fuel_price
-                - M * (1 - gen_on)
-            ]
-            constraints += [gen_costs >= 0]
-
-        else:
-            gen_on_fixed = np.zeros((nb_gen, T_future), dtype=float)
-
-            for t in range(T_future):
-                if interval_sail[t]:
-                    gen_on_fixed[:, t] = 1.0
-
-            constraints += [generation_power <= cp.multiply(max_p, gen_on_fixed)]
-
-            constraints += [
-                gen_costs >= (
-                    cp.multiply(a, cp.square(generation_power))
-                    + cp.multiply(b, generation_power)
-                    + cp.multiply(c, gen_on_fixed)
-                ) * self.itinerary.fuel_price
-            ]
-            constraints += [gen_costs >= 0]
+        nb_gen = generator_dispatch.nb_gen
+        generation_power = generator_dispatch.generation_power
+        gen_costs = generator_dispatch.gen_costs
 
         # ================================= POWER BALANCE =================================
         for t in range(T_future):
@@ -2635,6 +2878,7 @@ class FR_TSO:
         objective = cp.Minimize(
             cp.sum(cp.multiply(gen_costs, gen_dt))
             + cp.sum(cp.multiply(shore_power, shore_cost * timestep_dt_h))
+            + generator_dispatch.transition_cost
         )
 
         # ================================= SOLVE =================================
@@ -2691,10 +2935,10 @@ class FR_TSO:
             axis=1,
         )
 
-        if unit_commitment:
-            gen_on_out = np.asarray(gen_on.value)
-        else:
-            gen_on_out = gen_on_fixed
+        gen_on_out = _value_array(generator_dispatch.gen_on)
+        gen_startup_out = _value_array(generator_dispatch.startup)
+        gen_shutdown_out = _value_array(generator_dispatch.shutdown)
+        generator_transition_cost = float(_value_array(generator_dispatch.transition_cost))
 
         shore_power_cost = np.asarray(shore_power.value).astype(float) * shore_cost.astype(float)
 
@@ -2740,6 +2984,9 @@ class FR_TSO:
             segment_dt_h=None,
             timestep_dt_h=timestep_dt_h,
             interval_port_idx=interval_port_idx,
+            gen_startup=gen_startup_out,
+            gen_shutdown=gen_shutdown_out,
+            generator_transition_cost=generator_transition_cost,
         )
         if debug:
             record_optimizer_debug(
@@ -2900,6 +3147,8 @@ class FR_O:
 
     def optimize(
         self,
+        unit_commitment=False,
+        initial_gen_on=None,
         debug=False,
         verbose=False,
     ):
@@ -3148,30 +3397,21 @@ class FR_O:
         constraints += [SOC[-1] >= self.itinerary.soc_f]
 
         # ================================= GENERATORS =================================
-        nb_gen, max_p, a, b, c = _generator_dispatch_data(
-            self.ship, self.generator_models, T_future
+        generator_dispatch = _add_generator_dispatch_constraints(
+            constraints=constraints,
+            ship=self.ship,
+            generator_models=self.generator_models,
+            horizon_slots=T_future,
+            T_future=T_future,
+            slot_timestep_index=np.arange(T_future),
+            unit_commitment=unit_commitment,
+            fuel_price=self.itinerary.fuel_price,
+            first_instant_sail=instant_sail[0],
+            initial_gen_on=initial_gen_on,
         )
-
-        generation_power = cp.Variable((nb_gen, T_future))
-        gen_costs = cp.Variable((nb_gen, T_future))
-
-        constraints += [generation_power >= 0]
-        gen_on_fixed = np.zeros((nb_gen, T_future), dtype=float)
-
-        for t in range(T_future):
-            if interval_sail[t]:
-                gen_on_fixed[:, t] = 1.0
-
-        constraints += [generation_power <= cp.multiply(max_p, gen_on_fixed)]
-
-        constraints += [
-            gen_costs >= (
-                cp.multiply(a, cp.square(generation_power))
-                + cp.multiply(b, generation_power)
-                + cp.multiply(c, gen_on_fixed)
-            ) * self.itinerary.fuel_price
-        ]
-        constraints += [gen_costs >= 0]
+        nb_gen = generator_dispatch.nb_gen
+        generation_power = generator_dispatch.generation_power
+        gen_costs = generator_dispatch.gen_costs
 
         # ================================= POWER BALANCE =================================
         for t in range(T_future):
@@ -3190,6 +3430,7 @@ class FR_O:
         objective = cp.Minimize(
             cp.sum(cp.multiply(gen_costs, gen_dt))
             + cp.sum(cp.multiply(shore_power, shore_cost * timestep_dt_h))
+            + generator_dispatch.transition_cost
         )
 
         # ================================= SOLVE =================================
@@ -3239,7 +3480,10 @@ class FR_O:
             return waypoints[s] + (d_abs - D_breaks[s]) * segment_dirs[s]
 
         ship_pos_2d = np.vstack([_xy_from_distance(x) for x in d_opt])
-        gen_on_out = gen_on_fixed
+        gen_on_out = _value_array(generator_dispatch.gen_on)
+        gen_startup_out = _value_array(generator_dispatch.startup)
+        gen_shutdown_out = _value_array(generator_dispatch.shutdown)
+        generator_transition_cost = float(_value_array(generator_dispatch.transition_cost))
         shore_power_cost = np.asarray(shore_power.value).astype(float) * shore_cost.astype(float)
         self.sol = Solution(
             estimated_cost=problem.value,
@@ -3283,6 +3527,9 @@ class FR_O:
             segment_dt_h=None,
             timestep_dt_h=timestep_dt_h,
             interval_port_idx=interval_port_idx,
+            gen_startup=gen_startup_out,
+            gen_shutdown=gen_shutdown_out,
+            generator_transition_cost=generator_transition_cost,
         )
         if debug:
             record_optimizer_debug(
@@ -3423,10 +3670,17 @@ class NaiveController:
         generation_power = np.zeros((nb_gen, T_future), dtype=float)
         gen_on = np.zeros((nb_gen, T_future), dtype=float)
 
-        sailing_intervals = interval_sail_fraction > 1e-9
         if nb_gen > 0:
-            generation_power[:, sailing_intervals] = 1.0 / nb_gen
-            gen_on[:, sailing_intervals] = 1.0
+            generation_power[:, :] = 1.0 / nb_gen
+            gen_on[:, :] = 1.0
+
+        gen_startup, gen_shutdown, generator_transition_cost = (
+            _generator_transition_cost_from_schedule(
+                self.ship,
+                gen_on,
+                first_instant_sail=instant_sail[0],
+            )
+        )
 
         zeros = np.zeros(T_future, dtype=float)
 
@@ -3474,6 +3728,9 @@ class NaiveController:
             segment_dt_h=None,
             timestep_dt_h=timestep_dt_h,
             interval_port_idx=interval_port_idx,
+            gen_startup=gen_startup,
+            gen_shutdown=gen_shutdown,
+            generator_transition_cost=generator_transition_cost,
         )
 
         if debug:

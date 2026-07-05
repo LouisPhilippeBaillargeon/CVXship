@@ -1,27 +1,158 @@
 import numpy as np
 from typing import List
 import time
+import argparse
+import atexit
+import sys
 
 from lib.load_params import load_config
 from lib.models import FitRange, PropulsionModel, BaseWindModel, WindModel1D, WindModel2D, WindModelPathAligned2D, GeneratorModel, CalmWaterModel, save_obj, load_obj
-from lib.paths import WIND_MODEL_1D, WIND_MODEL_2D, WIND_MODEL_PATH_ALIGNED_2D, PROPULSION_MODEL, GENERATOR_MODEL, CALM_MODEL
 from lib.plotting import plot_solutions, plot_zones_and_points
 from lib.optimizers import DJPE_TSO, NaiveController, FR_TSO, ShortestPath, CJPE_TSO, FR_O, _generator_dispatch_data
 from lib.utils import point_in_zones, dx_dy_km, classify_timesteps, _assert_finite
 from lib.evaluation import compute_non_convex_cost_all_timesteps_nc_interpolated
 from lib.weather_interpolation import prepare_nc_interp_source
 from lib.debug_diagnostics import clear_debug_reports, print_debug_report
+from lib.experiment import (
+    Tee,
+    create_run_context,
+    load_case_cache_options,
+    load_case_output_options,
+    load_case_run_options,
+    mark_failed_if_running,
+    save_run_results,
+)
 
 new_weather = True
 new_ship = True
 dimensions = "both"  # "1D", "2D" or "both"
-solver_verbose = False
+solver_verbose = True
+unit_commitment = False
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(
+        description="Run a CVXship optimization case and store configs/results in a run folder."
+    )
+    parser.add_argument("--case", help="Case directory containing ship/map/itinerary/weather TOMLs.")
+    parser.add_argument("--name", help="Optional run name used in the result folder.")
+    parser.add_argument("--dimensions", choices=["1D", "2D", "both"], default=None)
+    parser.add_argument("--new-ship", dest="new_ship", action="store_true", default=None)
+    parser.add_argument("--reuse-ship", dest="new_ship", action="store_false")
+    parser.add_argument("--new-weather", dest="new_weather", action="store_true", default=None)
+    parser.add_argument("--reuse-weather", dest="new_weather", action="store_false")
+    parser.add_argument("--solver-verbose", dest="solver_verbose", action="store_true", default=None)
+    parser.add_argument("--quiet-solver", dest="solver_verbose", action="store_false")
+    parser.add_argument("--unit-commitment", dest="unit_commitment", action="store_true", default=None)
+    parser.add_argument("--no-unit-commitment", dest="unit_commitment", action="store_false")
+    parser.add_argument("--cache-scope", choices=["case", "run", "global"], default=None)
+    parser.add_argument("--no-save-plots", dest="save_plots", action="store_false", default=None)
+    parser.add_argument("--save-plots", dest="save_plots", action="store_true")
+    parser.add_argument("--no-save-solutions", dest="save_solutions", action="store_false", default=None)
+    parser.add_argument("--save-solutions", dest="save_solutions", action="store_true")
+    parser.add_argument("--no-console-log", dest="save_console_log", action="store_false", default=None)
+    parser.add_argument("--console-log", dest="save_console_log", action="store_true")
+    return parser.parse_args()
+
+
+def _option(cli_value, toml_options, key, default):
+    if cli_value is not None:
+        return cli_value
+    if key in toml_options:
+        return toml_options[key]
+    return default
+
+
+def _enable_console_log(path):
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    log_file = open(path, "w", encoding="utf-8", buffering=1)
+    sys.stdout = Tee(original_stdout, log_file)
+    sys.stderr = Tee(original_stderr, log_file)
+
+    def _restore():
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        log_file.close()
+
+    atexit.register(_restore)
 
 
 if __name__ == "__main__":
+    args = _parse_args()
+    run_toml_options = load_case_run_options(args.case)
+    output_toml_options = load_case_output_options(args.case)
+    cache_toml_options = load_case_cache_options(args.case)
+
+    new_weather = bool(_option(args.new_weather, run_toml_options, "new_weather", new_weather))
+    new_ship = bool(_option(args.new_ship, run_toml_options, "new_ship", new_ship))
+    dimensions = str(_option(args.dimensions, run_toml_options, "dimensions", dimensions))
+    if dimensions not in {"1D", "2D", "both"}:
+        raise ValueError("dimensions must be one of: 1D, 2D, both")
+    solver_verbose = bool(_option(args.solver_verbose, run_toml_options, "solver_verbose", solver_verbose))
+    unit_commitment = bool(_option(args.unit_commitment, run_toml_options, "unit_commitment", unit_commitment))
+    save_plots = bool(_option(args.save_plots, output_toml_options, "save_plots", True))
+    save_solutions = bool(_option(args.save_solutions, output_toml_options, "save_solutions", True))
+    save_console_log = bool(_option(args.save_console_log, output_toml_options, "save_console_log", True))
+    cache_scope = str(_option(args.cache_scope, cache_toml_options, "scope", "case"))
+
+    run_options = {
+        "case": args.case,
+        "name": args.name,
+        "dimensions": dimensions,
+        "new_ship": new_ship,
+        "new_weather": new_weather,
+        "solver_verbose": solver_verbose,
+        "unit_commitment": unit_commitment,
+        "save_plots": save_plots,
+        "save_solutions": save_solutions,
+        "save_console_log": save_console_log,
+        "cache_scope": cache_scope,
+    }
+    run_context = create_run_context(
+        case_dir=args.case,
+        run_name=args.name,
+        options=run_options,
+        cache_scope=cache_scope,
+    )
+    atexit.register(mark_failed_if_running, run_context)
+    if save_console_log:
+        _enable_console_log(run_context.console_log_path)
+
+    print(f"[RUN] id={run_context.run_id}")
+    print(f"[RUN] case={run_context.case_name}")
+    print(f"[RUN] results={run_context.run_dir}")
+    print(f"[RUN] cache={run_context.cache_dir}")
+
+    WIND_MODEL_1D = run_context.cache_path("wind_model_1d")
+    WIND_MODEL_2D = run_context.cache_path("wind_model_2d")
+    WIND_MODEL_PATH_ALIGNED_2D = run_context.cache_path("wind_model_path_aligned_2d")
+    PROPULSION_MODEL = run_context.cache_path("propulsion_model")
+    GENERATOR_MODEL = run_context.cache_path("generator_model")
+    CALM_MODEL = run_context.cache_path("calm_model")
+
+    def maybe_plot_solutions(*plot_args, **plot_kwargs):
+        if not save_plots:
+            return None
+        plot_kwargs["output_root"] = run_context.plots_dir
+        return plot_solutions(*plot_args, **plot_kwargs)
+
+    def maybe_plot_zones_and_points(*plot_args, **plot_kwargs):
+        if not save_plots:
+            return None
+        plot_kwargs["output_root"] = run_context.plots_dir
+        return plot_zones_and_points(*plot_args, **plot_kwargs)
+
     clear_debug_reports()
-    map, itinerary, states, ship, weather = load_config()
-    nc_sources = prepare_nc_interp_source(map, itinerary)
+    map, itinerary, states, ship, weather = load_config(
+        case_dir=run_context.case_dir,
+        weather_files=run_context.weather_files,
+    )
+    nc_sources = prepare_nc_interp_source(
+        map,
+        itinerary,
+        weather_files=run_context.weather_files,
+    )
     fit_range = FitRange.initial_from_ship(ship)
     _assert_finite("map.zone_ineq", map.zone_ineq)
     _assert_finite("map.zone_adj", map.zone_adj)
@@ -110,11 +241,15 @@ if __name__ == "__main__":
     if new_ship:
         start = time.time()
         calm_model = CalmWaterModel(ship=ship, fit_range=fit_range)
-        calm_model.plot_calm_water_models_ieee(
-            nb_points=200,
-            fit_if_needed=True,
-            show=False,
-        )
+        if save_plots:
+            calm_model.plot_calm_water_models_ieee(
+                nb_points=200,
+                fit_if_needed=True,
+                show=False,
+                output_root=run_context.plots_dir,
+            )
+        else:
+            calm_model.fit_convex_model(debug=False)
 
         propulsion_model = PropulsionModel(
             ship=ship,
@@ -128,9 +263,19 @@ if __name__ == "__main__":
         print("mean error power", fit_error_P_mean, "%")
         print("Ship model fit took:", time.time() - start, "seconds")
 
-        propulsion_model.plot_power_surface_speed_resistance()
-        propulsion_model.plot_power_error_heatmap()
-        propulsion_model.plot_feasibility_mask()
+        if save_plots:
+            propulsion_model.plot_power_surface_speed_resistance(
+                show=False,
+                directory=run_context.plots_dir,
+            )
+            propulsion_model.plot_power_error_heatmap(
+                show=False,
+                directory=run_context.plots_dir,
+            )
+            propulsion_model.plot_feasibility_mask(
+                show=False,
+                directory=run_context.plots_dir,
+            )
 
         save_obj(GENERATOR_MODEL, generatorModels)
         save_obj(CALM_MODEL, calm_model)
@@ -260,7 +405,7 @@ if __name__ == "__main__":
         "Naive Controller",
     )
 
-    plot_solutions(
+    maybe_plot_solutions(
         [naive_rule_sol, naive_nonconv_sol],
         ["Naive solution + rule-based EMS", "Naive solution + energy redispatch"],
         benchmark_label="Naive solution + rule-based EMS",
@@ -286,7 +431,7 @@ if __name__ == "__main__":
         )
 
         ok = optimizer.optimize(
-            unit_commitment     = False,
+            unit_commitment     = unit_commitment,
             debug               = True,
             restrict_to_base    = True,
             base_solution       = naive.sol,
@@ -343,7 +488,7 @@ if __name__ == "__main__":
 
                 if getattr(sol, "crossing_point", None) is not None:
                     dq = _point_to_polyline_min_dist(sol.crossing_point, wp)
-            plot_solutions([optimizer.sol, FR_STO_POW_sol],["Convex FR_TSO solution", "Non-convex FR_TSO + energy redispatch"], benchmark_label="Non-convex FR_TSO + energy redispatch", show=False, subfolder="FR_TSO", map=optimizer.map)
+            maybe_plot_solutions([optimizer.sol, FR_STO_POW_sol],["Convex FR_TSO solution", "Non-convex FR_TSO + energy redispatch"], benchmark_label="Non-convex FR_TSO + energy redispatch", show=False, subfolder="FR_TSO", map=optimizer.map)
         else:
             print("Optimization failed.")
 
@@ -373,6 +518,7 @@ if __name__ == "__main__":
         )
         FR_O_runner.nc_sources = nc_sources
         FR_O_runner.optimize(
+            unit_commitment=unit_commitment,
             debug=True,
             verbose=solver_verbose,
         )
@@ -386,7 +532,7 @@ if __name__ == "__main__":
         )
         if dimensions == "1D":
             print_debug_report()
-            plot_solutions(
+            maybe_plot_solutions(
                 [naive_rule_sol, naive_nonconv_sol, FR_O_rule_sol, FR_O_nonconv_sol_pow, FR_STO_rule_sol, FR_STO_POW_sol],
                 ["Naive + rule-based", "Naive + energy", "FR_O + rule-based", "FR_O + energy", "FR_TSO + rule-based", "FR_TSO + energy"],
                 benchmark_label="Naive + rule-based",
@@ -415,6 +561,7 @@ if __name__ == "__main__":
         x, y, _ = dx_dy_km(optimizer.map, optimizer.itinerary.transits[-1].lat, optimizer.itinerary.transits[-1].lon)
 
         optimizer.optimize(
+            unit_commitment=unit_commitment,
             debug=True,
             ordered_zones = True,
             min_timestep = True,
@@ -424,7 +571,7 @@ if __name__ == "__main__":
             base_zone_radius=1,
             verbose=solver_verbose,
         )
-        plot_zones_and_points(optimizer.sol.ship_pos, optimizer.map.zone_ineq)
+        maybe_plot_zones_and_points(optimizer.sol.ship_pos, optimizer.map.zone_ineq)
         _, DJPE_TSO_rule_sol, _, _ = evaluate_with_rule_based_power_management(
             optimizer,
             "DJPE_TSO",
@@ -433,11 +580,11 @@ if __name__ == "__main__":
             optimizer,
             "DJPE_TSO",
         )
-        plot_solutions([optimizer.sol, DJPE_TSO_POW_sol],["Convex Gloabal solution", "Non-convex DJPE_TSO + energy redispatch"], benchmark_label="Non-convex DJPE_TSO + energy redispatch", show=False, subfolder="DJPE_TSO Path", map=optimizer.map)
+        maybe_plot_solutions([optimizer.sol, DJPE_TSO_POW_sol],["Convex Gloabal solution", "Non-convex DJPE_TSO + energy redispatch"], benchmark_label="Non-convex DJPE_TSO + energy redispatch", show=False, subfolder="DJPE_TSO Path", map=optimizer.map)
 
         if dimensions == "2D":
             print_debug_report()
-            plot_solutions(
+            maybe_plot_solutions(
                 [naive_rule_sol, naive_nonconv_sol, DJPE_TSO_rule_sol, DJPE_TSO_POW_sol],
                 ["Naive + rule-based", "Naive + energy", "DJPE_TSO + rule-based", "DJPE_TSO + energy"],
                 benchmark_label="Naive + rule-based",
@@ -467,6 +614,7 @@ if __name__ == "__main__":
         x, y, _ = dx_dy_km(glob_cont_opt.map, glob_cont_opt.itinerary.transits[-1].lat, glob_cont_opt.itinerary.transits[-1].lon)
 
         glob_cont_opt.optimize(
+            unit_commitment=unit_commitment,
             debug=True,
             ordered_zones = True,
             min_timestep = True,
@@ -476,7 +624,7 @@ if __name__ == "__main__":
             base_zone_radius=1,
             verbose=solver_verbose,
         )
-        plot_zones_and_points(glob_cont_opt.sol.ship_pos, glob_cont_opt.map.zone_ineq)
+        maybe_plot_zones_and_points(glob_cont_opt.sol.ship_pos, glob_cont_opt.map.zone_ineq)
         _, CJTE_TSO_rule_sol, _, _ = evaluate_with_rule_based_power_management(
             glob_cont_opt,
             "CJPE_TSO",
@@ -495,9 +643,9 @@ if __name__ == "__main__":
             print(name)
             print("  optimizer:", np.asarray(glob_cont_opt.sol.__dict__[name]).shape)
             print("  evaluator:", np.asarray(CJTE_TSO_POW_sol.__dict__[name]).shape)
-        plot_solutions([glob_cont_opt.sol, CJTE_TSO_POW_sol],["Convex CJPE_TSO solution", "Non-convex CJPE_TSO + energy redispatch"], benchmark_label="Non-convex CJPE_TSO + energy redispatch", show=False, subfolder="CJPE_TSO Path", map=optimizer.map)
+        maybe_plot_solutions([glob_cont_opt.sol, CJTE_TSO_POW_sol],["Convex CJPE_TSO solution", "Non-convex CJPE_TSO + energy redispatch"], benchmark_label="Non-convex CJPE_TSO + energy redispatch", show=False, subfolder="CJPE_TSO Path", map=optimizer.map)
         print_debug_report()
-        plot_solutions(
+        maybe_plot_solutions(
             [
                 naive_rule_sol,
                 naive_nonconv_sol,
@@ -527,3 +675,23 @@ if __name__ == "__main__":
             subfolder="All sol compared",
             map=optimizer.map,
         )
+
+    solution_records = [
+        ("naive_rule", "Naive Controller + rule-based", locals().get("naive_rule_sol")),
+        ("naive_energy", "Naive Controller + energy", locals().get("naive_nonconv_sol")),
+        ("fr_o_rule", "FR_O + rule-based", locals().get("FR_O_rule_sol")),
+        ("fr_o_energy", "FR_O + energy", locals().get("FR_O_nonconv_sol_pow")),
+        ("fr_tso_rule", "FR_TSO + rule-based", locals().get("FR_STO_rule_sol")),
+        ("fr_tso_energy", "FR_TSO + energy", locals().get("FR_STO_POW_sol")),
+        ("djpe_tso_rule", "DJPE_TSO + rule-based", locals().get("DJPE_TSO_rule_sol")),
+        ("djpe_tso_energy", "DJPE_TSO + energy", locals().get("DJPE_TSO_POW_sol")),
+        ("cjpe_tso_rule", "CJPE_TSO + rule-based", locals().get("CJTE_TSO_rule_sol")),
+        ("cjpe_tso_energy", "CJPE_TSO + energy", locals().get("CJTE_TSO_POW_sol")),
+    ]
+    summary_rows = save_run_results(
+        run_context,
+        solution_records,
+        save_solutions=save_solutions,
+    )
+    print(f"[RUN] saved {len(summary_rows)} solution summaries")
+    print(f"[RUN] summary={run_context.run_dir / 'summary.csv'}")

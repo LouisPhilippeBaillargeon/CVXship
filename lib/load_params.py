@@ -4,9 +4,10 @@ from dataclasses import dataclass, field
 from typing import List
 import tomllib
 import math
+from pathlib import Path
 
 from lib.utils import build_variable_timestep_grid, dx_dy_km, point_in_zones
-from lib.paths import SHIP, MAP_TOML, ITINERARY, ZONE_INEQ, TRANSITION_INEQ, ADJ
+from lib.paths import SHIP, MAP_TOML, ITINERARY, ZONE_INEQ, TRANSITION_INEQ, ADJ, NAVIGABILITY_MAP
 from lib.weather import weather_from_nc_file
 
 #===================================================SHIP======================================================================================
@@ -15,7 +16,7 @@ class Propulsion:
     D               : float
     min_pitch       : float
     max_pitch       : float
-    AE_AO           : float 
+    AE_AO           : float
     nb_blades       : int
     nb_propellers   : int
     max_n           : float
@@ -71,6 +72,8 @@ class Generator:
     min_power       : float
     max_power       : float
     iddle_fuel      : float
+    startup_cost    : float = 0.0
+    shutdown_cost   : float = 0.0
 
 @dataclass
 class Battery:
@@ -107,8 +110,20 @@ class Ship:
     battery         : Battery
     solarPannels    : SolarPannels
 
-def load_ship() -> Ship:
-    with open(SHIP, "rb") as f:
+def _case_file(case_dir, filename, default_path):
+    if case_dir is None:
+        return Path(default_path)
+    return Path(case_dir).resolve() / filename
+
+
+def _case_map_file(case_dir, filename, default_path):
+    if case_dir is None:
+        return Path(default_path)
+    return Path(case_dir).resolve() / "map" / filename
+
+
+def load_ship(case_dir=None) -> Ship:
+    with open(_case_file(case_dir, "ship.toml", SHIP), "rb") as f:
         data = tomllib.load(f)
 
     propulsion = Propulsion(**data["propulsion"])
@@ -123,7 +138,14 @@ def load_ship() -> Ship:
         # Ensure we get proper lists of floats
         power_mw = [float(x) for x in g["power"]]
         eff = [float(x) for x in g["eff"]]
-        iddle_fuel = g["iddle_fuel"]
+        iddle_fuel = float(g["iddle_fuel"])
+        startup_cost = float(g.get("startup_cost", 0.0))
+        shutdown_cost = float(g.get("shutdown_cost", 0.0))
+
+        if startup_cost < 0 or shutdown_cost < 0:
+            raise ValueError(
+                f"Generator {g['name']!r} startup_cost and shutdown_cost must be nonnegative."
+            )
 
         generators.append(
             Generator(
@@ -133,6 +155,8 @@ def load_ship() -> Ship:
                 max_power = np.max(power_mw),
                 eff=eff,
                 iddle_fuel = iddle_fuel,
+                startup_cost = startup_cost,
+                shutdown_cost = shutdown_cost,
             )
         )
 
@@ -149,7 +173,7 @@ def load_ship() -> Ship:
 #=======================================================MAP======================================================================================
 @dataclass
 class MapInfo:
-    sw_lat          : float # Lattitude of the South West reference point 
+    sw_lat          : float # Lattitude of the South West reference point
     sw_lon          : float # Longitude of the South West reference point
     span_km_east    : float # Eastward map size (km)
     span_km_north   : float # Northward map size (km)
@@ -164,12 +188,13 @@ class Map:
     zone_adj        : np.ndarray
     nb_zones        : float
     speed_limit_bands: List[dict] = field(default_factory=list)
+    navigability_map_path: Path | None = None
     zone_centroids  : np.ndarray = field(init=False)
 
 def _compute_zone_centroids(info: MapInfo, zone_ineq: np.ndarray) -> np.ndarray:
     """
     Compute a simple centroid (in km) for each convex zone defined by zone_ineq.
-    
+
     We sample a regular grid over the map in km, assign grid points to zones
     using the inequalities, and take the mean (x, y) of the points in each zone.
     """
@@ -287,19 +312,19 @@ def _load_speed_limit_bands(data, nb_zones: int) -> List[dict]:
     return bands
 
 
-def load_map() -> Map:
-    with open(MAP_TOML, "rb") as f:
+def load_map(case_dir=None) -> Map:
+    with open(_case_file(case_dir, "map.toml", MAP_TOML), "rb") as f:
         toml_data = tomllib.load(f)
 
     info = MapInfo(**toml_data["params"])
 
-    zone_data = np.load(ZONE_INEQ)
+    zone_data = np.load(_case_map_file(case_dir, "zones_ineq.npz", ZONE_INEQ))
     zone_ineq = zone_data["lambda_array"]
     nb_zones = zone_ineq.shape[2]
 
-    zone_adj = np.load(ADJ)
+    zone_adj = np.load(_case_map_file(case_dir, "zones_adj.npy", ADJ))
 
-    trans_data = np.load(TRANSITION_INEQ)
+    trans_data = np.load(_case_map_file(case_dir, "transition_ineq.npz", TRANSITION_INEQ))
     trans_from = np.nan_to_num(trans_data["transition_ineqs_from"], nan=0.0)
     trans_to = np.nan_to_num(trans_data["transition_ineqs_to"], nan=0.0)
     speed_limit_bands = _load_speed_limit_bands(toml_data, nb_zones)
@@ -312,6 +337,7 @@ def load_map() -> Map:
         zone_adj=zone_adj,
         nb_zones=nb_zones,
         speed_limit_bands=speed_limit_bands,
+        navigability_map_path=_case_map_file(case_dir, "navigability_map.npy", NAVIGABILITY_MAP),
     )
     m.zone_centroids = _compute_zone_centroids(m.info, m.zone_ineq)
     return m
@@ -418,8 +444,8 @@ def _compute_auxiliary_power_profile(itinerary):
     return profile
 
 
-def load_itinerary(map) -> Itinerary:
-    with open(ITINERARY, "rb") as f:
+def load_itinerary(map, case_dir=None) -> Itinerary:
+    with open(_case_file(case_dir, "itinerary.toml", ITINERARY), "rb") as f:
         data = tomllib.load(f)
     params = data.get("params", {})
     soc_i=params["soc_i"]
@@ -509,12 +535,10 @@ def load_states(map, itinerary) -> States:
     )
 
 #===================================================ALL======================================================================================
-def load_config(): 
-    map = load_map()
-    itinerary = load_itinerary(map)
+def load_config(case_dir=None, weather_files=None):
+    map = load_map(case_dir=case_dir)
+    itinerary = load_itinerary(map, case_dir=case_dir)
     states = load_states(map, itinerary)
-    ship = load_ship()
-    weather = weather_from_nc_file(map, itinerary)
+    ship = load_ship(case_dir=case_dir)
+    weather = weather_from_nc_file(map, itinerary, weather_files=weather_files)
     return map, itinerary, states, ship, weather
-
-

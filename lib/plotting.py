@@ -123,11 +123,12 @@ def _zone_polygons_from_ineq(zone_ineq, eps_poly=1e-9):
 
 
 def _draw_feasibility_map(ax, map_obj, alpha=0.35):
-    if not os.path.exists(NAVIGABILITY_MAP):
-        print(f"[WARN] NAVIGABILITY_MAP not found: {NAVIGABILITY_MAP}")
+    navigability_map = getattr(map_obj, "navigability_map_path", NAVIGABILITY_MAP)
+    if not os.path.exists(navigability_map):
+        print(f"[WARN] NAVIGABILITY_MAP not found: {navigability_map}")
         return False
 
-    nav = np.load(NAVIGABILITY_MAP)
+    nav = np.load(navigability_map)
 
     ax.imshow(
         nav,
@@ -539,7 +540,8 @@ def _print_cost_summary_vs_benchmark(solutions, labels, benchmark_label):
     )
 
     for label, sol in zip(labels, solutions):
-        gen_cost = _generator_time_weighted_sum(sol, sol.gen_costs)
+        transition_cost = float(getattr(sol, "generator_transition_cost", 0.0) or 0.0)
+        gen_cost = _generator_time_weighted_sum(sol, sol.gen_costs) + transition_cost
         shore_cost = _time_weighted_sum(sol, sol.shore_power_cost)
         prop_energy = _time_weighted_sum(sol, sol.prop_power)
         final_soc = float(np.asarray(sol.SOC, dtype=float).reshape(-1)[-1])
@@ -564,6 +566,7 @@ def plot_solutions(
     show=False,
     subfolder=None,
     map=None,
+    output_root=None,
 ):
 
     if labels is None:
@@ -572,9 +575,9 @@ def plot_solutions(
     if len(labels) != len(solutions):
         raise ValueError("labels must have the same length as solutions.")
 
-    directory = PLOTS
+    directory = output_root if output_root is not None else PLOTS
     if subfolder is not None:
-        directory = os.path.join(PLOTS, subfolder)
+        directory = os.path.join(directory, subfolder)
     os.makedirs(directory, exist_ok=True)
 
     T = max(int(sol.T_future) for sol in solutions)
@@ -825,6 +828,7 @@ def plot_solutions(
 def load_solutions_from_pkl(
     filenames: List[str],
     subfolder: str | None = None,
+    output_root=None,
 ) -> List[Any]:
     """
     Load a list of solution objects from pickle files.
@@ -843,7 +847,8 @@ def load_solutions_from_pkl(
     """
 
     # Resolve directory (same logic as in plot_solutions)
-    base_dir = os.path.join(PLOTS, subfolder) if subfolder else PLOTS
+    root = output_root if output_root is not None else PLOTS
+    base_dir = os.path.join(root, subfolder) if subfolder else root
 
     solutions = []
 
@@ -861,7 +866,7 @@ def load_solutions_from_pkl(
     print(f"Loaded {len(solutions)} solution(s) from: {base_dir}")
     return solutions
 
-def plot_weather_snapshot(map, weather, variable="current_x", t_index=0, show: bool = False):
+def plot_weather_snapshot(map, weather, variable="current_x", t_index=0, show: bool = False, output_root=None):
     """
     Quick 2D visualization of a weather variable at a given timestep.
 
@@ -894,7 +899,8 @@ def plot_weather_snapshot(map, weather, variable="current_x", t_index=0, show: b
         title=f"Weather snapshot: {variable} (t={t_index})",
     )
 
-    _save_and_maybe_show(fig, f"weather_snapshot_{variable}_t{t_index}", show, font_scale = 2.0)
+    directory = output_root if output_root is not None else PLOTS
+    _save_and_maybe_show(fig, f"weather_snapshot_{variable}_t{t_index}", show, directory=directory, font_scale = 2.0)
 
 def plot_zones_and_points(
     ship_pos: np.ndarray,
@@ -903,6 +909,7 @@ def plot_zones_and_points(
     eps_poly: float = 1e-9,
     name: str = "zones_and_trajectory",
     show: bool = False,
+    output_root=None,
 ):
     ship_pos = np.asarray(ship_pos, dtype=float)
 
@@ -988,5 +995,6 @@ def plot_zones_and_points(
     ax.set_title("Zones (filled) and ship trajectory")
     ax.legend()
 
-    _save_and_maybe_show(fig, name, show,font_scale = 2.0)
+    directory = output_root if output_root is not None else PLOTS
+    _save_and_maybe_show(fig, name, show, directory=directory, font_scale = 2.0)
     return in_zone

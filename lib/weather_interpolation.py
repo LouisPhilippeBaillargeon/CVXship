@@ -4,8 +4,9 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 from pyproj import Geod
+from pathlib import Path
 
-from lib.paths import CURRENTS, WAVES, ATMO, SUN
+from lib.paths import CURRENTS, ATMO, SUN
 
 
 _GEOD = Geod(ellps="WGS84")
@@ -47,7 +48,20 @@ def _grid_radius_deg(ds):
     return 1.05 * max(_spacing(lat), _spacing(lon))
 
 
-def prepare_nc_interp_source(map_obj, itinerary):
+def _resolve_weather_files(weather_files=None):
+    files = {
+        "currents": Path(CURRENTS),
+        "atmo": Path(ATMO),
+        "sun": Path(SUN),
+    }
+    if weather_files is not None:
+        for key, path in weather_files.items():
+            files[key] = Path(path)
+    return files
+
+
+def prepare_nc_interp_source(map_obj, itinerary, weather_files=None):
+    files = _resolve_weather_files(weather_files)
     t_start = itinerary.transits[0].arrival_datetime
     t_end = itinerary.transits[-1].departure_datetime
 
@@ -76,10 +90,9 @@ def prepare_nc_interp_source(map_obj, itinerary):
             ds.close()
 
     sources = {
-        "currents": {"ds": _open_loaded(CURRENTS, "time", surface_current=True), "time_name": "time"},
-        "atmo": {"ds": _open_loaded(ATMO, "valid_time"), "time_name": "valid_time"},
-        "waves": {"ds": _open_loaded(WAVES, "valid_time"), "time_name": "valid_time"},
-        "sun": {"ds": _open_loaded(SUN, "valid_time"), "time_name": "valid_time"},
+        "currents": {"ds": _open_loaded(files["currents"], "time", surface_current=True), "time_name": "time"},
+        "atmo": {"ds": _open_loaded(files["atmo"], "valid_time"), "time_name": "valid_time"},
+        "sun": {"ds": _open_loaded(files["sun"], "valid_time"), "time_name": "valid_time"},
     }
 
     for src in sources.values():
@@ -181,7 +194,6 @@ def interpolated_weather_at(sources, map_obj, pos_xy_km, query_time):
 
     cur = sources["currents"]
     atm = sources["atmo"]
-    wav = sources["waves"]
     sun = sources["sun"]
 
     current_x = interp_nc_value(cur, "uo", query_time, lat, lon)
@@ -189,21 +201,11 @@ def interpolated_weather_at(sources, map_obj, pos_xy_km, query_time):
     wind_x = interp_nc_value(atm, "u10", query_time, lat, lon)
     wind_y = interp_nc_value(atm, "v10", query_time, lat, lon)
 
-    amp = interp_nc_value(wav, "swh", query_time, lat, lon)
-    mwp = interp_nc_value(wav, "mwp", query_time, lat, lon)
-    mwd = interp_nc_value(wav, "mwd", query_time, lat, lon, circular=True, period=360.0)
-
-    freq = (2.0 * np.pi) / max(mwp, 1e-9)
-    wl = 9.81 * mwp**2
     irradiance = interp_nc_value(sun, "ssrd", query_time, lat, lon) / (1_000_000.0 * 3600.0)
 
     return {
         "current": np.array([current_x, current_y], dtype=float),
         "wind": np.array([wind_x, wind_y], dtype=float),
-        "wave_amp": float(amp),
-        "wave_freq": float(freq),
-        "wave_len": float(wl),
-        "wave_dir": float(mwd),
         "irradiance": float(irradiance),
         "lat": float(lat),
         "lon": float(lon),

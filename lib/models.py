@@ -279,6 +279,7 @@ class CalmWaterModel:
         fit_if_needed: bool = True,
         show: bool = False,
         subfolder: str | None = None,
+        output_root: str | None = None,
     ):
         """
         Generate IEEE-style diagnostic plots for calm-water resistance models.
@@ -317,7 +318,8 @@ class CalmWaterModel:
         # ---------------------------------
         # Plot directory
         # ---------------------------------
-        plot_dir = os.path.join(PLOTS, subfolder) if subfolder else PLOTS
+        root = output_root if output_root is not None else PLOTS
+        plot_dir = os.path.join(root, subfolder) if subfolder else root
         os.makedirs(plot_dir, exist_ok=True)
 
         # ---------------------------------
@@ -1241,8 +1243,6 @@ class PropulsionModel:
     ):
         #Compute feasibility constraints to exclude infeasible speed thrust combinations
         self.fit_feasibility_boundary(debug=debug)
-        print("constraint_params shape:", self.constraint_params.shape)
-        print(self.constraint_params)
 
         #Only include points in the power limits in the fit
         min_pow = max(self.ship.propulsion.min_pow, self.fit_range.min_prop_power/self.ship.propulsion.nb_propellers)
@@ -1323,7 +1323,7 @@ class PropulsionModel:
     #=======================================Plots===================================================
     from matplotlib.patches import Patch
 
-    def plot_power_surface_speed_resistance(self):
+    def plot_power_surface_speed_resistance(self, show: bool = False, directory=None):
         """
         Plot REAL and FITTED power as separate 2D heatmaps.
         Figure size automatically adapts to large labels/titles.
@@ -1348,10 +1348,7 @@ class PropulsionModel:
         for title, Z in plots:
 
             # Bigger adaptive figure
-            fig, ax = plt.subplots(
-                figsize=(14, 10),
-                constrained_layout=True   # <-- key fix
-            )
+            fig, ax = plt.subplots(figsize=(14, 10))
 
             heat = ax.imshow(
                 Z,
@@ -1403,19 +1400,18 @@ class PropulsionModel:
                 labelsize=20
             )
 
-            plt.show()
+            filename = title.lower().replace(" ", "_").replace("-", "_")
+            _save_and_maybe_show(fig, filename, show, directory=directory or PLOTS)
 
-    def plot_power_error_heatmap(self):
+    def plot_power_error_heatmap(self, show: bool = False, directory=None):
         """
         Show a 2D heatmap of error P_fit - P_real.
         """
-        import matplotlib.pyplot as plt
-
         error = (self.P_fit - self.P_real) * self.mask_fit
 
-        plt.figure(figsize=(10, 6))
+        fig, ax = plt.subplots(figsize=(10, 6))
 
-        heat = plt.imshow(
+        heat = ax.imshow(
             error,
             extent=[self.min_thrust, self.max_thrust, self.min_ua, self.max_ua],
             origin='lower',
@@ -1423,19 +1419,18 @@ class PropulsionModel:
             cmap="inferno"
         )
 
-        cbar = plt.colorbar(heat)
+        cbar = fig.colorbar(heat, ax=ax)
         cbar.set_label("error [MW]", fontsize=30)
         cbar.ax.tick_params(labelsize=14)
 
-        plt.xlabel("Resistance [MN]", fontsize=30)
-        plt.ylabel("Advance speed [m/s]", fontsize=30)
-        plt.title("Power Fit Error Heatmap", fontsize=30)
+        ax.set_xlabel("Resistance [MN]", fontsize=30)
+        ax.set_ylabel("Advance speed [m/s]", fontsize=30)
+        ax.set_title("Power Fit Error Heatmap", fontsize=30)
 
-        plt.xticks(fontsize=20)
-        plt.yticks(fontsize=20)
+        ax.tick_params(axis='both', labelsize=20)
 
-        plt.tight_layout()  # <-- key fix
-        plt.show()
+        fig.tight_layout()
+        _save_and_maybe_show(fig, "power_fit_error_heatmap", show, directory=directory or PLOTS)
 
     def _require_fit_data(self):
         if self.mask_fit is None or self.ua_vals is None or self.thrust_vals is None:
@@ -1486,7 +1481,7 @@ class PropulsionModel:
     # ------------------------
     # 1) Feasibility mask + boundary
     # ------------------------
-    def plot_feasibility_mask(self, show_boundary: bool = True):
+    def plot_feasibility_mask(self, show_boundary: bool = True, show: bool = False, directory=None):
         """
         Visualize the stored feasibility mask over (speed, thrust).
         Optionally overlays the fitted boundary from constraint_params.
@@ -1496,18 +1491,18 @@ class PropulsionModel:
 
         Th, S, mask, ua_vals, thrust_vals = self._mesh()
 
-        plt.figure()
+        fig, ax = plt.subplots()
         # show mask as image: x=thrust, y=speed
-        plt.imshow(
+        im = ax.imshow(
             mask.astype(int),
             origin="lower",
             aspect="auto",
             extent=[thrust_vals[0], thrust_vals[-1], ua_vals[0], ua_vals[-1]],
         )
-        plt.xlabel("Thrust (MN)")
-        plt.ylabel("Advance speed ua (m/s)")
-        plt.title("Feasibility mask (1 = feasible)")
-        plt.colorbar(label="feasible")
+        ax.set_xlabel("Thrust (MN)")
+        ax.set_ylabel("Advance speed ua (m/s)")
+        ax.set_title("Feasibility mask (1 = feasible)")
+        fig.colorbar(im, ax=ax, label="feasible")
 
         if show_boundary:
             if self.constraint_params is None or len(self.constraint_params) < 2:
@@ -1522,11 +1517,11 @@ class PropulsionModel:
                 s_line = np.linspace(ua_vals[0], ua_vals[-1], self.grid_granularity*2)
                 thrust_line = -(a * s_line + b)
 
-                plt.plot(thrust_line, s_line, linewidth=2, label="fitted boundary")
-                plt.legend()
+                ax.plot(thrust_line, s_line, linewidth=2, label="fitted boundary")
+                ax.legend()
 
-        plt.tight_layout()
-        plt.show()
+        fig.tight_layout()
+        _save_and_maybe_show(fig, "propulsion_feasibility_mask", show, directory=directory or PLOTS)
 
     # ------------------------
     # 2) Fitted power surface (feasible only)
