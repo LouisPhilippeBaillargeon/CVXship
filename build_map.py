@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import tomllib
+import sys
 from pathlib import Path
 
 from lib.load_params import MapInfo, load_ship
@@ -9,14 +10,31 @@ from lib.map_builder import MapBuilder
 from lib.paths import CONFIG
 
 
-def _parse_args():
+def _normalize_argv(argv: list[str]) -> list[str]:
+    normalized = []
+    for arg in argv:
+        if arg.startswith(("--cases\\", "--cases/")):
+            normalized.append("cases" + arg[len("--cases"):])
+        else:
+            normalized.append(arg)
+    return normalized
+
+
+def _parse_args(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
         description="Build or edit map artifacts for a CVXship case."
     )
     parser.add_argument(
-        "--case",
+        "case_path",
+        nargs="?",
         type=Path,
-        default=CONFIG,
+        help="Case directory. Equivalent to --case.",
+    )
+    parser.add_argument(
+        "--case",
+        "--cases",
+        dest="case",
+        type=Path,
         help="Case directory containing map.toml and ship.toml. Defaults to cases/baseline.",
     )
     parser.add_argument(
@@ -34,7 +52,12 @@ def _parse_args():
         action="store_true",
         help="Open the zone editor without importing existing corners.csv/zones.csv.",
     )
-    return parser.parse_args()
+    args = parser.parse_args(_normalize_argv(sys.argv[1:] if argv is None else argv))
+    if args.case is not None and args.case_path is not None:
+        parser.error("provide the case directory either positionally or with --case, not both")
+    args.case = args.case or args.case_path or CONFIG
+    del args.case_path
+    return args
 
 
 def main():
@@ -67,7 +90,7 @@ def main():
     print(f"[MAP] artifacts={map_dir}")
 
     builder.fetch_or_load_depth(force=args.force_depth)
-    builder.build_or_load_navigability(force=args.force_nav)
+    builder.build_or_load_navigability(force=args.force_nav or builder.depth_rebuilt)
     builder.launch_zone_editor(import_existing=not args.no_import_existing)
 
 

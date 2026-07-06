@@ -1,12 +1,16 @@
 # lib/map_builder.py
 from __future__ import annotations
 from dataclasses import dataclass, field
+import json
 from pathlib import Path
 from typing import Optional
 import numpy as np
 import pandas as pd
 import requests
 from pyproj import CRS, Transformer
+from rasterio.io import MemoryFile
+from rasterio.transform import from_origin
+from rasterio.warp import Resampling, reproject
 
 import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon as PatchPolygon
@@ -107,6 +111,58 @@ def validate_zero_based_zone_tables(corners_df: pd.DataFrame, zones_df: pd.DataF
         orders = sorted(group["order"].astype(int).tolist())
         if orders != [0, 1, 2, 3]:
             raise ValueError(f"Zone {zid} must have orders [0,1,2,3]. Got {orders}")
+
+
+def normalize_zero_based_zone_tables(
+    corners_df: pd.DataFrame,
+    zones_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    required_c = {"corner_id", "x", "y"}
+    required_z = {"zone_id", "order", "corner_id"}
+
+    if not required_c.issubset(corners_df.columns):
+        raise ValueError(f"corners_df missing columns: {required_c - set(corners_df.columns)}")
+    if not required_z.issubset(zones_df.columns):
+        raise ValueError(f"zones_df missing columns: {required_z - set(zones_df.columns)}")
+
+    df_corners = corners_df.copy()
+    df_zones = zones_df.copy()
+
+    df_corners["corner_id"] = df_corners["corner_id"].astype(int)
+    df_zones[["zone_id", "order", "corner_id"]] = df_zones[
+        ["zone_id", "order", "corner_id"]
+    ].astype(int)
+
+    if df_zones.empty:
+        return (
+            df_corners.iloc[0:0][["corner_id", "x", "y"]].copy(),
+            df_zones[["zone_id", "order", "corner_id"]].copy(),
+        )
+
+    corners_by_id = df_corners.drop_duplicates("corner_id", keep="first").set_index("corner_id")
+    referenced_corner_ids = sorted(df_zones["corner_id"].unique())
+    missing = [cid for cid in referenced_corner_ids if cid not in corners_by_id.index]
+    if missing:
+        raise ValueError(f"zones_df references missing corner_id values: {missing}")
+
+    zone_id_map = {
+        old_id: new_id
+        for new_id, old_id in enumerate(sorted(df_zones["zone_id"].unique()))
+    }
+    corner_id_map = {
+        old_id: new_id
+        for new_id, old_id in enumerate(referenced_corner_ids)
+    }
+
+    normalized_corners = corners_by_id.loc[referenced_corner_ids, ["x", "y"]].reset_index(drop=True)
+    normalized_corners.insert(0, "corner_id", range(len(normalized_corners)))
+
+    normalized_zones = df_zones[["zone_id", "order", "corner_id"]].copy()
+    normalized_zones["zone_id"] = normalized_zones["zone_id"].map(zone_id_map).astype(int)
+    normalized_zones["corner_id"] = normalized_zones["corner_id"].map(corner_id_map).astype(int)
+    normalized_zones = normalized_zones.sort_values(["zone_id", "order"], ignore_index=True)
+
+    return normalized_corners, normalized_zones
 
 
 def get_zone_ccw_corner_ids(zid: int, zones_df: pd.DataFrame, corners_df: pd.DataFrame):
@@ -497,6 +553,7 @@ class ZoneEditor:
         df_corners = pd.read_csv(corners_path)
         df_zones = pd.read_csv(zones_path)
 
+        df_corners, df_zones = normalize_zero_based_zone_tables(df_corners, df_zones)
         validate_zero_based_zone_tables(df_corners, df_zones)
 
         self._clear_all()
@@ -675,9 +732,53 @@ class ZoneEditor:
 
         return df_corners, df_zones
 
+    def _compact_ids(self):
+        zone_id_map = {
+            z.id: new_id
+            for new_id, z in enumerate(sorted(self.zones, key=lambda zone: zone.id))
+        }
+
+        for z in self.zones:
+            z.id = zone_id_map[z.id]
+
+        used_corners = []
+        seen = set()
+        for z in sorted(self.zones, key=lambda zone: zone.id):
+            for c in sorted(z.corners, key=lambda corner: corner.id):
+                if id(c) not in seen:
+                    used_corners.append(c)
+                    seen.add(id(c))
+
+        used_set = {id(c) for c in used_corners}
+        for c in list(self.corners):
+            if id(c) not in used_set:
+                try:
+                    c.artist.remove()
+                except Exception:
+                    pass
+
+        corner_id_map = {
+            c.id: new_id
+            for new_id, c in enumerate(sorted(used_corners, key=lambda corner: corner.id))
+        }
+
+        for c in used_corners:
+            c.id = corner_id_map[c.id]
+            c.zones.clear()
+
+        for z in self.zones:
+            for c in z.corners:
+                c.zones.add(z.id)
+
+        self.corners = sorted(used_corners, key=lambda corner: corner.id)
+        Zone._next_id = len(self.zones)
+        Corner._next_id = len(self.corners)
+
     def on_save(self, event):
         try:
+            self._compact_ids()
             df_corners, df_zones = self._to_dataframes()
+            df_corners, df_zones = normalize_zero_based_zone_tables(df_corners, df_zones)
             validate_zero_based_zone_tables(df_corners, df_zones)
 
             self.corners_path.parent.mkdir(parents=True, exist_ok=True)
@@ -836,17 +937,24 @@ class MapBuilder:
     transition_ineq_to: Optional[np.ndarray] = None
 
     depth_grid_path: Path = field(init=False)
+    depth_metadata_path: Path = field(init=False)
     navigability_map_path: Path = field(init=False)
+    navigability_metadata_path: Path = field(init=False)
+    map_params_path: Path = field(init=False)
     corners_path: Path = field(init=False)
     zones_path: Path = field(init=False)
     zone_ineq_path: Path = field(init=False)
     transition_ineq_path: Path = field(init=False)
     adj_path: Path = field(init=False)
+    depth_rebuilt: bool = field(default=False, init=False)
 
     def __post_init__(self):
         if self.map_dir is None:
             self.depth_grid_path = Path(DEPTH_GRID)
+            self.depth_metadata_path = self.depth_grid_path.with_suffix(".meta.json")
             self.navigability_map_path = Path(NAVIGABILITY_MAP)
+            self.navigability_metadata_path = self.navigability_map_path.with_suffix(".meta.json")
+            self.map_params_path = self.depth_grid_path.parent / "map_params.csv"
             self.corners_path = Path(CORNERS)
             self.zones_path = Path(ZONES)
             self.zone_ineq_path = Path(ZONE_INEQ)
@@ -857,20 +965,105 @@ class MapBuilder:
         map_dir = Path(self.map_dir).resolve()
         self.map_dir = map_dir
         self.depth_grid_path = map_dir / "depth_grid.csv"
+        self.depth_metadata_path = map_dir / "depth_grid.meta.json"
         self.navigability_map_path = map_dir / "navigability_map.npy"
+        self.navigability_metadata_path = map_dir / "navigability_map.meta.json"
+        self.map_params_path = map_dir / "map_params.csv"
         self.corners_path = map_dir / "corners.csv"
         self.zones_path = map_dir / "zones.csv"
         self.zone_ineq_path = map_dir / "zones_ineq.npz"
         self.transition_ineq_path = map_dir / "transition_ineq.npz"
         self.adj_path = map_dir / "zones_adj.npy"
 
+    def _map_params_metadata(self) -> dict:
+        return {
+            "sw_lat": float(self.map_info.sw_lat),
+            "sw_lon": float(self.map_info.sw_lon),
+            "span_km_east": float(self.map_info.span_km_east),
+            "span_km_north": float(self.map_info.span_km_north),
+            "resolution_km": float(self.map_info.resolution_km),
+        }
+
+    @staticmethod
+    def _metadata_matches(actual: dict, expected: dict) -> bool:
+        return actual == expected
+
+    @staticmethod
+    def _read_json(path: Path) -> Optional[dict]:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return None
+
+    @staticmethod
+    def _write_json(path: Path, data: dict):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.write("\n")
+
+    def _depth_metadata(self, gmrt_layer: str) -> dict:
+        return {
+            "artifact": "depth_grid.csv",
+            "version": 1,
+            "gmrt_layer": gmrt_layer,
+            "map_params": self._map_params_metadata(),
+        }
+
+    def _legacy_map_params_match(self) -> bool:
+        if not self.map_params_path.exists():
+            return False
+        try:
+            df = pd.read_csv(self.map_params_path)
+        except Exception:
+            return False
+        if len(df) != 1:
+            return False
+        expected = self._map_params_metadata()
+        for key, value in expected.items():
+            if key not in df.columns or not np.isclose(float(df.loc[0, key]), value):
+                return False
+        return True
+
+    def _depth_cache_current(self, gmrt_layer: str) -> bool:
+        metadata = self._read_json(self.depth_metadata_path)
+        if metadata is not None:
+            return self._metadata_matches(metadata, self._depth_metadata(gmrt_layer))
+        return self._legacy_map_params_match()
+
+    def _write_depth_metadata(self, gmrt_layer: str):
+        self._write_json(self.depth_metadata_path, self._depth_metadata(gmrt_layer))
+        pd.DataFrame([self._map_params_metadata()]).to_csv(self.map_params_path, index=False)
+
+    def _navigability_metadata(self) -> dict:
+        return {
+            "artifact": "navigability_map.npy",
+            "version": 1,
+            "map_params": self._map_params_metadata(),
+            "min_depth": float(self.ship.info.min_depth),
+        }
+
+    def _navigability_cache_current(self) -> bool:
+        metadata = self._read_json(self.navigability_metadata_path)
+        return metadata is not None and self._metadata_matches(
+            metadata,
+            self._navigability_metadata(),
+        )
+
+    def _write_navigability_metadata(self):
+        self._write_json(self.navigability_metadata_path, self._navigability_metadata())
+
     def fetch_or_load_depth(self, force: bool = False, gmrt_layer: str = "topo") -> pd.DataFrame:
         out_path = self.depth_grid_path
+        self.depth_rebuilt = False
 
-        if out_path.exists() and not force:
+        if out_path.exists() and not force and self._depth_cache_current(gmrt_layer):
             self.depth_df = pd.read_csv(out_path)
             _, _, self.depth_grid = grid_from_depth_df(self.depth_df)
             return self.depth_df
+        if out_path.exists() and not force:
+            print("[MAP] depth cache does not match map.toml; rebuilding depth_grid.csv")
 
         ref_lat_sw = float(self.map_info.sw_lat)
         ref_lon_sw = float(self.map_info.sw_lon)
@@ -963,9 +1156,11 @@ class MapBuilder:
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(out_path, index=False)
+        self._write_depth_metadata(gmrt_layer)
 
         self.depth_df = df
         _, _, self.depth_grid = grid_from_depth_df(df)
+        self.depth_rebuilt = True
 
         print(f"Saved depth grid to {out_path}")
         print(f"Grid shape: ny={ny}, nx={nx}, resolution={dx_km} km")
@@ -976,9 +1171,11 @@ class MapBuilder:
     def build_or_load_navigability(self, force: bool = False) -> np.ndarray:
         out_path = self.navigability_map_path
 
-        if out_path.exists() and not force:
+        if out_path.exists() and not force and self._navigability_cache_current():
             self.navigability_map = np.load(out_path)
             return self.navigability_map
+        if out_path.exists() and not force:
+            print("[MAP] navigability cache does not match map/ship settings; rebuilding navigability_map.npy")
 
         if self.depth_df is None:
             self.fetch_or_load_depth(force=False)
@@ -993,6 +1190,7 @@ class MapBuilder:
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
         np.save(out_path, nav)
+        self._write_navigability_metadata()
 
         self.depth_grid = Z
         self.navigability_map = nav
@@ -1014,6 +1212,7 @@ class MapBuilder:
         df_corners = df_corners.copy()
         df_zones = df_zones.copy()
 
+        df_corners, df_zones = normalize_zero_based_zone_tables(df_corners, df_zones)
         validate_zero_based_zone_tables(df_corners, df_zones)
 
         lambda_array = compute_lambda_array_zero_based(df_corners, df_zones, normalize=normalize)

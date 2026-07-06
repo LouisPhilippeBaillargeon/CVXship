@@ -18,6 +18,26 @@ class Weather:
     current_x           : np.ndarray    # [nb_zones, nb_timesteps] Eastward current speed      (m/s)
     current_y           : np.ndarray    # [nb_zones, nb_timesteps] Northward current speed     (m/s)
 
+
+def _nearest_finite_values_by_time(var_latlon: np.ndarray, dist2: np.ndarray) -> np.ndarray:
+    """
+    Return the nearest finite grid value to a query point for each timestep.
+    """
+    flat_values = var_latlon.reshape(var_latlon.shape[0], -1)
+    flat_dist2 = dist2.reshape(-1)
+    out = np.full(var_latlon.shape[0], np.nan, dtype=float)
+
+    for t in range(var_latlon.shape[0]):
+        finite = np.isfinite(flat_values[t, :])
+        if not np.any(finite):
+            continue
+        finite_flat_idx = np.flatnonzero(finite)
+        nearest_idx = finite_flat_idx[np.argmin(flat_dist2[finite])]
+        out[t] = flat_values[t, nearest_idx]
+
+    return out
+
+
 def latlon_to_zone(weather_ds, var_name, time_name, map):
     var_latlon      = weather_ds[var_name].values
     times           = pd.to_datetime(weather_ds[time_name].values)
@@ -32,6 +52,25 @@ def latlon_to_zone(weather_ds, var_name, time_name, map):
     x_km            = np.empty((Ny, Nx), dtype=float)
     y_km            = np.empty((Ny, Nx), dtype=float)
     zone_index      = np.full((Ny, Nx), -1, dtype=int)
+
+    while var_latlon.ndim > 3:
+        squeezed = False
+        for axis in range(1, var_latlon.ndim - 2):
+            if var_latlon.shape[axis] == 1:
+                var_latlon = np.squeeze(var_latlon, axis=axis)
+                squeezed = True
+                break
+        if not squeezed:
+            raise ValueError(
+                f"{var_name} must reduce to (time, latitude, longitude); "
+                f"got shape {weather_ds[var_name].values.shape}."
+            )
+
+    if var_latlon.shape != (nb_timesteps, Ny, Nx):
+        raise ValueError(
+            f"{var_name} expected shape {(nb_timesteps, Ny, Nx)} after squeezing, "
+            f"got {var_latlon.shape}."
+        )
 
     for i_lat, lat in enumerate(latitudes):
         for i_lon, lon in enumerate(longitudes):
@@ -49,26 +88,39 @@ def latlon_to_zone(weather_ds, var_name, time_name, map):
                 zone_index[i_lat, i_lon] = int(np.argmax(inside))
             # else: remain -1 -> grid point not used by any zone
 
-    # Aggregate to zone-time currents
+    # Aggregate to zone-time values. Some datasets use NaN over land even
+    # inside otherwise valid coastal zones, so averages must ignore NaNs.
     var_zone = np.zeros((map.nb_zones, nb_timesteps), dtype=float)
+    fallback_zones = []
+
     for z in range(map.nb_zones):
         mask = (zone_index == z)  # 2D boolean mask over (Ny, Nx)
+        x_c, y_c = map.zone_centroids[z]
+        dist2 = (x_km - x_c) ** 2 + (y_km - y_c) ** 2
 
         if np.any(mask):
-            # At least one grid point in this zone:
-            # uo: (T, Ny, Nx) -> (T, N_points_in_zone)
             var_z = var_latlon[:, mask]
-            var_zone[z, :] = var_z.mean(axis=1)
+            finite_count = np.sum(np.isfinite(var_z), axis=1)
+            summed = np.nansum(var_z, axis=1)
+            values = np.full(nb_timesteps, np.nan, dtype=float)
+            good = finite_count > 0
+            values[good] = summed[good] / finite_count[good]
+
+            if not np.all(good):
+                fallback_values = _nearest_finite_values_by_time(var_latlon, dist2)
+                values[~good] = fallback_values[~good]
+                fallback_zones.append((z, int(np.count_nonzero(~good))))
+
+            var_zone[z, :] = values
         else:
             # No grid point fell inside this zone.
-            # Fallback: use the closest grid point to the zone centroid (in km).
-            # Assume map.zone_centroids[z] = (x_centroid_km, y_centroid_km)
-            x_c, y_c = map.zone_centroids[z]
+            var_zone[z, :] = _nearest_finite_values_by_time(var_latlon, dist2)
+            fallback_zones.append((z, nb_timesteps))
 
-            dist2 = (x_km - x_c) ** 2 + (y_km - y_c) ** 2
-            i_min, j_min = np.unravel_index(np.argmin(dist2), dist2.shape)
+    if fallback_zones:
+        summary = ", ".join(f"zone {z}: {n}" for z, n in fallback_zones)
+        print(f"{var_name}: nearest finite fallback used for {summary} timestep(s)")
 
-            var_zone[z, :] = var_latlon[:, i_min, j_min]
     return var_zone
 
 

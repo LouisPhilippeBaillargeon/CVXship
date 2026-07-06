@@ -9,7 +9,7 @@
 [params]
 soc_i               = 1.5
 soc_f               = 3
-timestep            = 3.0
+timestep            = 2.0
 fuel_price          = 1.396
 init_speed          = 0
 
@@ -68,14 +68,3 @@ until = "2024-03-22T18:00"
 [[auxiliary_load]]
 power = 0.11
 
-# ============================
-# [[speed_limit]]
-# zone = 3
-# speed = 10.0
-# until = "2024-03-21T18:00"
-
-# [[speed_limit]]
-# zone = 3
-# speed = 5.0
-# from = "2024-03-21T18:00"
-# until = "2024-03-22T18:00"

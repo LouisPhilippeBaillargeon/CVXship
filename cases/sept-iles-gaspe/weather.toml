@@ -1,0 +1,4 @@
+[files]
+currents = "../../weather_data/copernicus_marine_forecast.nc"
+atmo = "../../weather_data/data_stream-oper_stepType-instant.nc"
+sun = "../../weather_data/data_stream-oper_stepType-accum.nc"

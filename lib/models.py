@@ -1236,6 +1236,26 @@ class PropulsionModel:
         self.constraint_params = constraint_params
         return constraint_params
 
+    def _power_fit_limits(self) -> tuple[float, float]:
+        min_pow = max(
+            self.ship.propulsion.min_pow,
+            self.fit_range.min_prop_power / self.ship.propulsion.nb_propellers,
+        )
+        max_pow = min(
+            self.ship.propulsion.max_pow,
+            self.fit_range.max_prop_power / self.ship.propulsion.nb_propellers,
+        )
+        return min_pow, max_pow
+
+    def _power_fit_domain_mask(self) -> np.ndarray:
+        min_pow, max_pow = self._power_fit_limits()
+        mask_power = (
+            np.isfinite(self.P_real)
+            & (self.P_real >= min_pow)
+            & (self.P_real <= max_pow)
+        )
+        return np.asarray(self.mask_feasible_n, dtype=bool) & mask_power
+
 
     def fit_convex_model(
         self,
@@ -1245,19 +1265,14 @@ class PropulsionModel:
         self.fit_feasibility_boundary(debug=debug)
 
         #Only include points in the power limits in the fit
-        min_pow = max(self.ship.propulsion.min_pow, self.fit_range.min_prop_power/self.ship.propulsion.nb_propellers)
-        max_pow = min(self.ship.propulsion.max_pow, self.fit_range.max_prop_power/self.ship.propulsion.nb_propellers)
+        min_pow, max_pow = self._power_fit_limits()
         if min_pow > max_pow:
             raise ValueError(
                 f"Empty power fit range: [{min_pow}, {max_pow}] "
                 f"from ship limits [{self.ship.propulsion.min_pow}, {self.ship.propulsion.max_pow}] "
                 f"and fit limits [{self.fit_range.min_prop_power/self.ship.propulsion.nb_propellers}, {self.fit_range.max_prop_power/self.ship.propulsion.nb_propellers}]"
             )
-        mask_power = (
-        np.isfinite(self.P_real) &
-        (self.P_real >= min_pow) &
-        (self.P_real <= max_pow))
-        mask_fit = self.mask_feasible_n & mask_power
+        mask_fit = self._power_fit_domain_mask()
         print(np.sum(mask_fit), "feasible points are considered in the propulsion fit")
 
         #Fit a convex power model
@@ -1336,7 +1351,8 @@ class PropulsionModel:
 
         mask = np.asarray(self.mask_fit, dtype=bool)
 
-        # --- Hide infeasible points ---
+        # Hide points outside the domain used for the power fit:
+        # physical feasibility plus the configured propulsion-power window.
         P_real_plot = np.where(mask, self.P_real, np.nan)
         P_fit_plot  = np.where(mask, self.P_fit,  np.nan)
 
@@ -1390,7 +1406,7 @@ class PropulsionModel:
             )
 
             ax.set_title(
-                title,
+                f"{title} (power-fit domain)",
                 fontsize=24,
                 pad=25
             )
@@ -1462,9 +1478,8 @@ class PropulsionModel:
         Th, S, mask, ua_vals, thrust_vals = self._mesh()
 
         # Same normalization as fit_convex_model():
-        max_advance_speed = self.ship.info.max_speed * (1 - self.ship.propulsion.wake_fraction)
         r_norm = Th / float(self.max_thrust)
-        s_norm = S / float(max_advance_speed)
+        s_norm = S / float(self.max_ua)
 
         intercept, pr, pr2, pr3, ps, ps2, ps3 = self.power_coeffs
 
@@ -1481,10 +1496,17 @@ class PropulsionModel:
     # ------------------------
     # 1) Feasibility mask + boundary
     # ------------------------
-    def plot_feasibility_mask(self, show_boundary: bool = True, show: bool = False, directory=None):
+    def plot_feasibility_mask(
+        self,
+        show_boundary: bool = True,
+        show_fit_domain: bool = True,
+        show: bool = False,
+        directory=None,
+    ):
         """
-        Visualize the stored feasibility mask over (speed, thrust).
-        Optionally overlays the fitted boundary from constraint_params.
+        Visualize the physical propulsion feasibility mask over (speed, thrust).
+        Optionally overlays the fitted physical boundary from constraint_params
+        and the smaller power-fit domain used by the power heatmaps.
         """
         if self.mask_fit is None or self.ua_vals is None or self.thrust_vals is None:
             raise ValueError("Missing mask/ua_vals/thrust_vals. Run fit_convex_model() first.")
@@ -1498,11 +1520,15 @@ class PropulsionModel:
             origin="lower",
             aspect="auto",
             extent=[thrust_vals[0], thrust_vals[-1], ua_vals[0], ua_vals[-1]],
+            vmin=0,
+            vmax=1,
         )
         ax.set_xlabel("Thrust (MN)")
         ax.set_ylabel("Advance speed ua (m/s)")
-        ax.set_title("Feasibility mask (1 = feasible)")
-        fig.colorbar(im, ax=ax, label="feasible")
+        ax.set_title("Physical feasibility mask (1 = feasible)")
+        fig.colorbar(im, ax=ax, label="physically feasible")
+
+        legend_handles = []
 
         if show_boundary:
             if self.constraint_params is None or len(self.constraint_params) < 2:
@@ -1517,8 +1543,35 @@ class PropulsionModel:
                 s_line = np.linspace(ua_vals[0], ua_vals[-1], self.grid_granularity*2)
                 thrust_line = -(a * s_line + b)
 
-                ax.plot(thrust_line, s_line, linewidth=2, label="fitted boundary")
-                ax.legend()
+                boundary_line, = ax.plot(
+                    thrust_line,
+                    s_line,
+                    linewidth=2,
+                    label="physical boundary fit",
+                )
+                legend_handles.append(boundary_line)
+
+        if show_fit_domain and self.mask_fit is not None:
+            fit_mask = np.asarray(self.mask_fit, dtype=bool)
+            if fit_mask.shape != mask.shape:
+                raise ValueError(f"mask_fit shape {fit_mask.shape} does not match grid shape {mask.shape}.")
+            if np.any(fit_mask) and np.any(~fit_mask):
+                from matplotlib.lines import Line2D
+
+                ax.contour(
+                    thrust_vals,
+                    ua_vals,
+                    fit_mask.astype(int),
+                    levels=[0.5],
+                    colors=["tab:orange"],
+                    linewidths=2,
+                )
+                legend_handles.append(
+                    Line2D([0], [0], color="tab:orange", linewidth=2, label="power-fit domain")
+                )
+
+        if legend_handles:
+            ax.legend(handles=legend_handles)
 
         fig.tight_layout()
         _save_and_maybe_show(fig, "propulsion_feasibility_mask", show, directory=directory or PLOTS)
