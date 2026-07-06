@@ -27,6 +27,7 @@ WEATHER_DEFAULTS = {
 
 CACHE_FILENAMES = {
     "wind_model_1d": "WindModel1D.pkl",
+    "wind_model_transition_1d": "WindModelTransition1D.pkl",
     "wind_model_2d": "WindModel2D.pkl",
     "wind_model_path_aligned_2d": "WindModelPathAligned2D.pkl",
     "propulsion_model": "PropulsionModel.pkl",

@@ -172,7 +172,7 @@ def _local_1d_fit_value(kind: str, base_model, ship, fit_range, weather_key: Tup
         if kind == "wind":
             wx, wy = weather_key
             model = WindModel1D(ship, fit_range)
-            _, coeffs, _, _ = model.fit_convex_model(
+            _max_err, _mean_err, coeffs, _min_fit, _max_fit, *_rest = model.fit_convex_model(
                 wx,
                 wy,
                 course,
@@ -529,14 +529,17 @@ def _record_cjpe(report: OptimizerDebugReport, runner, ctx: Dict[str, Any], eval
         s0 = zone_to_segment[z0]
         s1 = zone_to_segment.get(z1, s0)
         if z0 == z1:
-            fit_wind = _poly2(wind_coeffs[s0, t], speed_vec[t], runner.ship.info.max_speed)
+            fit_wind = _poly2(wind_coeffs[z0, t], speed_vec[t], runner.ship.info.max_speed)
             exact_wind = float(runner.wind_model.compute_resistance(_vec2(runner.weather.wind_x[z0, t0 + t], runner.weather.wind_y[z0, t0 + t]), speed_vec[t]))
         else:
             speed = float(np.linalg.norm(speed_vec[t]))
-            fit_wind = 0.5 * (
-                _poly1(wind_nd[s0, t], speed, runner.ship.info.max_speed)
-                + _poly1(wind_nd[s1, t], speed, runner.ship.info.max_speed)
-            )
+            if wind_nd.ndim == 4:
+                fit_wind = _poly1(wind_nd[z0, z1, t], speed, runner.ship.info.max_speed)
+            else:
+                fit_wind = 0.5 * (
+                    _poly1(wind_nd[s0, t], speed, runner.ship.info.max_speed)
+                    + _poly1(wind_nd[s1, t], speed, runner.ship.info.max_speed)
+                )
             exact_wind = 0.5 * (
                 float(runner.wind_model.compute_resistance(_vec2(runner.weather.wind_x[z0, t0 + t], runner.weather.wind_y[z0, t0 + t]), speed_vec[t]))
                 + float(runner.wind_model.compute_resistance(_vec2(runner.weather.wind_x[z1, t0 + t], runner.weather.wind_y[z1, t0 + t]), speed_vec[t]))
@@ -561,6 +564,9 @@ def _record_fr_tso(report: OptimizerDebugReport, runner, ctx: Dict[str, Any], ev
     report.add("slack.rel_speed_mag_minus_avg_split_norm", (rel_speed - np.mean(np.linalg.norm(rel_vec, axis=-1), axis=1))[sail])
     wind_coeffs = np.asarray(ctx["wind_model_future"], dtype=float)
     path_zone_ids = np.asarray(runner.path_zone_ids, dtype=int)
+    sampled_wind_path = getattr(runner, "sampled_wind_path", None)
+    if sampled_wind_path is not None:
+        sampled_wind_path = np.asarray(sampled_wind_path, dtype=float)
     t0 = int(getattr(runner.states, "timesteps_completed", 0))
 
     for t in range(wind_res.shape[0]):
@@ -581,7 +587,15 @@ def _record_fr_tso(report: OptimizerDebugReport, runner, ctx: Dict[str, Any], ev
         for j, z in enumerate(zones):
             weight = 1.0 / len(zones)
             speed_vec = ship_split[t, min(j, 1), :]
-            exact_wind += weight * float(runner.wind_model.compute_resistance(_vec2(runner.weather.wind_x[z, t0 + t], runner.weather.wind_y[z, t0 + t]), speed_vec))
+            if sampled_wind_path is not None:
+                s = s0 if j == 0 else s1
+                wind_vec = sampled_wind_path[s, t, :]
+            else:
+                wind_vec = _vec2(
+                    runner.weather.wind_x[z, t0 + t],
+                    runner.weather.wind_y[z, t0 + t],
+                )
+            exact_wind += weight * float(runner.wind_model.compute_resistance(wind_vec, speed_vec))
         fit_calm = _poly1(runner.calm_model.res_coeffs, rel_speed[t], runner.ship.info.max_speed)
         exact_calm = float(runner.calm_model.compute_resistance(rel_speed[t]))
         eval_values = eval_by_t.get(t)

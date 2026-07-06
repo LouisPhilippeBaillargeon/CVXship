@@ -6,12 +6,12 @@ import atexit
 import sys
 
 from lib.load_params import load_config
-from lib.models import FitRange, PropulsionModel, BaseWindModel, WindModel1D, WindModel2D, WindModelPathAligned2D, GeneratorModel, CalmWaterModel, save_obj, load_obj
+from lib.models import FitRange, PropulsionModel, BaseWindModel, WindModel1D, WindModelTransition1D, WindModel2D, WindModelPathAligned2D, GeneratorModel, CalmWaterModel, save_obj, load_obj
 from lib.plotting import plot_solutions, plot_zones_and_points
 from lib.optimizers import DJPE_TSO, NaiveController, FR_TSO, ShortestPath, CJPE_TSO, FR_O
 from lib.utils import point_in_zones, dx_dy_km, classify_timesteps, _assert_finite
 from lib.evaluation import compute_non_convex_cost_all_timesteps_nc_interpolated
-from lib.weather_interpolation import prepare_nc_interp_source
+from lib.weather_interpolation import build_transition_weather_inputs, prepare_nc_interp_source
 from lib.debug_diagnostics import clear_debug_reports, print_debug_report
 from lib.experiment import (
     Tee,
@@ -100,14 +100,9 @@ if __name__ == "__main__":
         raise ValueError("dimensions must be one of: 1D, 2D, both")
     solver_verbose = bool(_option(args.solver_verbose, run_toml_options, "solver_verbose", solver_verbose))
     unit_commitment = bool(_option(args.unit_commitment, run_toml_options, "unit_commitment", unit_commitment))
-    djpe_ordered_zones = _run_bool_option(
+    ordered_zones = _run_bool_option(
         run_toml_options,
-        ("djpe_ordered_zones", "djte_ordered_zones"),
-        True,
-    )
-    cjpe_ordered_zones = _run_bool_option(
-        run_toml_options,
-        ("cjpe_ordered_zones", "cjte_ordered_zones"),
+        ("ordered_zones", "djpe_ordered_zones", "djte_ordered_zones", "cjpe_ordered_zones", "cjte_ordered_zones"),
         True,
     )
     save_plots = bool(_option(args.save_plots, output_toml_options, "save_plots", True))
@@ -124,8 +119,7 @@ if __name__ == "__main__":
         "new_weather": new_weather,
         "solver_verbose": solver_verbose,
         "unit_commitment": unit_commitment,
-        "djpe_ordered_zones": djpe_ordered_zones,
-        "cjpe_ordered_zones": cjpe_ordered_zones,
+        "ordered_zones": ordered_zones,
         "save_plots": save_plots,
         "show_plots": show_plots,
         "save_solutions": save_solutions,
@@ -148,6 +142,7 @@ if __name__ == "__main__":
     print(f"[RUN] cache={run_context.cache_dir}")
 
     WIND_MODEL_1D = run_context.cache_path("wind_model_1d")
+    WIND_MODEL_TRANSITION_1D = run_context.cache_path("wind_model_transition_1d")
     WIND_MODEL_2D = run_context.cache_path("wind_model_2d")
     WIND_MODEL_PATH_ALIGNED_2D = run_context.cache_path("wind_model_path_aligned_2d")
     PROPULSION_MODEL = run_context.cache_path("propulsion_model")
@@ -330,9 +325,10 @@ if __name__ == "__main__":
         if dimensions in ("1D", "2D", "both"):
             wind_model_1D = WindModel1D(ship, fit_range)
             wind_model_1D.fit_convex_models(
-            weather.wind_x,
-            weather.wind_y,
-            zone_course_angles,
+                weather.wind_x,
+                weather.wind_y,
+                zone_course_angles,
+                diagnostic_wind_samples=getattr(weather, "diagnostic_wind_samples", None),
             )
             print("average max error wind 1D", np.mean(wind_model_1D.relative_errors) , "%")
 
@@ -344,22 +340,48 @@ if __name__ == "__main__":
         naive.calm_model = calm_model
 
         if dimensions == "2D" or dimensions == "both":
-            '''
-            wind_model_2D = WindModel2D(ship, fit_range)
-            wind_model_2D.fit_convex_models(weather.wind_x, weather.wind_y)
-            print("average max error wind 2D", np.mean(wind_model_2D.relative_errors) , "%")
+            if ordered_zones:
+                wind_model_zone_2D = WindModelPathAligned2D(ship, fit_range)
+                wind_model_zone_2D.fit_convex_models(
+                    weather.wind_x,
+                    weather.wind_y,
+                    zone_course_angles,
+                    debug=False,
+                    diagnostic_wind_samples=getattr(weather, "diagnostic_wind_samples", None),
+                )
+                save_obj(WIND_MODEL_PATH_ALIGNED_2D, wind_model_zone_2D)
+            else:
+                wind_model_zone_2D = WindModel2D(ship, fit_range)
+                wind_model_zone_2D.fit_convex_models(
+                    weather.wind_x,
+                    weather.wind_y,
+                    diagnostic_wind_samples=getattr(weather, "diagnostic_wind_samples", None),
+                )
+                print("average max error wind 2D", np.mean(wind_model_zone_2D.relative_errors) , "%")
+                save_obj(WIND_MODEL_2D, wind_model_zone_2D)
 
-            save_obj(WIND_MODEL_2D, wind_model_2D)
-            '''
-            wind_model_path_2D = WindModelPathAligned2D(ship, fit_range)
-            wind_model_path_2D.fit_convex_models(
-                weather.wind_x,
-                weather.wind_y,
-                zone_course_angles,
-                debug=False,
+        if dimensions == "both":
+            transition_weather = build_transition_weather_inputs(
+                nc_sources,
+                map,
+                itinerary,
+                states,
+                path.sol.zone_sequence,
+                path.sol.waypoints,
+                fit_points=3,
+                diagnostic_points=9,
+                use_route_directions=ordered_zones,
+                print_diagnostics=True,
             )
-
-            save_obj(WIND_MODEL_PATH_ALIGNED_2D, wind_model_path_2D)
+            wind_model_transition_1D = WindModelTransition1D(ship, fit_range)
+            wind_model_transition_1D.fit_convex_models(
+                transition_weather["wind_x"],
+                transition_weather["wind_y"],
+                transition_weather["course_angles"],
+                transition_weather["valid_pairs"],
+                diagnostic_wind_samples=transition_weather["diagnostic_wind_samples"],
+            )
+            save_obj(WIND_MODEL_TRANSITION_1D, wind_model_transition_1D)
         end = time.time()
         print("Weather model fit took :", end - start, "seconds")
 
@@ -367,8 +389,12 @@ if __name__ == "__main__":
         if dimensions in ("1D", "2D", "both"):
             wind_model_1D = load_obj(WIND_MODEL_1D)
         if dimensions == "2D" or dimensions == "both":
-            #wind_model_2D = load_obj(WIND_MODEL_2D)
-            wind_model_path_2D = load_obj(WIND_MODEL_PATH_ALIGNED_2D)
+            if ordered_zones:
+                wind_model_zone_2D = load_obj(WIND_MODEL_PATH_ALIGNED_2D)
+            else:
+                wind_model_zone_2D = load_obj(WIND_MODEL_2D)
+        if dimensions == "both":
+            wind_model_transition_1D = load_obj(WIND_MODEL_TRANSITION_1D)
         print("Saved weather model loaded")
 
     naive.wind_model = base_wind_model
@@ -516,6 +542,7 @@ if __name__ == "__main__":
             path_zone_ids       = path.sol.zone_sequence,
             ref_speed           = ref_speed
         )
+        optimizer.nc_sources = nc_sources
 
         ok = optimizer.optimize(
             unit_commitment     = unit_commitment,
@@ -599,7 +626,7 @@ if __name__ == "__main__":
 
     if dimensions == "2D" or dimensions == "both":
         optimizer = DJPE_TSO(
-            wind_model          = wind_model_path_2D,
+            wind_model          = wind_model_zone_2D,
             propulsion_model    = propulsion_model,
             calm_model          = calm_model,
             generator_models    = generatorModels,
@@ -619,7 +646,7 @@ if __name__ == "__main__":
         ok = optimizer.optimize(
             unit_commitment=unit_commitment,
             debug=True,
-            ordered_zones = djpe_ordered_zones,
+            ordered_zones = ordered_zones,
             min_timestep = True,
             enforce_adjacency=True,
             restrict_to_base=False,
@@ -662,8 +689,8 @@ if __name__ == "__main__":
 
     if dimensions == "both":
         glob_cont_opt = CJPE_TSO(
-            wind_model          = wind_model_path_2D,
-            wind_model_nd       = wind_model_1D,
+            wind_model          = wind_model_zone_2D,
+            wind_model_nd       = wind_model_transition_1D,
             propulsion_model    = propulsion_model,
             calm_model          = calm_model,
             generator_models    = generatorModels,
@@ -683,7 +710,7 @@ if __name__ == "__main__":
         ok = glob_cont_opt.optimize(
             unit_commitment=unit_commitment,
             debug=True,
-            ordered_zones = cjpe_ordered_zones,
+            ordered_zones = ordered_zones,
             min_timestep = True,
             enforce_adjacency=True,
             restrict_to_base=False,

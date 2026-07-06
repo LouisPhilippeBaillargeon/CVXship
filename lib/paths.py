@@ -32,6 +32,7 @@ B_SERIES_CT = CONSTANTS / "B_series_coefficients_CT.csv"
 
 CACHE = ROOT / "cache"
 WIND_MODEL_1D = CACHE / "WindModel1D.pkl"
+WIND_MODEL_TRANSITION_1D = CACHE / "WindModelTransition1D.pkl"
 WIND_MODEL_2D = CACHE / "WindModel2D.pkl"
 WIND_MODEL_PATH_ALIGNED_2D = CACHE / "WindModelPathAligned2D.pkl"
 PROPULSION_MODEL = CACHE / "PropulsionModel.pkl"

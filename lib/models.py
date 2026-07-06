@@ -428,8 +428,11 @@ class BaseWindModel:
     fit_range : FitRange
     thrust_coeffs: Optional[np.ndarray] = field(default=None, init=False)
     relative_errors: Optional[np.ndarray] = field(default=None, init=False)
+    mean_abs_errors: Optional[np.ndarray] = field(default=None, init=False)
     max_convex_resistance: Optional[np.ndarray] = field(default=None, init=False)
     min_convex_resistance: Optional[np.ndarray] = field(default=None, init=False)
+    combined_mean_abs_errors: Optional[np.ndarray] = field(default=None, init=False)
+    combined_max_abs_errors: Optional[np.ndarray] = field(default=None, init=False)
     big_m_resistance: Optional[float] = field(default=None, init=False)
 
     def compute_resistance(self,
@@ -448,6 +451,47 @@ class BaseWindModel:
         CX = -CDlAF * np.cos(gamma_rw) / den
         tauX = 0.5 * CX * self.ship.info.rho_air * V_rw**2 * self.ship.hull.AF_air
         return -tauX/1000000
+
+
+def _eval_wind_poly_1d(coeffs, speed, ship_max_speed):
+    coeffs = np.asarray(coeffs, dtype=float)
+    s = np.asarray(speed, dtype=float) / float(ship_max_speed)
+    return (
+        coeffs[0]
+        + coeffs[1] * s
+        + coeffs[2] * s**2
+        + coeffs[3] * s**3
+        + coeffs[4] * s**4
+    )
+
+
+def _eval_wind_poly_2d(coeffs, vx, vy, ship_max_speed):
+    coeffs = np.asarray(coeffs, dtype=float)
+    vx_n = np.asarray(vx, dtype=float) / float(ship_max_speed)
+    vy_n = np.asarray(vy, dtype=float) / float(ship_max_speed)
+    vs_n = np.sqrt(vx_n * vx_n + vy_n * vy_n)
+    return (
+        coeffs[0]
+        + coeffs[1] * vs_n
+        + coeffs[2] * vs_n**2
+        + coeffs[3] * vs_n**3
+        + coeffs[4] * vs_n**4
+        + coeffs[5] * vx_n
+        + coeffs[6] * vx_n**2
+        + coeffs[7] * vx_n**4
+        + coeffs[8] * vy_n
+        + coeffs[9] * vy_n**2
+        + coeffs[10] * vy_n**4
+    )
+
+
+def _print_wind_fit_summary(name, fit_err, combined_err=None):
+    print(f"\n[{name} diagnostics]")
+    print(f"  fit mean abs error: {np.nanmean(fit_err):.6g} MN")
+    print(f"  fit worst abs error: {np.nanmax(fit_err):.6g} MN")
+    if combined_err is not None:
+        print(f"  combined mean abs error: {np.nanmean(combined_err):.6g} MN")
+        print(f"  combined worst abs error: {np.nanmax(combined_err):.6g} MN")
 
 
 @dataclass
@@ -595,7 +639,16 @@ class WindModel2D(BaseWindModel):
             param_vy_2.value,
             param_vy_4.value,
         ])
-        return np.nanmax(abs_err),coeffs, min(R_fit.value[mask]), max(R_fit.value[mask])
+        return (
+            float(np.nanmax(abs_err)),
+            float(np.nanmean(abs_err)),
+            coeffs,
+            float(np.nanmin(R_fit.value[mask])),
+            float(np.nanmax(R_fit.value[mask])),
+            VX,
+            VY,
+            mask,
+        )
 
     def fit_convex_models(
         #fit convex wind models for every zone and timestep combination based on weather
@@ -603,18 +656,55 @@ class WindModel2D(BaseWindModel):
         wind_speed_x, #wind speed m/s [nb_zones, nb_timestep]
         wind_speed_y, #wind speed m/s [nb_zones, nb_timestep]
         nb_steps : float = 40,
+        diagnostic_wind_samples=None,
     ):
         nb_zones                = wind_speed_x.shape[0]
         nb_timesteps            = wind_speed_x.shape[1]
         self.thrust_coeffs      = np.zeros((nb_zones,nb_timesteps,11))
         self.relative_errors    = np.zeros((nb_zones,nb_timesteps))
+        self.mean_abs_errors    = np.zeros((nb_zones,nb_timesteps))
         self.max_convex_resistance    = np.zeros((nb_zones,nb_timesteps))
         self.min_convex_resistance    = np.zeros((nb_zones,nb_timesteps))
+        if diagnostic_wind_samples is not None:
+            self.combined_mean_abs_errors = np.zeros((nb_zones, nb_timesteps))
+            self.combined_max_abs_errors = np.zeros((nb_zones, nb_timesteps))
 
         for iz in range(nb_zones):
             for it in range(nb_timesteps):
-                self.relative_errors[iz,it], self.thrust_coeffs[iz,it,:], self.min_convex_resistance[iz,it], self.max_convex_resistance[iz,it] = self.fit_convex_model(wind_speed_x[iz,it],wind_speed_y[iz,it],debug=False)
+                (
+                    self.relative_errors[iz,it],
+                    self.mean_abs_errors[iz,it],
+                    self.thrust_coeffs[iz,it,:],
+                    self.min_convex_resistance[iz,it],
+                    self.max_convex_resistance[iz,it],
+                    VX,
+                    VY,
+                    mask,
+                ) = self.fit_convex_model(wind_speed_x[iz,it],wind_speed_y[iz,it],debug=False)
+                if diagnostic_wind_samples is not None:
+                    fit_vals = _eval_wind_poly_2d(
+                        self.thrust_coeffs[iz, it, :],
+                        VX[mask],
+                        VY[mask],
+                        self.ship.info.max_speed,
+                    )
+                    diag = np.asarray(diagnostic_wind_samples[iz, it], dtype=float)
+                    errs = []
+                    for w in diag:
+                        true_vals = np.array([
+                            self.compute_resistance(w, np.array([vx, vy], dtype=float))
+                            for vx, vy in zip(VX[mask], VY[mask])
+                        ])
+                        errs.append(np.abs(fit_vals - true_vals))
+                    errs = np.asarray(errs, dtype=float)
+                    self.combined_mean_abs_errors[iz, it] = float(np.nanmean(errs))
+                    self.combined_max_abs_errors[iz, it] = float(np.nanmax(errs))
             print("zone", iz, "fitted")
+        _print_wind_fit_summary(
+            "WindModel2D",
+            self.mean_abs_errors,
+            self.combined_mean_abs_errors if diagnostic_wind_samples is not None else None,
+        )
         _finalize_resistance_big_m(self)
 
 @dataclass
@@ -676,7 +766,16 @@ class WindModel1D(BaseWindModel):
             param_vs_3.value,
             param_vs_4.value,
         ])
-        return np.nanmax(abs_err),coeffs, min(R_fit.value), max(R_fit.value)
+        return (
+            float(np.nanmax(abs_err)),
+            float(np.nanmean(abs_err)),
+            coeffs,
+            float(np.nanmin(R_fit.value)),
+            float(np.nanmax(R_fit.value)),
+            vs_vals,
+            Resistance,
+            R_fit.value,
+        )
 
     def fit_convex_models(
         #fit convex wind models for every zone and timestep combination based on weather
@@ -686,19 +785,148 @@ class WindModel1D(BaseWindModel):
         course_angles, #angle of the ship [nb_zones, nb_timestep]
         nb_steps : float = 40,
         debug = False,
+        diagnostic_wind_samples=None,
     ):
         nb_zones                = wind_speed_x.shape[0]
         nb_timesteps            = wind_speed_x.shape[1]
         self.thrust_coeffs      = np.zeros((nb_zones,nb_timesteps,5))
         self.relative_errors    = np.zeros((nb_zones,nb_timesteps))
+        self.mean_abs_errors    = np.zeros((nb_zones,nb_timesteps))
         self.max_convex_resistance    = np.zeros((nb_zones,nb_timesteps))
         self.min_convex_resistance    = np.zeros((nb_zones,nb_timesteps))
+        if diagnostic_wind_samples is not None:
+            self.combined_mean_abs_errors = np.zeros((nb_zones, nb_timesteps))
+            self.combined_max_abs_errors = np.zeros((nb_zones, nb_timesteps))
 
         for iz in range(nb_zones):
             for it in range(nb_timesteps):
-                self.relative_errors[iz,it], self.thrust_coeffs[iz,it,:], self.min_convex_resistance[iz,it], self.max_convex_resistance[iz,it] = self.fit_convex_model(wind_speed_x[iz,it],wind_speed_y[iz,it], course_angles[iz,it], nb_steps=nb_steps, debug=debug)
+                (
+                    self.relative_errors[iz,it],
+                    self.mean_abs_errors[iz,it],
+                    self.thrust_coeffs[iz,it,:],
+                    self.min_convex_resistance[iz,it],
+                    self.max_convex_resistance[iz,it],
+                    vs_vals,
+                    _Resistance,
+                    _R_fit,
+                ) = self.fit_convex_model(wind_speed_x[iz,it],wind_speed_y[iz,it], course_angles[iz,it], nb_steps=nb_steps, debug=debug)
+                if diagnostic_wind_samples is not None:
+                    coeffs = self.thrust_coeffs[iz, it, :]
+                    fit_vals = _eval_wind_poly_1d(coeffs, vs_vals, self.ship.info.max_speed)
+                    course = float(course_angles[iz, it])
+                    ship_vecs = np.stack(
+                        [vs_vals * np.cos(course), vs_vals * np.sin(course)],
+                        axis=1,
+                    )
+                    diag = np.asarray(diagnostic_wind_samples[iz, it], dtype=float)
+                    errs = []
+                    for w in diag:
+                        true_vals = np.array([
+                            self.compute_resistance(w, ship_vec)
+                            for ship_vec in ship_vecs
+                        ])
+                        errs.append(np.abs(fit_vals - true_vals))
+                    errs = np.asarray(errs, dtype=float)
+                    self.combined_mean_abs_errors[iz, it] = float(np.nanmean(errs))
+                    self.combined_max_abs_errors[iz, it] = float(np.nanmax(errs))
             print("zone", iz, "fitted")
+        _print_wind_fit_summary(
+            "WindModel1D",
+            self.mean_abs_errors,
+            self.combined_mean_abs_errors if diagnostic_wind_samples is not None else None,
+        )
         _finalize_resistance_big_m(self)
+
+
+@dataclass
+class WindModelTransition1D(WindModel1D):
+    valid_pairs: Optional[np.ndarray] = field(default=None, init=False)
+
+    def fit_convex_models(
+        self,
+        wind_speed_x,
+        wind_speed_y,
+        course_angles,
+        valid_pairs,
+        nb_steps: float = 40,
+        debug=False,
+        diagnostic_wind_samples=None,
+    ):
+        wind_speed_x = np.asarray(wind_speed_x, dtype=float)
+        wind_speed_y = np.asarray(wind_speed_y, dtype=float)
+        course_angles = np.asarray(course_angles, dtype=float)
+        valid_pairs = np.asarray(valid_pairs, dtype=bool)
+
+        nb_zones = wind_speed_x.shape[0]
+        nb_timesteps = wind_speed_x.shape[2]
+        if wind_speed_x.shape != (nb_zones, nb_zones, nb_timesteps):
+            raise ValueError("wind_speed_x must have shape (nb_zones, nb_zones, nb_timesteps).")
+        if wind_speed_y.shape != wind_speed_x.shape:
+            raise ValueError("wind_speed_y must match wind_speed_x shape.")
+        if course_angles.shape != wind_speed_x.shape:
+            raise ValueError("course_angles must match wind_speed_x shape.")
+        if valid_pairs.shape != (nb_zones, nb_zones):
+            raise ValueError("valid_pairs must have shape (nb_zones, nb_zones).")
+
+        self.valid_pairs = valid_pairs
+        self.thrust_coeffs = np.full((nb_zones, nb_zones, nb_timesteps, 5), np.nan, dtype=float)
+        self.relative_errors = np.full((nb_zones, nb_zones, nb_timesteps), np.nan, dtype=float)
+        self.mean_abs_errors = np.full((nb_zones, nb_zones, nb_timesteps), np.nan, dtype=float)
+        self.max_convex_resistance = np.full((nb_zones, nb_zones, nb_timesteps), np.nan, dtype=float)
+        self.min_convex_resistance = np.full((nb_zones, nb_zones, nb_timesteps), np.nan, dtype=float)
+        if diagnostic_wind_samples is not None:
+            self.combined_mean_abs_errors = np.full((nb_zones, nb_zones, nb_timesteps), np.nan, dtype=float)
+            self.combined_max_abs_errors = np.full((nb_zones, nb_zones, nb_timesteps), np.nan, dtype=float)
+
+        for z0 in range(nb_zones):
+            for z1 in range(nb_zones):
+                if not valid_pairs[z0, z1]:
+                    continue
+                for t in range(nb_timesteps):
+                    (
+                        self.relative_errors[z0, z1, t],
+                        self.mean_abs_errors[z0, z1, t],
+                        self.thrust_coeffs[z0, z1, t, :],
+                        self.min_convex_resistance[z0, z1, t],
+                        self.max_convex_resistance[z0, z1, t],
+                        vs_vals,
+                        _Resistance,
+                        _R_fit,
+                    ) = self.fit_convex_model(
+                        wind_speed_x[z0, z1, t],
+                        wind_speed_y[z0, z1, t],
+                        course_angles[z0, z1, t],
+                        nb_steps=nb_steps,
+                        debug=debug,
+                    )
+                    if diagnostic_wind_samples is not None:
+                        coeffs = self.thrust_coeffs[z0, z1, t, :]
+                        fit_vals = _eval_wind_poly_1d(coeffs, vs_vals, self.ship.info.max_speed)
+                        course = float(course_angles[z0, z1, t])
+                        ship_vecs = np.stack(
+                            [vs_vals * np.cos(course), vs_vals * np.sin(course)],
+                            axis=1,
+                        )
+                        diag = np.asarray(diagnostic_wind_samples[z0, z1, t], dtype=float)
+                        errs = []
+                        for w in diag:
+                            true_vals = np.array([
+                                self.compute_resistance(w, ship_vec)
+                                for ship_vec in ship_vecs
+                            ])
+                            errs.append(np.abs(fit_vals - true_vals))
+                        errs = np.asarray(errs, dtype=float)
+                        self.combined_mean_abs_errors[z0, z1, t] = float(np.nanmean(errs))
+                        self.combined_max_abs_errors[z0, z1, t] = float(np.nanmax(errs))
+                print(f"transition pair {z0}->{z1} wind fitted")
+
+        _print_wind_fit_summary(
+            "WindModelTransition1D",
+            self.mean_abs_errors,
+            self.combined_mean_abs_errors if diagnostic_wind_samples is not None else None,
+        )
+        _finalize_resistance_big_m(self)
+
 
 @dataclass
 class WindModelPathAligned2D(BaseWindModel):
@@ -843,6 +1071,7 @@ class WindModelPathAligned2D(BaseWindModel):
 
         return (
             float(np.nanmax(abs_err)),
+            float(np.nanmean(abs_err)),
             coeffs,
             float(np.nanmin(R_fit.value)),
             float(np.nanmax(R_fit.value)),
@@ -866,16 +1095,21 @@ class WindModelPathAligned2D(BaseWindModel):
         nb_angle_steps: int = 21,
         debug: bool = False,
         conservative: bool = False,
+        diagnostic_wind_samples=None,
     ):
         nb_segments = wind_speed_x.shape[0]
         nb_timesteps = wind_speed_x.shape[1]
 
         self.thrust_coeffs = np.zeros((nb_segments, nb_timesteps, 11))
         self.relative_errors = np.zeros((nb_segments, nb_timesteps))
+        self.mean_abs_errors = np.zeros((nb_segments, nb_timesteps))
         self.max_convex_resistance = np.zeros((nb_segments, nb_timesteps))
         self.min_convex_resistance = np.zeros((nb_segments, nb_timesteps))
         self.mean_true_resistance = np.zeros((nb_segments, nb_timesteps))
         self.max_true_resistance = np.zeros((nb_segments, nb_timesteps))
+        if diagnostic_wind_samples is not None:
+            self.combined_mean_abs_errors = np.zeros((nb_segments, nb_timesteps))
+            self.combined_max_abs_errors = np.zeros((nb_segments, nb_timesteps))
 
         self.speed_constraint_A = np.zeros((nb_segments, 2, 2))
         self.speed_constraint_b = np.zeros((nb_segments, 2))
@@ -899,6 +1133,7 @@ class WindModelPathAligned2D(BaseWindModel):
             for t in range(nb_timesteps):
                 (
                     err,
+                    mean_err,
                     coeffs,
                     min_fit,
                     max_fit,
@@ -922,11 +1157,33 @@ class WindModelPathAligned2D(BaseWindModel):
                 )
 
                 self.relative_errors[s, t] = err
+                self.mean_abs_errors[s, t] = mean_err
                 self.thrust_coeffs[s, t, :] = coeffs
                 self.min_convex_resistance[s, t] = min_fit
                 self.max_convex_resistance[s, t] = max_fit
                 self.mean_true_resistance[s, t] = mean_true
                 self.max_true_resistance[s, t] = max_true
+                if diagnostic_wind_samples is not None:
+                    fit_vals = _eval_wind_poly_2d(
+                        coeffs,
+                        VX,
+                        VY,
+                        self.ship.info.max_speed,
+                    )
+                    diag = np.asarray(diagnostic_wind_samples[s, t], dtype=float)
+                    errs = []
+                    for w in diag:
+                        true_vals = np.zeros_like(VX, dtype=float)
+                        for iy in range(VX.shape[0]):
+                            for ix in range(VX.shape[1]):
+                                true_vals[iy, ix] = self.compute_resistance(
+                                    w,
+                                    np.array([VX[iy, ix], VY[iy, ix]], dtype=float),
+                                )
+                        errs.append(np.abs(fit_vals - true_vals))
+                    errs = np.asarray(errs, dtype=float)
+                    self.combined_mean_abs_errors[s, t] = float(np.nanmean(errs))
+                    self.combined_max_abs_errors[s, t] = float(np.nanmax(errs))
 
                 if err > worst["err"]:
                     worst.update({
@@ -941,6 +1198,12 @@ class WindModelPathAligned2D(BaseWindModel):
                     })
 
             print("path segment", s, "wind fitted")
+
+        _print_wind_fit_summary(
+            "WindModelPathAligned2D",
+            self.mean_abs_errors,
+            self.combined_mean_abs_errors if diagnostic_wind_samples is not None else None,
+        )
 
         if debug:
             print("\n[WindModelPathAligned2D debug]")

@@ -9,10 +9,10 @@ import faulthandler
 faulthandler.enable()
 
 from lib.load_params import Ship, Map, Itinerary, States
-from lib.models import BaseWindModel, WindModel1D, WindModel2D, WindModelPathAligned2D, PropulsionModel, GeneratorModel, CalmWaterModel
+from lib.models import BaseWindModel, WindModel1D, WindModelTransition1D, WindModel2D, WindModelPathAligned2D, PropulsionModel, GeneratorModel, CalmWaterModel
 from lib.weather import Weather
 from lib.utils import classify_timesteps, dx_dy_km, compute_port_zone_indices, point_in_zones, _compute_tight_big_M_zone, _compute_min_zone_timesteps, _compute_min_crossing_distance_per_zone, build_constant_speed_path_reference, xy_from_path_distance, _ordered_zone_corner_ids, _zone_edges_from_corner_ids
-from lib.weather_interpolation import prepare_nc_interp_source, interpolated_weather_at, query_time_for_segment
+from lib.weather_interpolation import build_path_segment_weather_inputs, prepare_nc_interp_source, interpolated_weather_at, query_time_for_segment
 from lib.paths import CORNERS, ZONES
 from lib.debug_diagnostics import record_optimizer_debug
 
@@ -1105,7 +1105,6 @@ class DJPE_TSO:
         interval_sail_fraction = interval_sail_fraction[self.states.timesteps_completed:]
         interval_sail = interval_sail_fraction > 0.5
         interval_port_idx = _future_interval_port_idx(self.itinerary, self.states, T_future, port_idx)
-
         # ================================================= ITINERARY =================================================
         ship_pos = cp.Variable((T_future + 1, 2))
 
@@ -1394,15 +1393,16 @@ class DJPE_TSO:
                 if interval_sail_fraction[t] > 0.01:
 
                     for z in range(self.map.nb_zones):
-                        A = self.wind_model.speed_constraint_A[z][:2]
-                        b = self.wind_model.speed_constraint_b[z][:2]
+                        if ordered_zones and hasattr(self.wind_model, "speed_constraint_A"):
+                            A = self.wind_model.speed_constraint_A[z][:2]
+                            b = self.wind_model.speed_constraint_b[z][:2]
 
-                        for k in range(A.shape[0]):
-                            constraints += [
-                                A[k, 0] * ship_speed_x[t, h]
-                                + A[k, 1] * ship_speed_y[t, h]
-                                >= b[k] - 1000 * (1 - active_zone[z])
-                            ]
+                            for k in range(A.shape[0]):
+                                constraints += [
+                                    A[k, 0] * ship_speed_x[t, h]
+                                    + A[k, 1] * ship_speed_y[t, h]
+                                    >= b[k] - 1000 * (1 - active_zone[z])
+                                ]
                         c = wind_model_future[z, t, :]
 
 
@@ -1708,7 +1708,7 @@ class DJPE_TSO:
 @dataclass
 class CJPE_TSO:
     wind_model          : WindModel2D
-    wind_model_nd       : WindModel1D
+    wind_model_nd       : WindModelTransition1D
     propulsion_model    : PropulsionModel
     calm_model          : CalmWaterModel
     generator_models    : List[GeneratorModel]
@@ -1756,6 +1756,12 @@ class CJPE_TSO:
         interval_sail_fraction = interval_sail_fraction[self.states.timesteps_completed:]
         interval_sail = interval_sail_fraction > 0.5
         interval_port_idx = _future_interval_port_idx(self.itinerary, self.states, T_future, port_idx)
+        transition_valid_pairs = getattr(self.wind_model_nd, "valid_pairs", None)
+        if transition_valid_pairs is not None and not enforce_adjacency:
+            raise ValueError(
+                "CJPE_TSO transition wind model is fitted only for adjacent zone pairs; "
+                "use enforce_adjacency=True or fit transition coefficients for all allowed pairs."
+            )
 
         # ================================================= ITINERARY =================================================
         ship_pos = cp.Variable((T_future + 1, 2))
@@ -2036,7 +2042,10 @@ class CJPE_TSO:
         normalized_rel_speed = cp.Variable(T_future)
         normalized_speed = cp.Variable(T_future)
 
-        WIND_BIG_M = float(self.wind_model.big_m_resistance)
+        WIND_BIG_M = max(
+            float(self.wind_model.big_m_resistance),
+            float(self.wind_model_nd.big_m_resistance),
+        )
         constraints += [wind_resistance <= WIND_BIG_M]
         constraints += [-WIND_BIG_M <= wind_resistance]
 
@@ -2044,12 +2053,23 @@ class CJPE_TSO:
         constraints += [normalized_speed == speed_mag / self.ship.info.max_speed]
 
         wind_model_future = self.wind_model.thrust_coeffs[:, self.states.timesteps_completed : self.states.timesteps_completed + T_future, :]
-        wind_model_nd_future = self.wind_model_nd.thrust_coeffs[:, self.states.timesteps_completed : self.states.timesteps_completed + T_future, :]
+        wind_model_nd_future = self.wind_model_nd.thrust_coeffs[:, :, self.states.timesteps_completed : self.states.timesteps_completed + T_future, :]
 
         for t in range(T_future):
             if interval_sail_fraction[t] > 0.01:
 
                 for z in range(self.map.nb_zones):
+                    if ordered_zones and hasattr(self.wind_model, "speed_constraint_A"):
+                        A = self.wind_model.speed_constraint_A[z][:2]
+                        b = self.wind_model.speed_constraint_b[z][:2]
+
+                        for k in range(A.shape[0]):
+                            constraints += [
+                                A[k, 0] * ship_speed_x[t]
+                                + A[k, 1] * ship_speed_y[t]
+                                >= b[k] - 1000 * (2 - zone[t, z] - zone[t+1, z])
+                            ]
+
                     c = wind_model_future[z, t, :]
 
                     #wind constraints applied when there is no transitions
@@ -2074,23 +2094,17 @@ class CJPE_TSO:
                             continue
                         if enforce_adjacency and self.map.zone_adj[z, z_next] < 0.5:
                             continue
+                        if transition_valid_pairs is not None and not transition_valid_pairs[z, z_next]:
+                            continue
 
-                        cnd1 = wind_model_nd_future[z, t, :]
-                        cnd2 = wind_model_nd_future[z_next, t, :]
+                        cnd = wind_model_nd_future[z, z_next, t, :]
                         constraints += [
                             wind_resistance[t] >=
-                            (
-                                cnd1[0]
-                                + cnd1[1] * normalized_speed[t]
-                                + cnd1[2] * cp.square(normalized_speed[t])
-                                + cnd1[3] * cp.power(normalized_speed[t], 3)
-                                + cnd1[4] * cp.power(normalized_speed[t], 4)
-                                + cnd2[0]
-                                + cnd2[1] * normalized_speed[t]
-                                + cnd2[2] * cp.square(normalized_speed[t])
-                                + cnd2[3] * cp.power(normalized_speed[t], 3)
-                                + cnd2[4] * cp.power(normalized_speed[t], 4)
-                            ) / 2
+                            cnd[0]
+                            + cnd[1] * normalized_speed[t]
+                            + cnd[2] * cp.square(normalized_speed[t])
+                            + cnd[3] * cp.power(normalized_speed[t], 3)
+                            + cnd[4] * cp.power(normalized_speed[t], 4)
                             - WIND_BIG_M * (2 - zone[t, z] - zone[t+1, z_next])
                         ]
 
@@ -2398,6 +2412,61 @@ class FR_TSO:
     path_zone_ids       : List[int]
 
     sol: Optional[Solution] = field(default=None, init=False)
+    wind_model_path: Optional[WindModel1D] = field(default=None, init=False)
+    sampled_current_x_path: Optional[np.ndarray] = field(default=None, init=False)
+    sampled_current_y_path: Optional[np.ndarray] = field(default=None, init=False)
+    sampled_wind_path: Optional[np.ndarray] = field(default=None, init=False)
+    sampled_irradiance_path: Optional[np.ndarray] = field(default=None, init=False)
+    sampled_course_angle_path: Optional[np.ndarray] = field(default=None, init=False)
+    nc_sources: Optional[dict] = field(default=None, init=False)
+
+    def _precompute_path_segment_weather_models(
+        self,
+        waypoints: np.ndarray,
+        segment_dirs: np.ndarray,
+        timestep_dt_h: np.ndarray,
+        T_future: int,
+        debug: bool = False,
+    ):
+        if self.nc_sources is None:
+            self.nc_sources = prepare_nc_interp_source(self.map, self.itinerary)
+
+        weather_inputs = build_path_segment_weather_inputs(
+            self.nc_sources,
+            self.map,
+            self.itinerary,
+            self.states,
+            waypoints,
+            fit_points=3,
+            diagnostic_points=9,
+            print_diagnostics=True,
+        )
+
+        wind_x_path = weather_inputs["wind_x"]
+        wind_y_path = weather_inputs["wind_y"]
+        current_x_path = weather_inputs["current_x"]
+        current_y_path = weather_inputs["current_y"]
+        irradiance_path = weather_inputs["irradiance"]
+        course_path = weather_inputs["course_angles"]
+
+        self.sampled_current_x_path = current_x_path
+        self.sampled_current_y_path = current_y_path
+        self.sampled_wind_path = np.stack([wind_x_path, wind_y_path], axis=2)
+        self.sampled_irradiance_path = irradiance_path
+        self.sampled_course_angle_path = course_path
+
+        self.wind_model_path = WindModel1D(self.ship, self.wind_model.fit_range)
+        self.wind_model_path.fit_convex_models(
+            wind_x_path,
+            wind_y_path,
+            course_path,
+            diagnostic_wind_samples=weather_inputs["diagnostic_wind_samples"],
+        )
+
+        if debug:
+            print("[FR_TSO] fitted path-segment sampled wind models")
+            print("[FR_TSO] sampled current_x first segment:", current_x_path[0, :5])
+            print("[FR_TSO] sampled irradiance first segment:", irradiance_path[0, :5])
 
     def optimize(
         self,
@@ -2455,6 +2524,14 @@ class FR_TSO:
         theta_seg = np.arctan2(segment_vecs[:, 1], segment_vecs[:, 0])
         cos_seg = np.cos(theta_seg)
         sin_seg = np.sin(theta_seg)
+
+        self._precompute_path_segment_weather_models(
+            waypoints=waypoints,
+            segment_dirs=segment_dirs,
+            timestep_dt_h=timestep_dt_h,
+            T_future=T_future,
+            debug=debug,
+        )
 
         # ================================= BASE RESTRICTION REF =================================
         base_seg_idx = None
@@ -2649,17 +2726,18 @@ class FR_TSO:
         constraints += [ship_speed_y_split_rel_water <= self.ship.info.max_speed+1]
         constraints += [ship_speed_y_split_rel_water <= self.ship.info.max_speed+1]
 
-        current_x_future = self.weather.current_x[
-            :,
-            self.states.timesteps_completed : self.states.timesteps_completed + T_future,
-        ]
-        current_y_future = self.weather.current_y[
-            :,
-            self.states.timesteps_completed : self.states.timesteps_completed + T_future,
-        ]
-
-        current_x_path = current_x_future[path_zone_ids, :]
-        current_y_path = current_y_future[path_zone_ids, :]
+        current_x_path = np.asarray(self.sampled_current_x_path, dtype=float)
+        current_y_path = np.asarray(self.sampled_current_y_path, dtype=float)
+        if current_x_path.shape != (nb_path_zones, T_future):
+            raise ValueError(
+                f"Expected sampled_current_x_path shape {(nb_path_zones, T_future)}, "
+                f"got {current_x_path.shape}."
+            )
+        if current_y_path.shape != (nb_path_zones, T_future):
+            raise ValueError(
+                f"Expected sampled_current_y_path shape {(nb_path_zones, T_future)}, "
+                f"got {current_y_path.shape}."
+            )
 
         for t in range(T_future):
             constraints += [
@@ -2698,7 +2776,9 @@ class FR_TSO:
         normalized_rel_speed = cp.Variable(T_future)
 
 
-        WIND_BIG_M = float(self.wind_model.big_m_resistance)
+        if self.wind_model_path is None:
+            raise ValueError("FR_TSO path-sampled wind model was not fitted.")
+        WIND_BIG_M = float(self.wind_model_path.big_m_resistance)
 
         constraints += [wind_resistance <= WIND_BIG_M]
         constraints += [wind_resistance >= -WIND_BIG_M]
@@ -2706,15 +2786,12 @@ class FR_TSO:
         constraints += [normalized_speed == speed_mag / self.ship.info.max_speed]
         constraints += [normalized_rel_speed == speed_rel_water_mag / self.ship.info.max_speed]
 
-        wind_model_future = self.wind_model.thrust_coeffs[
-            :, self.states.timesteps_completed : self.states.timesteps_completed + T_future, :
-        ]
+        wind_model_future = np.asarray(self.wind_model_path.thrust_coeffs, dtype=float)
 
         for t in range(T_future):
             if interval_sail_fraction[t] > 0.01:
                 for s in range(nb_path_zones):
-                    z1 = int(path_zone_ids[s])
-                    c1 = wind_model_future[z1, t, :]
+                    c1 = wind_model_future[s, t, :]
 
                     # Same-segment case: s at t and s at t+1
                     constraints += [
@@ -2730,8 +2807,7 @@ class FR_TSO:
 
                     # Transition case: s -> s+1
                     if s < nb_path_zones - 1:
-                        z2 = int(path_zone_ids[s + 1])
-                        c2 = wind_model_future[z2, t, :]
+                        c2 = wind_model_future[s + 1, t, :]
 
                         constraints += [
                             wind_resistance[t] >=
@@ -2806,10 +2882,12 @@ class FR_TSO:
 
         # ================================= SOLAR POWER =================================
         solar_power = cp.Variable(T_future, nonneg=True)
-        irr_seg = self.weather.irradiance[
-            path_zone_ids,
-            self.states.timesteps_completed : self.states.timesteps_completed + T_future,
-        ]
+        irr_seg = np.asarray(self.sampled_irradiance_path, dtype=float)
+        if irr_seg.shape != (nb_path_zones, T_future):
+            raise ValueError(
+                f"Expected sampled_irradiance_path shape {(nb_path_zones, T_future)}, "
+                f"got {irr_seg.shape}."
+            )
 
         irr_avg = 0.5 * (
             cp.sum(cp.multiply(seg[:-1, :], irr_seg.T), axis=1)

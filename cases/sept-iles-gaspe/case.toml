@@ -7,8 +7,7 @@ new_ship = true
 new_weather = true
 solver_verbose = true
 unit_commitment = false
-djpe_ordered_zones = false
-cjpe_ordered_zones = false
+ordered_zones = false
 
 [cache]
 scope = "case"
