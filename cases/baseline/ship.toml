@@ -89,7 +89,7 @@ LCB_percent     = 0.0
 # max_n         : Maximum rotational speed (turns/sec)
 # min_pow       : Minimum propulsion power (MW)
 # max_pow       : Maximum propulsion power per propeller (MW)
-# wake_fraction : Water relative speed is slower on the stern than on the bow, because ships accelerate water. This is the fraction of relative speed reduced due to this effect, assumed constant.
+# wake_fraction : Water relative speed is slower on the stern than on the bow due to the hull wake. This is the fraction of relative speed reduced due to this effect, assumed constant.
 # ============================
 [propulsion]
 D               = 7.2

@@ -65,6 +65,13 @@ def _option(cli_value, toml_options, key, default):
     return default
 
 
+def _run_bool_option(toml_options, keys, default):
+    for key in keys:
+        if key in toml_options:
+            return bool(toml_options[key])
+    return bool(default)
+
+
 def _enable_console_log(path):
     original_stdout = sys.stdout
     original_stderr = sys.stderr
@@ -93,6 +100,16 @@ if __name__ == "__main__":
         raise ValueError("dimensions must be one of: 1D, 2D, both")
     solver_verbose = bool(_option(args.solver_verbose, run_toml_options, "solver_verbose", solver_verbose))
     unit_commitment = bool(_option(args.unit_commitment, run_toml_options, "unit_commitment", unit_commitment))
+    djpe_ordered_zones = _run_bool_option(
+        run_toml_options,
+        ("djpe_ordered_zones", "djte_ordered_zones"),
+        True,
+    )
+    cjpe_ordered_zones = _run_bool_option(
+        run_toml_options,
+        ("cjpe_ordered_zones", "cjte_ordered_zones"),
+        True,
+    )
     save_plots = bool(_option(args.save_plots, output_toml_options, "save_plots", True))
     show_plots = bool(_option(args.show_plots, output_toml_options, "show_plots", False))
     save_solutions = bool(_option(args.save_solutions, output_toml_options, "save_solutions", True))
@@ -107,6 +124,8 @@ if __name__ == "__main__":
         "new_weather": new_weather,
         "solver_verbose": solver_verbose,
         "unit_commitment": unit_commitment,
+        "djpe_ordered_zones": djpe_ordered_zones,
+        "cjpe_ordered_zones": cjpe_ordered_zones,
         "save_plots": save_plots,
         "show_plots": show_plots,
         "save_solutions": save_solutions,
@@ -169,6 +188,12 @@ if __name__ == "__main__":
     _assert_finite("map.zone_adj", map.zone_adj)
     _assert_finite("map.trans_ineq_to", map.trans_ineq_to)
     _assert_finite("map.trans_ineq_from", map.trans_ineq_from)
+    _assert_finite("weather.irradiance", weather.irradiance)
+    _assert_finite("weather.temperature", weather.temperature)
+    _assert_finite("weather.wind_x", weather.wind_x)
+    _assert_finite("weather.wind_y", weather.wind_y)
+    _assert_finite("weather.current_x", weather.current_x)
+    _assert_finite("weather.current_y", weather.current_y)
 
     x, y, _ = dx_dy_km(map, itinerary.transits[-1].lat, itinerary.transits[-1].lon)
 
@@ -180,12 +205,16 @@ if __name__ == "__main__":
         ship                = ship,)
     path.compute([x,y], verbose=solver_verbose)
 
-    course_angles = path.compute_course_angles()
-    course_angles = np.repeat(course_angles[:, None], weather.wind_x.shape[1], axis=1)
+    path_course_angles = path.compute_course_angles()
+    course_angles = np.repeat(path_course_angles[:, None], weather.wind_x.shape[1], axis=1)
     path_zone_ids = np.asarray(path.sol.zone_sequence, dtype=int)
-    base_wind_model = BaseWindModel(ship, fit_range)
-    wind_x_path = weather.wind_x[path_zone_ids, :]
-    wind_y_path = weather.wind_y[path_zone_ids, :]
+    zone_heading = np.arctan2(
+        y - map.zone_centroids[:, 1],
+        x - map.zone_centroids[:, 0],
+    )
+    zone_course_angles = np.repeat(zone_heading[:, None], weather.wind_x.shape[1], axis=1)
+    for s, z in enumerate(path_zone_ids):
+        zone_course_angles[z, :] = path_course_angles[s]
 
     # ============================================================
     # 1) Initialize models
@@ -298,12 +327,12 @@ if __name__ == "__main__":
 
     if new_weather:
         start = time.time()
-        if dimensions == "1D" or dimensions == "both":
+        if dimensions in ("1D", "2D", "both"):
             wind_model_1D = WindModel1D(ship, fit_range)
             wind_model_1D.fit_convex_models(
-            wind_x_path,
-            wind_y_path,
-            course_angles,
+            weather.wind_x,
+            weather.wind_y,
+            zone_course_angles,
             )
             print("average max error wind 1D", np.mean(wind_model_1D.relative_errors) , "%")
 
@@ -324,9 +353,9 @@ if __name__ == "__main__":
             '''
             wind_model_path_2D = WindModelPathAligned2D(ship, fit_range)
             wind_model_path_2D.fit_convex_models(
-                wind_x_path,
-                wind_y_path,
-                course_angles,
+                weather.wind_x,
+                weather.wind_y,
+                zone_course_angles,
                 debug=False,
             )
 
@@ -335,7 +364,7 @@ if __name__ == "__main__":
         print("Weather model fit took :", end - start, "seconds")
 
     else:
-        if dimensions == "1D" or dimensions == "both":
+        if dimensions in ("1D", "2D", "both"):
             wind_model_1D = load_obj(WIND_MODEL_1D)
         if dimensions == "2D" or dimensions == "both":
             #wind_model_2D = load_obj(WIND_MODEL_2D)
@@ -417,6 +446,61 @@ if __name__ == "__main__":
         map=naive.map,
     )
 
+    # ============================================================
+    # FR_O continuous fixed-path preflight.
+    # Run before any binary formulation so oversized timesteps fail fast.
+    # ============================================================
+    FR_O_runner = FR_O(
+        wind_model=wind_model_1D,
+        propulsion_model=propulsion_model,
+        calm_model=calm_model,
+        generator_models=generatorModels,
+        map=map,
+        itinerary=itinerary,
+        states=states,
+        weather=weather,
+        ship=ship,
+        ref_speed=ref_speed,
+        waypoints=path.sol.waypoints,
+        path_zone_ids=path.sol.zone_sequence,
+    )
+    FR_O_runner.nc_sources = nc_sources
+    fr_o_ok = FR_O_runner.optimize(
+        unit_commitment=False,
+        debug=True,
+        verbose=solver_verbose,
+    )
+    if not fr_o_ok:
+        if getattr(FR_O_runner, "failure_reason", None) == "waypoint_crossing":
+            print(
+                "[ABORT] Binary fixed-path and zone optimizers are being "
+                "skipped because FR_O showed the timestep is too large for "
+                "this map/path."
+            )
+        else:
+            print(
+                "[ABORT] FR_O preflight failed before binary optimizers could run; "
+                f"reason={getattr(FR_O_runner, 'failure_reason', 'unknown')}."
+            )
+        sys.exit(1)
+
+    _, FR_O_rule_sol, _, _ = evaluate_with_rule_based_power_management(
+        FR_O_runner,
+        "FR_O",
+    )
+    _, FR_O_nonconv_sol_pow, _, _ = evaluate_with_updated_power_management(
+        FR_O_runner,
+        "FR_O",
+    )
+    maybe_plot_solutions(
+        [FR_O_runner.sol, FR_O_rule_sol],
+        ["Convex FR_O solution", "FR_O rule-based evaluator"],
+        benchmark_label="FR_O rule-based evaluator",
+        show=False,
+        subfolder=relaxation_quality_dir("FR_O"),
+        map=FR_O_runner.map,
+    )
+
     if dimensions == "1D" or dimensions == "both":
         optimizer = FR_TSO(
             wind_model          = wind_model_1D,
@@ -436,7 +520,7 @@ if __name__ == "__main__":
         ok = optimizer.optimize(
             unit_commitment     = unit_commitment,
             debug               = True,
-            restrict_to_base    = True,
+            restrict_to_base    = False,
             base_solution       = naive.sol,
             base_segment_radius = 1,
             verbose             = solver_verbose,
@@ -502,52 +586,6 @@ if __name__ == "__main__":
         else:
             print("Optimization failed.")
 
-        # ============================================================
-        # FR_TSO, time-sampled weather benchmark
-        # ============================================================
-        remaining_sail_time_h = float(
-            np.sum(
-                classify_timesteps(itinerary)[2][states.timesteps_completed:]
-                * itinerary.timestep_dt_h[states.timesteps_completed:]
-            )
-        )
-        ref_speed = path.sol.total_distance / remaining_sail_time_h * 1000 / 3600
-        FR_O_runner = FR_O(
-            wind_model=wind_model_1D,
-            propulsion_model=propulsion_model,
-            calm_model=calm_model,
-            generator_models=generatorModels,
-            map=map,
-            itinerary=itinerary,
-            states=states,
-            weather=weather,
-            ship=ship,
-            ref_speed=ref_speed,
-            waypoints=path.sol.waypoints,
-            path_zone_ids=path.sol.zone_sequence,
-        )
-        FR_O_runner.nc_sources = nc_sources
-        FR_O_runner.optimize(
-            unit_commitment=unit_commitment,
-            debug=True,
-            verbose=solver_verbose,
-        )
-        _, FR_O_rule_sol, _, _ = evaluate_with_rule_based_power_management(
-            FR_O_runner,
-            "FR_O",
-        )
-        _, FR_O_nonconv_sol_pow, _, _ = evaluate_with_updated_power_management(
-            FR_O_runner,
-            "FR_O",
-        )
-        maybe_plot_solutions(
-            [FR_O_runner.sol, FR_O_rule_sol],
-            ["Convex FR_O solution", "FR_O rule-based evaluator"],
-            benchmark_label="FR_O rule-based evaluator",
-            show=False,
-            subfolder=relaxation_quality_dir("FR_O"),
-            map=FR_O_runner.map,
-        )
         if dimensions == "1D":
             print_debug_report()
             maybe_plot_solutions(
@@ -578,10 +616,10 @@ if __name__ == "__main__":
         optimizer.states.zone = point_in_zones(init_pos, optimizer.map.zone_ineq)
         x, y, _ = dx_dy_km(optimizer.map, optimizer.itinerary.transits[-1].lat, optimizer.itinerary.transits[-1].lon)
 
-        optimizer.optimize(
+        ok = optimizer.optimize(
             unit_commitment=unit_commitment,
             debug=True,
-            ordered_zones = True,
+            ordered_zones = djpe_ordered_zones,
             min_timestep = True,
             enforce_adjacency=True,
             restrict_to_base=False,
@@ -589,34 +627,38 @@ if __name__ == "__main__":
             base_zone_radius=1,
             verbose=solver_verbose,
         )
-        maybe_plot_zones_and_points(optimizer.sol.ship_pos, optimizer.map.zone_ineq)
-        _, DJPE_TSO_rule_sol, _, _ = evaluate_with_rule_based_power_management(
-            optimizer,
-            "DJPE_TSO",
-        )
-        n_all, DJPE_TSO_POW_sol, dt_h, best_pitch = evaluate_with_updated_power_management(
-            optimizer,
-            "DJPE_TSO",
-        )
-        maybe_plot_solutions(
-            [optimizer.sol, DJPE_TSO_rule_sol],
-            ["Convex DJPE_TSO solution", "DJPE_TSO rule-based evaluator"],
-            benchmark_label="DJPE_TSO rule-based evaluator",
-            show=False,
-            subfolder=relaxation_quality_dir("DJPE_TSO"),
-            map=optimizer.map,
-        )
+        if ok:
+            maybe_plot_zones_and_points(optimizer.sol.ship_pos, optimizer.map.zone_ineq)
+            _, DJPE_TSO_rule_sol, _, _ = evaluate_with_rule_based_power_management(
+                optimizer,
+                "DJPE_TSO",
+            )
+            n_all, DJPE_TSO_POW_sol, dt_h, best_pitch = evaluate_with_updated_power_management(
+                optimizer,
+                "DJPE_TSO",
+            )
+            maybe_plot_solutions(
+                [optimizer.sol, DJPE_TSO_rule_sol],
+                ["Convex DJPE_TSO solution", "DJPE_TSO rule-based evaluator"],
+                benchmark_label="DJPE_TSO rule-based evaluator",
+                show=False,
+                subfolder=relaxation_quality_dir("DJPE_TSO"),
+                map=optimizer.map,
+            )
+        else:
+            print("DJPE_TSO optimization failed.")
 
         if dimensions == "2D":
             print_debug_report()
-            maybe_plot_solutions(
-                [naive_rule_sol, naive_nonconv_sol, DJPE_TSO_rule_sol, DJPE_TSO_POW_sol],
-                ["Naive + rule-based", "Naive + energy", "DJPE_TSO + rule-based", "DJPE_TSO + energy"],
-                benchmark_label="Naive + rule-based",
-                show=show_plots,
-                subfolder=all_solution_comparison_dir,
-                map=optimizer.map,
-            )
+            if ok:
+                maybe_plot_solutions(
+                    [naive_rule_sol, naive_nonconv_sol, DJPE_TSO_rule_sol, DJPE_TSO_POW_sol],
+                    ["Naive + rule-based", "Naive + energy", "DJPE_TSO + rule-based", "DJPE_TSO + energy"],
+                    benchmark_label="Naive + rule-based",
+                    show=show_plots,
+                    subfolder=all_solution_comparison_dir,
+                    map=optimizer.map,
+                )
 
     if dimensions == "both":
         glob_cont_opt = CJPE_TSO(
@@ -638,10 +680,10 @@ if __name__ == "__main__":
         glob_cont_opt.states.zone = point_in_zones(init_pos, glob_cont_opt.map.zone_ineq)
         x, y, _ = dx_dy_km(glob_cont_opt.map, glob_cont_opt.itinerary.transits[-1].lat, glob_cont_opt.itinerary.transits[-1].lon)
 
-        glob_cont_opt.optimize(
+        ok = glob_cont_opt.optimize(
             unit_commitment=unit_commitment,
             debug=True,
-            ordered_zones = True,
+            ordered_zones = cjpe_ordered_zones,
             min_timestep = True,
             enforce_adjacency=True,
             restrict_to_base=False,
@@ -649,64 +691,37 @@ if __name__ == "__main__":
             base_zone_radius=1,
             verbose=solver_verbose,
         )
-        maybe_plot_zones_and_points(glob_cont_opt.sol.ship_pos, glob_cont_opt.map.zone_ineq)
-        _, CJTE_TSO_rule_sol, _, _ = evaluate_with_rule_based_power_management(
-            glob_cont_opt,
-            "CJPE_TSO",
-        )
-        n_all, CJTE_TSO_POW_sol, dt_h, best_pitch = evaluate_with_updated_power_management(
-            glob_cont_opt,
-            "CJPE_TSO",
-        )
-        for name in [
-            "prop_power",
-            "wind_resistance",
-            "calm_water_resistance",
-            "total_resistance",
-            "speed_rel_water_mag",
-        ]:
-            print(name)
-            print("  optimizer:", np.asarray(glob_cont_opt.sol.__dict__[name]).shape)
-            print("  evaluator:", np.asarray(CJTE_TSO_POW_sol.__dict__[name]).shape)
-        maybe_plot_solutions(
-            [glob_cont_opt.sol, CJTE_TSO_rule_sol],
-            ["Convex CJPE_TSO solution", "CJPE_TSO rule-based evaluator"],
-            benchmark_label="CJPE_TSO rule-based evaluator",
-            show=False,
-            subfolder=relaxation_quality_dir("CJPE_TSO"),
-            map=glob_cont_opt.map,
-        )
+        if ok:
+            maybe_plot_zones_and_points(glob_cont_opt.sol.ship_pos, glob_cont_opt.map.zone_ineq)
+            _, CJTE_TSO_rule_sol, _, _ = evaluate_with_rule_based_power_management(
+                glob_cont_opt,
+                "CJPE_TSO",
+            )
+            n_all, CJTE_TSO_POW_sol, dt_h, best_pitch = evaluate_with_updated_power_management(
+                glob_cont_opt,
+                "CJPE_TSO",
+            )
+            for name in [
+                "prop_power",
+                "wind_resistance",
+                "calm_water_resistance",
+                "total_resistance",
+                "speed_rel_water_mag",
+            ]:
+                print(name)
+                print("  optimizer:", np.asarray(glob_cont_opt.sol.__dict__[name]).shape)
+                print("  evaluator:", np.asarray(CJTE_TSO_POW_sol.__dict__[name]).shape)
+            maybe_plot_solutions(
+                [glob_cont_opt.sol, CJTE_TSO_rule_sol],
+                ["Convex CJPE_TSO solution", "CJPE_TSO rule-based evaluator"],
+                benchmark_label="CJPE_TSO rule-based evaluator",
+                show=False,
+                subfolder=relaxation_quality_dir("CJPE_TSO"),
+                map=glob_cont_opt.map,
+            )
+        else:
+            print("CJPE_TSO optimization failed.")
         print_debug_report()
-        maybe_plot_solutions(
-            [
-                naive_rule_sol,
-                naive_nonconv_sol,
-                FR_O_rule_sol,
-                FR_O_nonconv_sol_pow,
-                FR_STO_rule_sol,
-                FR_STO_POW_sol,
-                CJTE_TSO_rule_sol,
-                CJTE_TSO_POW_sol,
-                DJPE_TSO_rule_sol,
-                DJPE_TSO_POW_sol,
-            ],
-            [
-                "Naive Controller + rule-based",
-                "Naive Controller + energy",
-                "FR_O + rule-based",
-                "FR_O + energy",
-                "FR_STO + rule-based",
-                "FR_STO + energy",
-                "CJPE_TSO + rule-based",
-                "CJPE_TSO + energy",
-                "DJPE_TSO + rule-based",
-                "DJPE_TSO + energy",
-            ],
-            benchmark_label="Naive Controller + rule-based",
-            show=show_plots,
-            subfolder=all_solution_comparison_dir,
-            map=optimizer.map,
-        )
 
     solution_records = [
         ("naive_rule", "Naive Controller + rule-based", locals().get("naive_rule_sol")),
@@ -720,6 +735,22 @@ if __name__ == "__main__":
         ("cjpe_tso_rule", "CJPE_TSO + rule-based", locals().get("CJTE_TSO_rule_sol")),
         ("cjpe_tso_energy", "CJPE_TSO + energy", locals().get("CJTE_TSO_POW_sol")),
     ]
+
+    available_comparison = [
+        (label, sol)
+        for _, label, sol in solution_records
+        if sol is not None
+    ]
+    if len(available_comparison) >= 2:
+        maybe_plot_solutions(
+            [sol for _, sol in available_comparison],
+            [label for label, _ in available_comparison],
+            benchmark_label="Naive Controller + rule-based",
+            show=show_plots,
+            subfolder=all_solution_comparison_dir,
+            map=map,
+        )
+
     summary_rows = save_run_results(
         run_context,
         solution_records,

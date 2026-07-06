@@ -25,6 +25,7 @@ pycparser==3.0
 pyparsing==3.3.2
 pyproj==3.7.2
 python-dateutil==2.9.0.post0
+rasterio==1.4.3
 scipy==1.17.1
 scs==3.2.11
 setuptools==82.0.1

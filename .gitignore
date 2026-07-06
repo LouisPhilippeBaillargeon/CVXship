@@ -2,10 +2,21 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+.venv/
+venv/
+env/
+ENV/
 
 archive/
 slprj/
 
+cache/
 results/
 outputs/
 plots/

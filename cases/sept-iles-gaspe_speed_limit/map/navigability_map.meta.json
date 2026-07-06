@@ -1,0 +1,12 @@
+{
+  "artifact": "navigability_map.npy",
+  "map_params": {
+    "resolution_km": 1.0,
+    "span_km_east": 300.0,
+    "span_km_north": 300.0,
+    "sw_lat": 47.7,
+    "sw_lon": -67.0
+  },
+  "min_depth": 15.525,
+  "version": 1
+}

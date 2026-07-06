@@ -30,6 +30,359 @@ def _path_pos_at_distance(waypoints, d_abs):
     return waypoints[s] + alpha * seg_vecs[s]
 
 
+def redistribute_generator_adjustment(
+    P_g,
+    delta_total,
+    direction,
+    P_g_min,
+    P_g_max,
+    gen_allowed,
+    rated_capacity,
+    eps=1e-9,
+):
+    """
+    Redispatch generator powers by a requested aggregate increase/decrease.
+
+    Ineligible generators are fixed at zero. Eligible generators are kept within
+    their effective lower/upper bounds, and saturated units are frozen while the
+    remaining adjustment is redistributed.
+    """
+    P = np.asarray(P_g, dtype=float).copy()
+    P_min = np.asarray(P_g_min, dtype=float).copy()
+    P_max = np.asarray(P_g_max, dtype=float).copy()
+    allowed = np.asarray(gen_allowed, dtype=bool).reshape(P.shape)
+    rated = np.asarray(rated_capacity, dtype=float).reshape(P.shape)
+
+    P_min = np.where(allowed, P_min, 0.0)
+    P_max = np.where(allowed, P_max, 0.0)
+    P = np.where(allowed, P, 0.0)
+    P = np.minimum(np.maximum(P, P_min), P_max)
+
+    remaining = float(max(0.0, delta_total))
+    if remaining <= eps:
+        return P, 0.0
+
+    if direction not in ("increase", "decrease"):
+        raise ValueError("direction must be 'increase' or 'decrease'.")
+
+    while remaining > eps:
+        if direction == "decrease":
+            headroom = np.where(allowed, np.maximum(P - P_min, 0.0), 0.0)
+            eligible = headroom > eps
+            weights = np.where(eligible, np.maximum(P, 0.0), 0.0)
+        else:
+            headroom = np.where(allowed, np.maximum(P_max - P, 0.0), 0.0)
+            eligible = headroom > eps
+            weights = np.where(eligible, np.maximum(P, 0.0), 0.0)
+            if float(np.sum(weights)) <= eps:
+                weights = np.where(eligible, np.maximum(rated, 0.0), 0.0)
+
+        total_headroom = float(np.sum(headroom))
+        if total_headroom <= eps:
+            break
+
+        if float(np.sum(weights)) <= eps:
+            weights = np.where(eligible, headroom, 0.0)
+
+        weight_sum = float(np.sum(weights))
+        if weight_sum <= eps:
+            break
+
+        requested = remaining * weights / weight_sum
+        applied = np.minimum(requested, headroom)
+        applied_total = float(np.sum(applied))
+        if applied_total <= eps:
+            break
+
+        if direction == "decrease":
+            P -= applied
+        else:
+            P += applied
+
+        remaining -= applied_total
+        P = np.minimum(np.maximum(P, P_min), P_max)
+
+    return P, max(0.0, remaining)
+
+
+def apply_rule_based_power_balance_interval(
+    *,
+    P_prop,
+    P_aux,
+    P_pv_available,
+    P_g_cmd,
+    P_sh_cmd,
+    P_bat_ch_cmd,
+    P_bat_dis_cmd,
+    soc_start,
+    dt_h,
+    P_g_min,
+    P_g_max,
+    gen_on,
+    rated_capacity,
+    P_sh_max,
+    P_bat_ch_max,
+    P_bat_dis_max,
+    soc_min,
+    soc_max,
+    eta_ch,
+    eta_dis,
+    battery_leak,
+    eps=1e-9,
+):
+    """
+    Deterministic rule-based power-balance repair for one evaluated interval.
+    """
+    events = []
+    errors = []
+
+    def _event(key, message, amount):
+        events.append((key, message, float(abs(amount))))
+
+    def _error(key, message, amount):
+        errors.append((key, message, float(abs(amount))))
+
+    dt = float(dt_h)
+    dt_safe = max(dt, eps)
+    eta_ch = float(eta_ch)
+    eta_dis = float(eta_dis)
+    if eta_ch <= 0.0 or eta_dis <= 0.0:
+        raise ValueError("Battery charge/discharge efficiencies must be positive.")
+    battery_leak = float(battery_leak)
+    if battery_leak < 0.0:
+        raise ValueError("Battery leak factor must be nonnegative.")
+
+    P_g_cmd = np.asarray(P_g_cmd, dtype=float).reshape(-1)
+    P_g_min = np.asarray(P_g_min, dtype=float).reshape(P_g_cmd.shape)
+    P_g_max = np.asarray(P_g_max, dtype=float).reshape(P_g_cmd.shape)
+    gen_on_status = (np.asarray(gen_on, dtype=float).reshape(P_g_cmd.shape) > 0.5).astype(float)
+    rated_capacity = np.asarray(rated_capacity, dtype=float).reshape(P_g_cmd.shape)
+
+    gen_allowed = gen_on_status > 0.5
+    P_g_min_eff = np.where(gen_allowed, P_g_min, 0.0)
+    P_g_max_eff = np.where(gen_allowed, P_g_max, 0.0)
+
+    P_g = np.where(gen_allowed, np.maximum(P_g_cmd, 0.0), 0.0)
+    P_g_clipped = np.minimum(np.maximum(P_g, P_g_min_eff), P_g_max_eff)
+    if np.max(np.abs(P_g_clipped - P_g_cmd)) > eps:
+        _event(
+            "generator_command_clipped",
+            "Generator command was clipped to unit-commitment availability or generator power limits.",
+            np.max(np.abs(P_g_clipped - P_g_cmd)),
+        )
+    P_g = P_g_clipped
+
+    P_sh_max = max(0.0, float(P_sh_max))
+    P_sh = min(max(0.0, float(P_sh_cmd)), P_sh_max)
+    if abs(P_sh - float(P_sh_cmd)) > eps:
+        _event(
+            "shore_power_command_reduced",
+            "Shore power command was clipped to the physical interval shore-power limit.",
+            P_sh - float(P_sh_cmd),
+        )
+
+    cmd_ch = max(0.0, float(P_bat_ch_cmd))
+    cmd_dis = max(0.0, float(P_bat_dis_cmd))
+    if cmd_ch > eps and cmd_dis > eps:
+        _event(
+            "battery_simultaneous_command_netted",
+            "Simultaneous battery charge and discharge commands were netted.",
+            min(cmd_ch, cmd_dis),
+        )
+
+    if cmd_ch >= cmd_dis:
+        P_bat_ch = cmd_ch - cmd_dis
+        P_bat_dis = 0.0
+    else:
+        P_bat_dis = cmd_dis - cmd_ch
+        P_bat_ch = 0.0
+
+    leak_factor = float(battery_leak) ** dt
+    soc_after_leak = leak_factor * float(soc_start)
+
+    max_charge_from_soc = max(0.0, (float(soc_max) - soc_after_leak) / (eta_ch * dt_safe))
+    P_bat_ch_feasible = min(P_bat_ch, max(0.0, float(P_bat_ch_max)), max_charge_from_soc)
+    if abs(P_bat_ch_feasible - P_bat_ch) > eps:
+        _event(
+            "battery_charge_command_reduced",
+            "Battery charge command was reduced by charge power or SOC headroom.",
+            P_bat_ch - P_bat_ch_feasible,
+        )
+    P_bat_ch = P_bat_ch_feasible
+
+    soc_after_charge = soc_after_leak + eta_ch * P_bat_ch * dt
+    max_discharge_from_soc = max(0.0, (soc_after_charge - float(soc_min)) * eta_dis / dt_safe)
+    P_bat_dis_feasible = min(
+        P_bat_dis,
+        max(0.0, float(P_bat_dis_max)),
+        max_discharge_from_soc,
+    )
+    if abs(P_bat_dis_feasible - P_bat_dis) > eps:
+        _event(
+            "battery_discharge_command_reduced",
+            "Battery discharge command was reduced by discharge power or SOC availability.",
+            P_bat_dis - P_bat_dis_feasible,
+        )
+    P_bat_dis = P_bat_dis_feasible
+
+    P_pv_used = max(0.0, float(P_pv_available))
+    P_pv_curt = 0.0
+    demand = float(P_prop) + float(P_aux) + P_bat_ch
+    supply = float(np.sum(P_g)) + P_sh + P_bat_dis + P_pv_used
+    residual = supply - demand
+
+    if residual > eps:
+        P_g, residual = redistribute_generator_adjustment(
+            P_g,
+            residual,
+            "decrease",
+            P_g_min_eff,
+            P_g_max_eff,
+            gen_allowed,
+            rated_capacity,
+            eps=eps,
+        )
+
+        if residual > eps:
+            delta = min(residual, P_sh)
+            P_sh -= delta
+            residual -= delta
+
+        if residual > eps:
+            delta = min(residual, P_bat_dis)
+            P_bat_dis -= delta
+            residual -= delta
+
+        if residual > eps:
+            soc_next_base = (
+                soc_after_leak
+                + eta_ch * P_bat_ch * dt
+                - P_bat_dis * dt / eta_dis
+            )
+            charge_power_headroom = max(0.0, float(P_bat_ch_max) - P_bat_ch)
+            charge_soc_headroom = max(
+                0.0,
+                (float(soc_max) - soc_next_base) / (eta_ch * dt_safe),
+            )
+            extra_charge_room = max(0.0, min(charge_power_headroom, charge_soc_headroom))
+            delta = min(residual, extra_charge_room)
+            P_bat_ch += delta
+            residual -= delta
+
+        if residual > eps:
+            delta = min(residual, P_pv_used)
+            P_pv_used -= delta
+            P_pv_curt += delta
+            residual -= delta
+            if delta > eps:
+                _event(
+                    "solar_power_curtailed",
+                    "Solar power was curtailed only after all surplus-absorption actions were exhausted.",
+                    delta,
+                )
+
+        if residual > eps:
+            _error(
+                "power_surplus_infeasible",
+                "Power balance is infeasible: unavoidable surplus remains after deterministic redispatch.",
+                residual,
+            )
+
+    elif residual < -eps:
+        missing = -residual
+
+        shore_headroom = max(0.0, P_sh_max - P_sh)
+        delta = min(missing, shore_headroom)
+        P_sh += delta
+        missing -= delta
+
+        if missing > eps:
+            P_g, missing = redistribute_generator_adjustment(
+                P_g,
+                missing,
+                "increase",
+                P_g_min_eff,
+                P_g_max_eff,
+                gen_allowed,
+                rated_capacity,
+                eps=eps,
+            )
+
+        if missing > eps:
+            delta = min(missing, P_bat_ch)
+            P_bat_ch -= delta
+            missing -= delta
+
+        if missing > eps:
+            soc_next_base = (
+                soc_after_leak
+                + eta_ch * P_bat_ch * dt
+                - P_bat_dis * dt / eta_dis
+            )
+            discharge_power_headroom = max(0.0, float(P_bat_dis_max) - P_bat_dis)
+            discharge_soc_headroom = max(
+                0.0,
+                (soc_next_base - float(soc_min)) * eta_dis / dt_safe,
+            )
+            extra_discharge_room = max(
+                0.0,
+                min(discharge_power_headroom, discharge_soc_headroom),
+            )
+            delta = min(missing, extra_discharge_room)
+            P_bat_dis += delta
+            missing -= delta
+
+        residual = -missing
+        if missing > eps:
+            _error(
+                "power_deficit_infeasible",
+                "Power balance is infeasible: missing supply remains after deterministic redispatch.",
+                missing,
+            )
+
+    soc_next = (
+        soc_after_leak
+        + eta_ch * P_bat_ch * dt
+        - P_bat_dis * dt / eta_dis
+    )
+    if soc_next < float(soc_min) - eps:
+        _error(
+            "battery_soc_below_min",
+            "Battery SOC fell below its minimum bound after rule-based redispatch.",
+            float(soc_min) - soc_next,
+        )
+    elif soc_next > float(soc_max) + eps:
+        _error(
+            "battery_soc_above_max",
+            "Battery SOC exceeded its maximum bound after rule-based redispatch.",
+            soc_next - float(soc_max),
+        )
+    else:
+        soc_next = float(np.clip(soc_next, float(soc_min), float(soc_max)))
+
+    final_residual = (
+        float(np.sum(P_g))
+        + P_sh
+        + P_bat_dis
+        + P_pv_used
+        - (float(P_prop) + float(P_aux) + P_bat_ch)
+    )
+
+    return {
+        "generation_power": P_g,
+        "gen_on": gen_on_status,
+        "shore_power": P_sh,
+        "battery_charge": P_bat_ch,
+        "battery_discharge": P_bat_dis,
+        "solar_power": P_pv_used,
+        "solar_curtailment": P_pv_curt,
+        "soc_next": soc_next,
+        "residual": final_residual,
+        "events": events,
+        "errors": errors,
+    }
+
+
 def compute_non_convex_cost_all_timesteps_nc_interpolated(
     runner,
     eps=1e-9,
@@ -106,7 +459,6 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
 
     speed_cmd = np.asarray(sol.speed_mag, dtype=float)
     uses_two_setpoints = speed_cmd.ndim == 2 and speed_cmd.shape[1] == 2
-    effective_speed_cmd = np.asarray(speed_cmd, dtype=float).copy()
 
     def _as_T_or_TH(x, name):
         arr = np.asarray(x, dtype=float)
@@ -231,7 +583,6 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
                     _add_segment(segments_by_t, t, dt_seg_h, dist, speed_mps * direction, h_cmd, mid_pos, mid_off, "path_TH")
             else:
                 speed_mps = total_d / dt_vec[t] * 1000.0 / 3600.0
-                effective_speed_cmd[t] = speed_mps
                 split_points = [d_start]
                 for b in D_breaks[1:-1]:
                     if d_start + eps < b < d_end - eps:
@@ -286,7 +637,6 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
                     _add_segment(segments_by_t, t, dt_seg_h, dist, speed_vec, h_cmd, 0.5 * (a + b), mid_off, "q_TH")
             else:
                 speed_mps = total_d / dt_vec[t] * 1000.0 / 3600.0
-                effective_speed_cmd[t] = speed_mps
                 tau_h = 0.0
                 for h_geom, ((a, b), dist) in enumerate(zip(pieces_geom, dists)):
                     if dist <= eps:
@@ -337,7 +687,6 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
                     )
             else:
                 speed_mps = total_d / dt_vec[t] * 1000.0 / 3600.0
-                effective_speed_cmd[t] = speed_mps
                 dt_seg_h = dt_vec[t]
                 _add_segment(
                     segments_by_t,
@@ -362,13 +711,13 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
     prop_power = np.zeros((T, Hmax))
     wind_resistance = np.zeros((T, Hmax))
     calm_water_resistance = np.zeros((T, Hmax))
-    acc_force = np.zeros((T, Hmax))
     total_resistance = np.zeros((T, Hmax))
     generation_power = np.zeros((nb_gen, T, Hmax))
     gen_costs = np.zeros((nb_gen, T, Hmax))
     gen_on_all = np.zeros((nb_gen, T, Hmax))
     solar_power = np.zeros((T, Hmax))
     solar_power_available = np.zeros((T, Hmax))
+    solar_curtailment = np.zeros((T, Hmax))
     shore_power = np.zeros((T, Hmax))
     shore_power_cost = np.zeros((T, Hmax))
     battery_charge = np.zeros((T, Hmax))
@@ -382,11 +731,11 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
     c0 = c0_matrix[:, 0]
     gen_min_power = np.array([g.min_power for g in ship.generators], dtype=float)
     gen_max_power = np.array([g.max_power for g in ship.generators], dtype=float)
-    dt_s_vec = np.maximum(dt_vec * 3600.0, eps)
-    speed_before = float(getattr(runner.states, "current_speed", 0.0))
+    source_generator_unit_commitment = getattr(sol, "generator_unit_commitment", None)
     battery_capacity = float(ship.battery.capacity)
     battery_charge_eff = float(ship.battery.charge_eff)
     battery_discharge_eff = float(ship.battery.discharge_eff)
+    battery_leak = float(ship.battery.leak)
     battery_max_charge = float(ship.battery.max_charge_pow)
     battery_max_discharge = float(ship.battery.max_discharge_pow)
     soc_running = float(np.clip(getattr(runner.states, "soc", 0.0), 0.0, battery_capacity))
@@ -412,133 +761,6 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
             float(itinerary.transits[p].max_charge_power),
             float(itinerary.transits[p].power_cost),
         )
-
-    def _dispatch_generators(remaining_load, gen_cmd, gen_on_cmd, t, h):
-        gen_cmd = np.asarray(gen_cmd, dtype=float).copy()
-        gen_on_cmd = np.asarray(gen_on_cmd, dtype=float).copy()
-        gp = np.zeros(nb_gen, dtype=float)
-        online_actual = (gen_on_cmd > 0.5).astype(float)
-        remaining_load = float(max(0.0, remaining_load))
-
-        clipped_cmd = np.clip(gen_cmd, 0.0, gen_max_power)
-        clipped_delta = np.max(np.abs(clipped_cmd - gen_cmd)) if gen_cmd.size else 0.0
-        if clipped_delta > eps:
-            _record_message(
-                validation_warnings,
-                "generator_command_clipped",
-                "Generator command was clipped to generator power limits.",
-                clipped_delta,
-            )
-        gen_cmd = clipped_cmd
-
-        if remaining_load <= eps:
-            return gp, online_actual, 0.0
-
-        online = online_actual > 0.5
-        off_command = (~online) & (gen_cmd > eps)
-        if np.any(off_command):
-            _record_message(
-                validation_warnings,
-                "generator_command_while_off",
-                "Generator command was ignored because the generator was off.",
-                float(np.max(gen_cmd[off_command])),
-            )
-            gen_cmd[off_command] = 0.0
-
-        commanded_total = float(np.sum(gen_cmd))
-
-        if commanded_total >= remaining_load - eps:
-            on = online & (gen_cmd > eps)
-            if not np.any(on):
-                _record_message(
-                    validation_errors,
-                    "generator_no_online_capacity",
-                    "Generator dispatch is infeasible: no commanded generator can meet remaining load.",
-                    remaining_load,
-                )
-                return gp, online_actual, remaining_load
-
-            floor = np.zeros(nb_gen, dtype=float)
-            floor[on] = gen_min_power[on]
-            below_min = on & (gen_cmd < floor - eps)
-            if np.any(below_min):
-                _record_message(
-                    validation_warnings,
-                    "generator_command_below_min",
-                    "Generator command was below minimum power for an active generator.",
-                    float(np.max(floor[below_min] - gen_cmd[below_min])),
-                )
-
-            min_total = float(np.sum(floor))
-            if remaining_load <= min_total + eps:
-                gp = floor
-                wasted = max(0.0, min_total - remaining_load)
-                if wasted > eps:
-                    _record_message(
-                        validation_warnings,
-                        "generator_minimum_power_wasted",
-                        "Generator output was wasted because active generators hit minimum power.",
-                        wasted,
-                    )
-                return gp, online_actual, 0.0
-
-            reduction_needed = commanded_total - remaining_load
-            room_down = np.maximum(gen_cmd - floor, 0.0)
-            room_total = float(np.sum(room_down))
-            if reduction_needed <= eps:
-                gp = gen_cmd
-            elif room_total > eps:
-                gp = gen_cmd - reduction_needed * room_down / room_total
-            else:
-                gp = floor
-
-            gp = np.maximum(gp, floor)
-            return gp, online_actual, 0.0
-
-        increase_needed = remaining_load - commanded_total
-        room_up = np.zeros(nb_gen, dtype=float)
-        room_up[online] = np.maximum(gen_max_power[online] - gen_cmd[online], 0.0)
-        room_total = float(np.sum(room_up))
-
-        if room_total + eps < increase_needed:
-            gp = gen_max_power.copy()
-            shortfall = remaining_load - float(np.sum(gp))
-            _record_message(
-                validation_errors,
-                "generator_capacity_shortfall",
-                "Generator dispatch is infeasible: high limits cannot meet remaining load.",
-                shortfall,
-            )
-            return gp, online_actual, shortfall
-
-        if room_total > eps:
-            gp = gen_cmd + increase_needed * room_up / room_total
-        else:
-            gp = gen_cmd
-
-        return gp, online_actual, 0.0
-
-    def _cmd_speed_for_acc(t, h_cmd):
-        if uses_two_setpoints:
-            return float(effective_speed_cmd[t, h_cmd])
-        return float(effective_speed_cmd[t])
-
-    def _previous_cmd_speed_for_acc(t, h_cmd):
-        if uses_two_setpoints:
-            if t == 0 and h_cmd == 0:
-                return speed_before
-            if h_cmd == 0:
-                return float(speed_cmd[t - 1, 1])
-            return float(speed_cmd[t, 0])
-        if t == 0:
-            return speed_before
-        return float(speed_cmd[t - 1])
-
-    def _acc_for(t, h_cmd, dt_h):
-        if uses_two_setpoints:
-            denom_s = max(float(dt_h) * 3600.0, eps)
-            return (_cmd_speed_for_acc(t, h_cmd) - _previous_cmd_speed_for_acc(t, h_cmd)) / denom_s
-        return (_cmd_speed_for_acc(t, 0) - _previous_cmd_speed_for_acc(t, 0)) / dt_s_vec[t]
 
     for t in range(T):
         for h, seg in enumerate(segments_by_t[t]):
@@ -577,13 +799,10 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
                 wind_resistance[t, h] = float(wind_model.compute_resistance(wind_vec, v_ship))
                 calm_water_resistance[t, h] = float(calm_model.compute_resistance(speed_rel_water_mag[t, h]))
 
-                a = _acc_for(t, h_cmd, dt_h)
-                acc_force[t, h] = a * ship.info.weight / 1_000_000
                 total_resistance[t, h] = max(
                     0.0,
                     wind_resistance[t, h]
-                    + calm_water_resistance[t, h]
-                    + acc_force[t, h],
+                    + calm_water_resistance[t, h],
                 )
 
                 ua = (1.0 - ship.propulsion.wake_fraction) * speed_rel_water_mag[t, h]
@@ -613,179 +832,46 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
                         "prop", prop_power[t, h],
                     )
 
-            dt_h_safe = max(dt_h, eps)
-            soc_after_leak = (float(ship.battery.leak) ** dt_h) * soc_running
-
-            cmd_charge = max(0.0, float(battery_charge[t, h]))
-            max_charge_from_soc = max(
-                0.0,
-                (battery_capacity - soc_after_leak) / (battery_charge_eff * dt_h_safe),
-            )
-            feasible_cmd_charge = min(
-                cmd_charge,
-                battery_max_charge,
-                max_charge_from_soc,
-            )
-            if abs(feasible_cmd_charge - cmd_charge) > eps:
-                _record_message(
-                    validation_warnings,
-                    "battery_charge_command_reduced",
-                    "Battery charge command was reduced by charge power or SOC headroom.",
-                    cmd_charge - feasible_cmd_charge,
-                )
-
-            cmd_discharge = max(0.0, float(battery_discharge[t, h]))
-            max_discharge_from_soc = (
-                soc_after_leak + dt_h * battery_charge_eff * feasible_cmd_charge
-            ) * battery_discharge_eff / dt_h_safe
-            feasible_cmd_discharge = min(
-                cmd_discharge,
-                battery_max_discharge,
-                max_discharge_from_soc,
-            )
-            if abs(feasible_cmd_discharge - cmd_discharge) > eps:
-                _record_message(
-                    validation_warnings,
-                    "battery_discharge_command_reduced",
-                    "Battery discharge command was reduced by discharge power or SOC availability.",
-                    cmd_discharge - feasible_cmd_discharge,
-                )
-
             shore_limit, shore_unit_cost = _shore_command_limit(t)
-            cmd_shore = max(0.0, float(shore_power[t, h]))
-            feasible_cmd_shore = min(cmd_shore, shore_limit)
-            if abs(feasible_cmd_shore - cmd_shore) > eps:
-                _record_message(
-                    validation_warnings,
-                    "shore_power_command_reduced",
-                    "Shore power command was reduced by sailing state or port shore-power limit.",
-                    cmd_shore - feasible_cmd_shore,
-                )
-
-            load = prop_power[t, h] + auxiliary_power[t] + feasible_cmd_charge
-            solar_available = solar_power_available[t, h]
-
-            actual_charge = feasible_cmd_charge
-            actual_discharge = 0.0
-            actual_shore = 0.0
-            gp = np.zeros(nb_gen, dtype=float)
-            gen_on_actual = (np.asarray(gen_on, dtype=float) > 0.5).astype(float)
-
-            if solar_available >= load - eps:
-                excess_solar = max(0.0, solar_available - load)
-                max_total_charge = min(battery_max_charge, max_charge_from_soc)
-                extra_charge = min(excess_solar, max(0.0, max_total_charge - actual_charge))
-                actual_charge += extra_charge
-
-                if feasible_cmd_discharge > eps:
-                    _record_message(
-                        validation_warnings,
-                        "battery_discharge_canceled_by_solar",
-                        "Battery discharge command was canceled because solar met the load.",
-                        feasible_cmd_discharge,
-                    )
-                if feasible_cmd_shore > eps:
-                    _record_message(
-                        validation_warnings,
-                        "shore_power_canceled_by_solar",
-                        "Shore power command was canceled because solar met the load.",
-                        feasible_cmd_shore,
-                    )
-                if extra_charge > eps:
-                    _record_message(
-                        validation_warnings,
-                        "battery_extra_charge_from_solar",
-                        "Battery was charged above command to avoid wasting available solar.",
-                        extra_charge,
-                    )
-
-                solar_power[t, h] = min(solar_available, load + extra_charge)
-
-            else:
-                solar_power[t, h] = solar_available
-                remaining_load = load - solar_power[t, h]
-
-                actual_discharge = min(feasible_cmd_discharge, remaining_load)
-                remaining_load -= actual_discharge
-                if actual_discharge + eps < feasible_cmd_discharge:
-                    _record_message(
-                        validation_warnings,
-                        "battery_discharge_reduced_by_priority",
-                        "Battery discharge command was reduced because solar already covered part of the load.",
-                        feasible_cmd_discharge - actual_discharge,
-                    )
-
-                if mask_sail[t]:
-                    actual_shore = min(feasible_cmd_shore, remaining_load)
-                else:
-                    actual_shore = min(shore_limit, remaining_load)
-                    if actual_shore > feasible_cmd_shore + eps:
-                        _record_message(
-                            validation_warnings,
-                            "shore_power_increased_at_port",
-                            "Shore power was increased at port to meet load without generators.",
-                            actual_shore - feasible_cmd_shore,
-                        )
-
-                remaining_load -= actual_shore
-                if actual_shore + eps < feasible_cmd_shore:
-                    _record_message(
-                        validation_warnings,
-                        "shore_power_reduced_by_priority",
-                        "Shore power command was reduced because solar or battery discharge already covered the load.",
-                        feasible_cmd_shore - actual_shore,
-                    )
-
-                if remaining_load > eps and not mask_sail[t] and np.any(gen_on_actual > 0.5):
-                    gp, gen_on_actual, _unmet = _dispatch_generators(
-                        remaining_load,
-                        gen_sched,
-                        gen_on,
-                        t,
-                        h,
-                    )
-                    remaining_load = _unmet
-
-                if remaining_load > eps and not mask_sail[t]:
-                    charge_reduction = min(actual_charge, remaining_load)
-                    if charge_reduction > eps:
-                        actual_charge -= charge_reduction
-                        remaining_load -= charge_reduction
-                        _record_message(
-                            validation_warnings,
-                            "port_battery_charge_reduced_no_generators",
-                            "Battery charge was reduced at port instead of starting generators.",
-                            charge_reduction,
-                        )
-
-                    if remaining_load > eps:
-                        _record_message(
-                            validation_errors,
-                            "port_power_shortfall",
-                            "Port interval load could not be met without generators.",
-                            remaining_load,
-                        )
-
-                if remaining_load > eps and mask_sail[t]:
-                    gp, gen_on_actual, _unmet = _dispatch_generators(
-                        remaining_load,
-                        gen_sched,
-                        gen_on,
-                        t,
-                        h,
-                    )
-
-            battery_charge[t, h] = actual_charge
-            battery_discharge[t, h] = actual_discharge
-            shore_power[t, h] = actual_shore
-            shore_power_cost[t, h] = actual_shore * shore_unit_cost
-
-            soc_running = (
-                soc_after_leak
-                - dt_h * actual_discharge / battery_discharge_eff
-                + dt_h * battery_charge_eff * actual_charge
+            balance = apply_rule_based_power_balance_interval(
+                P_prop=prop_power[t, h],
+                P_aux=auxiliary_power[t],
+                P_pv_available=solar_power_available[t, h],
+                P_g_cmd=gen_sched,
+                P_sh_cmd=shore_power[t, h],
+                P_bat_ch_cmd=battery_charge[t, h],
+                P_bat_dis_cmd=battery_discharge[t, h],
+                soc_start=soc_running,
+                dt_h=dt_h,
+                P_g_min=gen_min_power,
+                P_g_max=gen_max_power,
+                gen_on=gen_on,
+                rated_capacity=gen_max_power,
+                P_sh_max=shore_limit,
+                P_bat_ch_max=battery_max_charge,
+                P_bat_dis_max=battery_max_discharge,
+                soc_min=0.0,
+                soc_max=battery_capacity,
+                eta_ch=battery_charge_eff,
+                eta_dis=battery_discharge_eff,
+                battery_leak=battery_leak,
+                eps=eps,
             )
-            soc_running = float(np.clip(soc_running, 0.0, battery_capacity))
+
+            for key, message, amount in balance["events"]:
+                _record_message(validation_warnings, key, message, amount)
+            for key, message, amount in balance["errors"]:
+                _record_message(validation_errors, key, message, amount)
+
+            gp = balance["generation_power"]
+            gen_on_actual = balance["gen_on"]
+            battery_charge[t, h] = balance["battery_charge"]
+            battery_discharge[t, h] = balance["battery_discharge"]
+            shore_power[t, h] = balance["shore_power"]
+            shore_power_cost[t, h] = shore_power[t, h] * shore_unit_cost
+            solar_power[t, h] = balance["solar_power"]
+            solar_curtailment[t, h] = balance["solar_curtailment"]
+            soc_running = balance["soc_next"]
 
             generation_power[:, t, h] = gp
             gen_on_all[:, t, h] = gen_on_actual
@@ -816,12 +902,30 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
                     continue
 
                 before[(tt, hh)] = soc
-                soc = (
-                    (float(ship.battery.leak) ** dt_local) * soc
-                    - dt_local * float(battery_discharge[tt, hh]) / battery_discharge_eff
+                leak_factor = battery_leak ** dt_local
+                soc_next = (
+                    leak_factor * soc
                     + dt_local * battery_charge_eff * float(battery_charge[tt, hh])
+                    - dt_local * float(battery_discharge[tt, hh]) / battery_discharge_eff
                 )
-                soc = float(np.clip(soc, 0.0, battery_capacity))
+                if soc_next < -eps:
+                    _record_message(
+                        validation_errors,
+                        "battery_soc_below_min",
+                        "Battery SOC fell below its minimum bound after rule-based redispatch.",
+                        soc_next,
+                    )
+                    soc = soc_next
+                elif soc_next > battery_capacity + eps:
+                    _record_message(
+                        validation_errors,
+                        "battery_soc_above_max",
+                        "Battery SOC exceeded its maximum bound after rule-based redispatch.",
+                        soc_next - battery_capacity,
+                    )
+                    soc = soc_next
+                else:
+                    soc = float(np.clip(soc_next, 0.0, battery_capacity))
                 after[(tt, hh)] = soc
 
             soc_by_t[tt + 1] = soc
@@ -839,12 +943,6 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
             target_soc - battery_capacity,
         )
     elif SOC_eval[-1] < target_soc - eps:
-        future_leak_factor = {}
-        leak_factor = 1.0
-        for rec_t, rec_h in reversed(real_segment_records):
-            future_leak_factor[(rec_t, rec_h)] = leak_factor
-            leak_factor *= float(ship.battery.leak) ** float(segment_dt_h[rec_t, rec_h])
-
         for rec_t, rec_h in reversed(real_segment_records):
             if SOC_eval[-1] >= target_soc - eps:
                 break
@@ -871,7 +969,6 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
             final_gain_per_mw = (
                 dt_local
                 * battery_charge_eff
-                * float(future_leak_factor.get((rec_t, rec_h), 1.0))
             )
             if final_gain_per_mw <= eps:
                 continue
@@ -934,12 +1031,12 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         prop_power[t, n_real:Hmax] = prop_power[t, last]
         wind_resistance[t, n_real:Hmax] = wind_resistance[t, last]
         calm_water_resistance[t, n_real:Hmax] = calm_water_resistance[t, last]
-        acc_force[t, n_real:Hmax] = acc_force[t, last]
         total_resistance[t, n_real:Hmax] = total_resistance[t, last]
         generation_power[:, t, n_real:Hmax] = generation_power[:, t, last:last + 1]
         gen_costs[:, t, n_real:Hmax] = gen_costs[:, t, last:last + 1]
         gen_on_all[:, t, n_real:Hmax] = gen_on_all[:, t, last:last + 1]
         solar_power[t, n_real:Hmax] = solar_power[t, last]
+        solar_curtailment[t, n_real:Hmax] = solar_curtailment[t, last]
         shore_power[t, n_real:Hmax] = shore_power[t, last]
         solar_power_available[t, n_real:Hmax] = solar_power_available[t, last]
         shore_power_cost[t, n_real:Hmax] = shore_power_cost[t, last]
@@ -972,7 +1069,6 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         auxiliary_power=auxiliary_power,
         wind_resistance=wind_resistance,
         calm_water_resistance=calm_water_resistance,
-        acc_force=acc_force,
         total_resistance=total_resistance,
         generation_power=generation_power,
         gen_costs=gen_costs,
@@ -992,11 +1088,13 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         timestep_dt_h=dt_vec,
         interval_port_idx=interval_port_idx_eval,
         solar_power_available=solar_power_available,
+        solar_curtailment=solar_curtailment,
         first_stage_optimizer=first_stage_optimizer,
         power_management_optimizer="RuleBasedSetpointRestoration",
         gen_startup=gen_startup_out,
         gen_shutdown=gen_shutdown_out,
         generator_transition_cost=generator_transition_cost,
+        generator_unit_commitment=source_generator_unit_commitment,
     )
 
     non_conv_sol.is_valid = len(validation_errors) == 0

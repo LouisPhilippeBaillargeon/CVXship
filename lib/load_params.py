@@ -7,7 +7,7 @@ import math
 from pathlib import Path
 
 from lib.utils import build_variable_timestep_grid, dx_dy_km, point_in_zones
-from lib.paths import SHIP, MAP_TOML, ITINERARY, ZONE_INEQ, TRANSITION_INEQ, ADJ, NAVIGABILITY_MAP
+from lib.paths import SHIP, MAP_TOML, ITINERARY, ZONE_INEQ, TRANSITION_INEQ, ADJ, NAVIGABILITY_MAP, CORNERS, ZONES
 from lib.weather import weather_from_nc_file
 
 #===================================================SHIP======================================================================================
@@ -215,6 +215,8 @@ class Map:
     nb_zones        : float
     speed_limit_bands: List[dict] = field(default_factory=list)
     navigability_map_path: Path | None = None
+    corners_path: Path | None = None
+    zone_corners_path: Path | None = None
     zone_centroids  : np.ndarray = field(init=False)
 
 def _compute_zone_centroids(info: MapInfo, zone_ineq: np.ndarray) -> np.ndarray:
@@ -364,6 +366,8 @@ def load_map(case_dir=None) -> Map:
         nb_zones=nb_zones,
         speed_limit_bands=speed_limit_bands,
         navigability_map_path=_case_map_file(case_dir, "navigability_map.npy", NAVIGABILITY_MAP),
+        corners_path=_case_map_file(case_dir, "corners.csv", CORNERS),
+        zone_corners_path=_case_map_file(case_dir, "zones.csv", ZONES),
     )
     m.zone_centroids = _compute_zone_centroids(m.info, m.zone_ineq)
     return m
