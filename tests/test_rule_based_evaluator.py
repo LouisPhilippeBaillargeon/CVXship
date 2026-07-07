@@ -12,7 +12,7 @@ from lib.load_params import (
     Propulsion,
     Ship,
     ShipInfo,
-    SolarPannels,
+    SolarPanels,
     States,
     Transit,
 )
@@ -256,34 +256,16 @@ class EnergyRedispatchRegressionTest(unittest.TestCase):
         ship = Ship(
             hull=Hull(
                 B=1.0,
-                L=1.0,
-                LPP=1.0,
                 LWL=1.0,
                 CB=1.0,
-                CM=1.0,
-                CWP=1.0,
-                kyy=1.0,
                 T=1.0,
-                TF=1.0,
-                TA=1.0,
-                E1=1.0,
-                E2=1.0,
                 AL_air=1.0,
                 AF_air=1.0,
-                AF_water=1.0,
-                AL_water=1.0,
                 total_wet_area=1.0,
-                sL=1.0,
-                sH=1.0,
                 CDt=1.0,
                 CDlAF_bow=1.0,
                 CDlAF_stern=1.0,
                 delta=1.0,
-                kappa=1.0,
-                AT=1.0,
-                ABT=1.0,
-                h_B=1.0,
-                LCB_percent=1.0,
             ),
             propulsion=Propulsion(
                 D=1.0,
@@ -299,11 +281,8 @@ class EnergyRedispatchRegressionTest(unittest.TestCase):
             ),
             info=ShipInfo(
                 max_speed=1.0,
-                weight=1.0,
                 rho_water=1.0,
-                displacement=1.0,
                 rho_air=1.0,
-                g=1.0,
                 min_depth=1.0,
             ),
             generators=[generator],
@@ -315,11 +294,9 @@ class EnergyRedispatchRegressionTest(unittest.TestCase):
                 charge_eff=1.0,
                 leak=leak,
             ),
-            solarPannels=SolarPannels(
+            solarPanels=SolarPanels(
                 area=0.0,
                 efficiency=0.0,
-                alpha_t=0.0,
-                NOCT=0.0,
             ),
         )
         return ship
@@ -357,7 +334,7 @@ class EnergyRedispatchRegressionTest(unittest.TestCase):
             current_y_pos=0.0,
             current_speed=0.0,
             soc=soc,
-            zone=0.0,
+            set_selection=0.0,
             current_heading=0.0,
         )
         return states
@@ -379,7 +356,7 @@ class EnergyRedispatchRegressionTest(unittest.TestCase):
             port_idx=np.array([0, 0]),
             interval_sail_fraction=np.array([1.0]),
             total_distance=0.0,
-            zone=np.zeros((2, 1)),
+            set_selection=np.zeros((2, 1)),
             ship_pos=np.zeros((2, 2)),
             ship_speed=np.zeros((1, 2, 1)),
             speed_mag=np.zeros((1, 1)),

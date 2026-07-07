@@ -1,5 +1,6 @@
 import numpy as np
 
+from lib.utils import safe_unit, xy_from_path_distance
 from lib.optimizers import (
     Solution,
     _future_auxiliary_power,
@@ -9,25 +10,9 @@ from lib.optimizers import (
     EnergyOnlyOptimizer,
 )
 from lib.weather_interpolation import (
-    prepare_nc_interp_source,
     interpolated_weather_at,
     query_time_for_segment,
 )
-
-
-def _path_pos_at_distance(waypoints, d_abs):
-    waypoints = np.asarray(waypoints, dtype=float)
-    seg_vecs = waypoints[1:] - waypoints[:-1]
-    seg_lens = np.linalg.norm(seg_vecs, axis=1)
-    breaks = np.concatenate([[0.0], np.cumsum(seg_lens)])
-
-    d_abs = float(np.clip(d_abs, 0.0, breaks[-1]))
-    if d_abs >= breaks[-1]:
-        return waypoints[-1].copy()
-
-    s = int(np.clip(np.searchsorted(breaks, d_abs, side="right") - 1, 0, len(seg_lens) - 1))
-    alpha = (d_abs - breaks[s]) / max(seg_lens[s], 1e-12)
-    return waypoints[s] + alpha * seg_vecs[s]
 
 
 def redistribute_generator_adjustment(
@@ -411,7 +396,9 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
     generator_models = runner.generator_models
 
     if nc_sources is None:
-        nc_sources = prepare_nc_interp_source(runner.map, itinerary)
+        nc_sources = getattr(runner, "nc_sources", None)
+    if nc_sources is None:
+        raise ValueError("NetCDF evaluator requires nc_sources prepared from weather.toml.")
 
     P = np.asarray(sol.ship_pos, dtype=float)
     T = P.shape[0] - 1
@@ -442,7 +429,7 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
             raise ValueError(f"Expected auxiliary_power shape {(T,)}, got {auxiliary_power.shape}.")
 
     mask_sail = np.asarray(sol.interval_sail_fraction, dtype=float).reshape(-1) > 0.5
-    zone_mat = np.asarray(sol.zone, dtype=float)
+    set_selection_mat = np.asarray(sol.set_selection, dtype=float)
     interval_port_idx_eval = getattr(sol, "interval_port_idx", None)
     if interval_port_idx_eval is None:
         interval_port_idx_eval = _future_interval_port_idx(
@@ -509,15 +496,8 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
     def _pick_NT(arr, kind, t, h_cmd):
         return np.asarray(arr[:, t], dtype=float) if kind == "NT" else np.asarray(arr[:, t, h_cmd], dtype=float)
 
-    def _zone_at_node(k):
-        return int(np.argmax(zone_mat[k, :]))
-
-    def _safe_unit(vec):
-        vec = np.asarray(vec, dtype=float)
-        n = float(np.linalg.norm(vec))
-        if n <= eps:
-            return np.zeros(2), 0.0
-        return vec / n, n
+    def _set_at_node(k):
+        return int(np.argmax(set_selection_mat[k, :]))
 
     def _speed_to_dt_h(distance_km, speed_mps, fallback_dt_h):
         distance_km = float(max(0.0, distance_km))
@@ -532,7 +512,7 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         if dt_h <= eps:
             return
         out[t].append({
-            "zone": _zone_at_node(t),
+            "set": _set_at_node(t),
             "dt_h": float(dt_h),
             "distance_km": float(distance_km),
             "speed_vec": np.asarray(speed_vec, dtype=float),
@@ -575,11 +555,11 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
                     dist = max(0.0, b_d - a_d)
                     if dist <= eps:
                         continue
-                    pa = _path_pos_at_distance(waypoints, a_d)
-                    pb = _path_pos_at_distance(waypoints, b_d)
-                    direction, _ = _safe_unit(pb - pa)
+                    pa = xy_from_path_distance(waypoints, a_d)
+                    pb = xy_from_path_distance(waypoints, b_d)
+                    direction, _ = safe_unit(pb - pa, eps=eps)
                     speed_mps = float(max(0.0, speed_cmd[t, h_cmd]))
-                    mid_pos = _path_pos_at_distance(waypoints, 0.5 * (a_d + b_d))
+                    mid_pos = xy_from_path_distance(waypoints, 0.5 * (a_d + b_d))
                     _add_segment(segments_by_t, t, dt_seg_h, dist, speed_mps * direction, h_cmd, mid_pos, mid_off, "path_TH")
             else:
                 speed_mps = total_d / dt_vec[t] * 1000.0 / 3600.0
@@ -594,11 +574,11 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
                     dist = max(0.0, b_d - a_d)
                     if dist <= eps:
                         continue
-                    pa = _path_pos_at_distance(waypoints, a_d)
-                    pb = _path_pos_at_distance(waypoints, b_d)
-                    direction, _ = _safe_unit(pb - pa)
+                    pa = xy_from_path_distance(waypoints, a_d)
+                    pb = xy_from_path_distance(waypoints, b_d)
+                    direction, _ = safe_unit(pb - pa, eps=eps)
                     dt_seg_h = dt_vec[t] * dist / max(total_d, eps)
-                    mid_pos = _path_pos_at_distance(waypoints, 0.5 * (a_d + b_d))
+                    mid_pos = xy_from_path_distance(waypoints, 0.5 * (a_d + b_d))
                     _add_segment(
                         segments_by_t,
                         t,
@@ -641,7 +621,7 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
                 for h_geom, ((a, b), dist) in enumerate(zip(pieces_geom, dists)):
                     if dist <= eps:
                         continue
-                    direction, _ = _safe_unit(b - a)
+                    direction, _ = safe_unit(b - a, eps=eps)
                     dt_seg_h = dt_vec[t] * dist / max(total_d, eps)
                     _add_segment(
                         segments_by_t,
@@ -662,7 +642,7 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
                 continue
 
             vec = P[t + 1, :] - P[t, :]
-            direction, total_d = _safe_unit(vec)
+            direction, total_d = safe_unit(vec, eps=eps)
             if total_d <= eps:
                 _add_segment(segments_by_t, t, dt_vec[t], 0.0, np.zeros(2), 0, P[t, :], 0.5 * dt_vec[t], "zero")
                 continue
@@ -763,13 +743,13 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         )
 
     for t in range(T):
-        for h, seg in enumerate(segments_by_t[t]):
-            dt_h = float(seg["dt_h"])
-            h_cmd = int(seg["h_cmd"])
-            v_ship = np.asarray(seg["speed_vec"], dtype=float)
+        for h, segment_record in enumerate(segments_by_t[t]):
+            dt_h = float(segment_record["dt_h"])
+            h_cmd = int(segment_record["h_cmd"])
+            v_ship = np.asarray(segment_record["speed_vec"], dtype=float)
 
             segment_dt_h[t, h] = dt_h
-            step_distance[t, h] = float(seg["distance_km"])
+            step_distance[t, h] = float(segment_record["distance_km"])
             ship_speed[t, :, h] = v_ship
             speed_mag[t, h] = float(np.linalg.norm(v_ship))
             shore_power[t, h] = _pick_T(shore_cmd, shore_kind, t, h_cmd)
@@ -780,12 +760,12 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
             gen_sched = _pick_NT(gen_cmd, gen_kind, t, h_cmd)
             gen_on = _pick_NT(gen_on_cmd, gen_on_kind, t, h_cmd)
 
-            qtime = query_time_for_segment(itinerary, runner.states, t, seg["mid_offset_h"])
-            w = interpolated_weather_at(nc_sources, runner.map, seg["mid_pos"], qtime)
+            qtime = query_time_for_segment(itinerary, runner.states, t, segment_record["mid_offset_h"])
+            w = interpolated_weather_at(nc_sources, runner.map, segment_record["mid_pos"], qtime)
             solar_power_available[t, h] = max(
                 0.0,
-                ship.solarPannels.area
-                * ship.solarPannels.efficiency
+                ship.solarPanels.area
+                * ship.solarPanels.efficiency
                 * float(w["irradiance"]),
             )
 
@@ -820,11 +800,11 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
                     print(
                         "nc-eval t", t,
                         "h", h,
-                        "label", seg.get("label", ""),
+                        "label", segment_record.get("label", ""),
                         "dt_h", dt_h,
-                        "dist_km", seg["distance_km"],
+                        "dist_km", segment_record["distance_km"],
                         "speed_mag", speed_mag[t, h],
-                        "mid_pos", seg["mid_pos"],
+                        "mid_pos", segment_record["mid_pos"],
                         "qtime", qtime,
                         "latlon", (w["lat"], w["lon"]),
                         "current", current,
@@ -1059,7 +1039,7 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         port_idx=sol.port_idx,
         interval_sail_fraction=sol.interval_sail_fraction,
         total_distance=float(np.sum(step_distance)),
-        zone=sol.zone,
+        set_selection=sol.set_selection,
         ship_pos=sol.ship_pos,
         ship_speed=ship_speed,
         speed_mag=speed_mag,
@@ -1081,7 +1061,7 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         SOC=SOC_eval,
         path_distance=getattr(sol, "path_distance", None),
         fixed_path_waypoints=getattr(sol, "fixed_path_waypoints", None),
-        path_zone_ids=getattr(sol, "path_zone_ids", None),
+        path_set_ids=getattr(sol, "path_set_ids", None),
         crossing_point=getattr(sol, "crossing_point", None),
         step_distance=step_distance,
         segment_dt_h=segment_dt_h,

@@ -35,7 +35,7 @@ init_speed          = 0
 #city                : Name
 #arrival_datetime    : "YYYY-MM-DDTHH:MM" in the UTC timezone
 #departure_datetime  : "YYYY-MM-DDTHH:MM" in the UTC timezone
-#lat                 : lattitude
+#lat                 : latitude
 #lon                 : longitude
 #power_cost          : ($/MWh)
 # ============================

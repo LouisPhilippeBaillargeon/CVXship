@@ -2,12 +2,13 @@ import math
 
 import numpy as np
 import pandas as pd
+import tomllib
 import xarray as xr
 from pyproj import Geod
 from pathlib import Path
 
-from lib.paths import CURRENTS, ATMO, SUN, CORNERS, ZONES
-from lib.utils import _halfspace_polygon_4ineq, _ordered_zone_corner_ids, _zone_edges_from_corner_ids
+from lib.paths import CORNERS, SETS
+from lib.utils import _halfspace_polygon_4ineq, _ordered_set_corner_ids, _set_edges_from_corner_ids, safe_unit
 
 
 _GEOD = Geod(ellps="WGS84")
@@ -49,22 +50,51 @@ def _grid_radius_deg(ds):
     return 1.05 * max(_spacing(lat), _spacing(lon))
 
 
-def _resolve_weather_files(weather_files=None):
-    files = {
-        "currents": Path(CURRENTS),
-        "atmo": Path(ATMO),
-        "sun": Path(SUN),
-    }
-    if weather_files is not None:
-        for key, path in weather_files.items():
-            files[key] = Path(path)
-    return files
+REQUIRED_WEATHER_FILES = ("currents", "atmo", "sun")
 
 
-def prepare_nc_interp_source(map_obj, itinerary, weather_files=None):
+def resolve_weather_files_from_toml(case_dir) -> dict[str, Path]:
+    if case_dir is None:
+        raise ValueError("A case directory with weather.toml is required for weather file paths.")
+
+    case_dir = Path(case_dir).resolve()
+    weather_toml = case_dir / "weather.toml"
+    if not weather_toml.exists():
+        raise FileNotFoundError(f"Missing weather.toml: {weather_toml}")
+
+    with open(weather_toml, "rb") as f:
+        data = tomllib.load(f)
+
+    files = data.get("files", {})
+    missing = [key for key in REQUIRED_WEATHER_FILES if key not in files]
+    if missing:
+        raise ValueError(f"{weather_toml} is missing [files] entries: {missing}")
+
+    resolved = {}
+    for key in REQUIRED_WEATHER_FILES:
+        path = Path(files[key])
+        if not path.is_absolute():
+            path = weather_toml.parent / path
+        resolved[key] = path.resolve()
+
+    return resolved
+
+
+def _resolve_weather_files(weather_files):
+    if weather_files is None:
+        raise ValueError("weather_files is required and must come from weather.toml.")
+
+    missing = [key for key in REQUIRED_WEATHER_FILES if key not in weather_files]
+    if missing:
+        raise ValueError(f"weather_files is missing required entries: {missing}")
+
+    return {key: Path(weather_files[key]) for key in REQUIRED_WEATHER_FILES}
+
+
+def prepare_nc_interp_source(map_obj, itinerary, weather_files):
     files = _resolve_weather_files(weather_files)
-    t_start = itinerary.transits[0].arrival_datetime
-    t_end = itinerary.transits[-1].departure_datetime
+    t_start = pd.Timestamp(itinerary.transits[0].arrival_datetime)
+    t_end = pd.Timestamp(itinerary.transits[-1].departure_datetime)
 
     km_per_deg_lat = 111.0
     lat_max = map_obj.info.sw_lat + map_obj.info.span_km_north / km_per_deg_lat
@@ -79,13 +109,29 @@ def prepare_nc_interp_source(map_obj, itinerary, weather_files=None):
             longitude=slice(map_obj.info.sw_lon, lon_max),
         )
 
+    def _time_window_with_brackets(ds, time_name, path):
+        times = pd.to_datetime(ds[time_name].values)
+        if len(times) == 0:
+            raise ValueError(f"Weather file {path} has no {time_name} values.")
+
+        if times[0] > t_start or times[-1] < t_end:
+            raise ValueError(
+                "Weather file does not cover the itinerary time window: "
+                f"{path} has {times[0]} to {times[-1]}, "
+                f"but itinerary requires {t_start} to {t_end}."
+            )
+
+        start_idx = max(0, int(np.searchsorted(times, t_start, side="right")) - 1)
+        end_idx = min(len(times) - 1, int(np.searchsorted(times, t_end, side="left")) + 1)
+        return slice(start_idx, end_idx + 1)
+
     def _open_loaded(path, time_name, *, surface_current=False):
         ds = xr.open_dataset(path)
         try:
-            ds = ds.sortby("latitude").sortby("longitude")
+            ds = ds.sortby(time_name).sortby("latitude").sortby("longitude")
             if surface_current and ("depth" in ds.dims or "depth" in ds.coords):
                 ds = ds.isel(depth=0)
-            ds = ds.sel({time_name: slice(t_start, t_end)})
+            ds = ds.isel({time_name: _time_window_with_brackets(ds, time_name, path)})
             return _crop(ds).load()
         finally:
             ds.close()
@@ -158,9 +204,16 @@ def _time_bracket(src, query_time):
 
     if ts.size == 1:
         return 0, 0, 1.0, 0.0
-    if tq_s <= ts[0]:
+    tol = 1e-9
+    if tq_s < ts[0] - tol or tq_s > ts[-1] + tol:
+        raise ValueError(
+            f"Weather query time {pd.Timestamp(query_time)} is outside "
+            f"loaded weather range {pd.Timestamp(src['times'][0])} to "
+            f"{pd.Timestamp(src['times'][-1])}."
+        )
+    if tq_s <= ts[0] + tol:
         return 0, 0, 1.0, 0.0
-    if tq_s >= ts[-1]:
+    if tq_s >= ts[-1] - tol:
         last = ts.size - 1
         return last, last, 1.0, 0.0
 
@@ -285,26 +338,26 @@ def segment_sample_points(a, b, n_points: int = 3) -> np.ndarray:
     return a[None, :] + fractions[:, None] * (b - a)[None, :]
 
 
-def zone_polygon_vertices(map_obj, zone_idx: int) -> np.ndarray:
-    z = int(zone_idx)
+def set_polygon_vertices(map_obj, set_idx: int) -> np.ndarray:
+    z = int(set_idx)
     A = np.column_stack([
-        map_obj.zone_ineq[1, :, z],
-        map_obj.zone_ineq[0, :, z],
+        map_obj.set_ineq[1, :, z],
+        map_obj.set_ineq[0, :, z],
     ])
-    b = map_obj.zone_ineq[2, :, z]
+    b = map_obj.set_ineq[2, :, z]
     verts, feasible = _halfspace_polygon_4ineq(A, b)
     if verts is None:
         if feasible is not None and len(feasible) > 0:
             return np.asarray(feasible, dtype=float)
-        return np.asarray(map_obj.zone_centroids[z], dtype=float)[None, :]
+        return np.asarray(map_obj.set_centroids[z], dtype=float)[None, :]
     return np.asarray(verts, dtype=float)
 
 
-def zone_sample_points(map_obj, zone_idx: int, n_side: int = 3) -> np.ndarray:
+def set_sample_points(map_obj, set_idx: int, n_side: int = 3) -> np.ndarray:
     if n_side <= 0:
         raise ValueError("n_side must be positive.")
 
-    verts = zone_polygon_vertices(map_obj, zone_idx)
+    verts = set_polygon_vertices(map_obj, set_idx)
     if verts.shape[0] == 1:
         return verts.copy()
 
@@ -339,30 +392,30 @@ def zone_sample_points(map_obj, zone_idx: int, n_side: int = 3) -> np.ndarray:
 
 def _load_map_corner_geometry(map_obj):
     corners_path = getattr(map_obj, "corners_path", None) or CORNERS
-    zone_corners_path = getattr(map_obj, "zone_corners_path", None) or ZONES
+    set_corners_path = getattr(map_obj, "set_corners_path", None) or SETS
     corners_df = pd.read_csv(corners_path)
-    zone_corners_df = pd.read_csv(zone_corners_path)
+    set_corners_df = pd.read_csv(set_corners_path)
     corner_xy = {
         int(r.corner_id): np.array([float(r.x), float(r.y)], dtype=float)
         for r in corners_df.itertuples(index=False)
     }
-    zone_corner_ids = _ordered_zone_corner_ids(zone_corners_df)
-    zone_edges = _zone_edges_from_corner_ids(zone_corner_ids)
-    return corner_xy, zone_edges
+    set_corner_ids = _ordered_set_corner_ids(set_corners_df)
+    set_edges = _set_edges_from_corner_ids(set_corner_ids)
+    return corner_xy, set_edges
 
 
 def shared_boundary_sample_points(map_obj, z0: int, z1: int, n_points: int = 3) -> np.ndarray:
-    corner_xy, zone_edges = _load_map_corner_geometry(map_obj)
-    shared_edges = zone_edges[int(z0)] & zone_edges[int(z1)]
+    corner_xy, set_edges = _load_map_corner_geometry(map_obj)
+    shared_edges = set_edges[int(z0)] & set_edges[int(z1)]
     if len(shared_edges) != 1:
-        c0 = np.asarray(map_obj.zone_centroids[int(z0)], dtype=float)
-        c1 = np.asarray(map_obj.zone_centroids[int(z1)], dtype=float)
+        c0 = np.asarray(map_obj.set_centroids[int(z0)], dtype=float)
+        c1 = np.asarray(map_obj.set_centroids[int(z1)], dtype=float)
         return segment_sample_points(c0, c1, n_points=n_points)
 
     corner_ids = list(next(iter(shared_edges)))
     if len(corner_ids) != 2:
-        c0 = np.asarray(map_obj.zone_centroids[int(z0)], dtype=float)
-        c1 = np.asarray(map_obj.zone_centroids[int(z1)], dtype=float)
+        c0 = np.asarray(map_obj.set_centroids[int(z0)], dtype=float)
+        c1 = np.asarray(map_obj.set_centroids[int(z1)], dtype=float)
         return segment_sample_points(c0, c1, n_points=n_points)
 
     a = corner_xy[int(corner_ids[0])]
@@ -400,14 +453,6 @@ def timestep_mid_times(itinerary, start_index: int = 0, count: int | None = None
         start + pd.to_timedelta((k + 0.5) * float(itinerary.timestep), unit="h")
         for k in range(int(start_index), int(start_index) + int(count))
     ]
-
-
-def _unit(vec, eps: float = 1e-12):
-    vec = np.asarray(vec, dtype=float)
-    n = float(np.linalg.norm(vec))
-    if n <= eps:
-        return np.zeros_like(vec), 0.0
-    return vec / n, n
 
 
 def _print_average_diagnostics(label: str, entity_ids, avg_std: np.ndarray, worst_abs: np.ndarray):
@@ -513,26 +558,26 @@ def build_path_segment_weather_inputs(
     }
 
 
-def _route_transition_direction_map(path_zone_ids, waypoints):
-    path_zone_ids = np.asarray(path_zone_ids, dtype=int)
+def _set_transition_direction_map(path_set_ids, waypoints):
+    path_set_ids = np.asarray(path_set_ids, dtype=int)
     waypoints = np.asarray(waypoints, dtype=float)
     directions = {}
 
-    for k in range(len(path_zone_ids) - 1):
-        z0 = int(path_zone_ids[k])
-        z1 = int(path_zone_ids[k + 1])
-        u_in, _ = _unit(waypoints[k + 1] - waypoints[k])
-        u_out, _ = _unit(waypoints[k + 2] - waypoints[k + 1])
-        u, n = _unit(u_in + u_out)
+    for k in range(len(path_set_ids) - 1):
+        z0 = int(path_set_ids[k])
+        z1 = int(path_set_ids[k + 1])
+        u_in, _ = safe_unit(waypoints[k + 1] - waypoints[k])
+        u_out, _ = safe_unit(waypoints[k + 2] - waypoints[k + 1])
+        u, n = safe_unit(u_in + u_out)
         if n <= 1e-12:
-            u, n = _unit(waypoints[k + 2] - waypoints[k])
+            u, n = safe_unit(waypoints[k + 2] - waypoints[k])
         if n <= 1e-12:
             continue
         directions.setdefault((z0, z1), []).append(u)
 
     out = {}
     for pair, vecs in directions.items():
-        u, n = _unit(np.sum(vecs, axis=0))
+        u, n = safe_unit(np.sum(vecs, axis=0))
         if n > 1e-12:
             out[pair] = u
     return out
@@ -545,18 +590,18 @@ def expected_transition_direction(map_obj, z0: int, z1: int, route_directions: d
         return np.asarray(route_directions[(z0, z1)], dtype=float)
 
     pts = shared_boundary_sample_points(map_obj, z0, z1, n_points=3)
-    edge_dir, n_edge = _unit(pts[-1] - pts[0])
+    edge_dir, n_edge = safe_unit(pts[-1] - pts[0])
     if n_edge > 1e-12:
         normal = np.array([-edge_dir[1], edge_dir[0]], dtype=float)
-        c0 = np.asarray(map_obj.zone_centroids[z0], dtype=float)
-        c1 = np.asarray(map_obj.zone_centroids[z1], dtype=float)
+        c0 = np.asarray(map_obj.set_centroids[z0], dtype=float)
+        c1 = np.asarray(map_obj.set_centroids[z1], dtype=float)
         if float(np.dot(normal, c1 - c0)) < 0.0:
             normal = -normal
         return normal
 
-    c0 = np.asarray(map_obj.zone_centroids[z0], dtype=float)
-    c1 = np.asarray(map_obj.zone_centroids[z1], dtype=float)
-    fallback, n = _unit(c1 - c0)
+    c0 = np.asarray(map_obj.set_centroids[z0], dtype=float)
+    c1 = np.asarray(map_obj.set_centroids[z1], dtype=float)
+    fallback, n = safe_unit(c1 - c0)
     if n <= 1e-12:
         return np.array([1.0, 0.0], dtype=float)
     return fallback
@@ -567,7 +612,7 @@ def build_transition_weather_inputs(
     map_obj,
     itinerary,
     states,
-    path_zone_ids,
+    path_set_ids,
     waypoints,
     *,
     fit_points: int = 3,
@@ -575,32 +620,32 @@ def build_transition_weather_inputs(
     use_route_directions: bool = True,
     print_diagnostics: bool = True,
 ) -> dict:
-    nb_zones = int(map_obj.nb_zones)
+    nb_sets = int(map_obj.nb_sets)
     t0 = int(getattr(states, "timesteps_completed", 0))
     T_future = int(itinerary.nb_timesteps) - t0
     query_times = timestep_mid_times(itinerary, t0, T_future)
     route_directions = (
-        _route_transition_direction_map(path_zone_ids, waypoints)
+        _set_transition_direction_map(path_set_ids, waypoints)
         if use_route_directions
         else {}
     )
 
-    wind_x = np.zeros((nb_zones, nb_zones, T_future), dtype=float)
-    wind_y = np.zeros((nb_zones, nb_zones, T_future), dtype=float)
-    course_angles = np.zeros((nb_zones, nb_zones, T_future), dtype=float)
-    valid_pairs = np.zeros((nb_zones, nb_zones), dtype=bool)
+    wind_x = np.zeros((nb_sets, nb_sets, T_future), dtype=float)
+    wind_y = np.zeros((nb_sets, nb_sets, T_future), dtype=float)
+    course_angles = np.zeros((nb_sets, nb_sets, T_future), dtype=float)
+    valid_pairs = np.zeros((nb_sets, nb_sets), dtype=bool)
 
     pair_ids = []
     pair_mean_values = []
     pair_diag_values = []
     diagnostic_wind_samples = np.zeros(
-        (nb_zones, nb_zones, T_future, diagnostic_points, 2),
+        (nb_sets, nb_sets, T_future, diagnostic_points, 2),
         dtype=float,
     )
 
-    for z0 in range(nb_zones):
-        for z1 in range(nb_zones):
-            if z0 == z1 or float(map_obj.zone_adj[z0, z1]) < 0.5:
+    for z0 in range(nb_sets):
+        for z1 in range(nb_sets):
+            if z0 == z1 or float(map_obj.set_adj[z0, z1]) < 0.5:
                 continue
 
             valid_pairs[z0, z1] = True

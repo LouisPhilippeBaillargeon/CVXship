@@ -6,8 +6,10 @@ import numpy as np
 import pandas as pd
 import cvxpy as cp
 import matplotlib.pyplot as plt
+import json
 import pickle
 import os
+from pathlib import Path
 from lib.load_params import Ship, Generator
 from lib.paths import B_SERIES_CQ, B_SERIES_CT, PLOTS
 from lib.utils import bisection
@@ -19,6 +21,16 @@ from lib.plotting import (
 
 eps = 1e-6
 RESISTANCE_BIG_M_SAFETY = 0.5
+
+
+def _require_cvxpy_success(problem, label: str):
+    if problem.status == cp.OPTIMAL_INACCURATE:
+        print(
+            f"[WARN] {label} solve status is optimal_inaccurate; "
+            "using the fit, but it is not an exact optimal solve."
+        )
+    if problem.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
+        raise RuntimeError(f"{label} problem not solved optimally: {problem.status}")
 
 
 def _finalize_resistance_big_m(model):
@@ -113,11 +125,32 @@ class FitRange:
         )
 
 
-def save_obj(path, obj):
+def _cache_metadata_path(path) -> Path:
+    path = Path(path)
+    return path.with_name(path.name + ".meta.json")
+
+
+def save_obj(path, obj, metadata=None):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "wb") as f:
         pickle.dump(obj, f)
+    if metadata is not None:
+        with open(_cache_metadata_path(path), "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "metadata": metadata}, f, indent=2, sort_keys=True)
+            f.write("\n")
 
-def load_obj(path):
+
+def load_obj(path, expected_metadata=None):
+    path = Path(path)
+    if expected_metadata is not None:
+        meta_path = _cache_metadata_path(path)
+        if not meta_path.exists():
+            raise ValueError(f"Cache metadata missing for {path}. Rebuild this cache.")
+        with open(meta_path, "r", encoding="utf-8") as f:
+            actual = json.load(f).get("metadata")
+        if actual != expected_metadata:
+            raise ValueError(f"Cache metadata mismatch for {path}. Rebuild this cache.")
     with open(path, "rb") as f:
         return pickle.load(f)
 
@@ -257,9 +290,7 @@ class CalmWaterModel:
         problem = cp.Problem(objective, constraints)
         problem.solve(solver="MOSEK", verbose=debug)
 
-        # Check solve status
-        if problem.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-            raise RuntimeError(f"Power fit problem not solved optimally: {problem.status}")
+        _require_cvxpy_success(problem, "Power fit")
 
         abs_err = np.abs(R_fit.value - Resistance)
 
@@ -567,8 +598,7 @@ class WindModel2D(BaseWindModel):
         problem.solve(solver="MOSEK", verbose=debug)
 
         # Check solve status
-        if problem.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-            raise RuntimeError(f"Power fit problem not solved optimally: {problem.status}")
+        _require_cvxpy_success(problem, "Power fit")
 
         if debug:
             # Prepare masked data for wireframe
@@ -651,25 +681,25 @@ class WindModel2D(BaseWindModel):
         )
 
     def fit_convex_models(
-        #fit convex wind models for every zone and timestep combination based on weather
+        #fit convex wind models for every set and timestep combination based on weather
         self,
-        wind_speed_x, #wind speed m/s [nb_zones, nb_timestep]
-        wind_speed_y, #wind speed m/s [nb_zones, nb_timestep]
+        wind_speed_x, #wind speed m/s [nb_sets, nb_timestep]
+        wind_speed_y, #wind speed m/s [nb_sets, nb_timestep]
         nb_steps : float = 40,
         diagnostic_wind_samples=None,
     ):
-        nb_zones                = wind_speed_x.shape[0]
+        nb_sets                = wind_speed_x.shape[0]
         nb_timesteps            = wind_speed_x.shape[1]
-        self.thrust_coeffs      = np.zeros((nb_zones,nb_timesteps,11))
-        self.relative_errors    = np.zeros((nb_zones,nb_timesteps))
-        self.mean_abs_errors    = np.zeros((nb_zones,nb_timesteps))
-        self.max_convex_resistance    = np.zeros((nb_zones,nb_timesteps))
-        self.min_convex_resistance    = np.zeros((nb_zones,nb_timesteps))
+        self.thrust_coeffs      = np.zeros((nb_sets,nb_timesteps,11))
+        self.relative_errors    = np.zeros((nb_sets,nb_timesteps))
+        self.mean_abs_errors    = np.zeros((nb_sets,nb_timesteps))
+        self.max_convex_resistance    = np.zeros((nb_sets,nb_timesteps))
+        self.min_convex_resistance    = np.zeros((nb_sets,nb_timesteps))
         if diagnostic_wind_samples is not None:
-            self.combined_mean_abs_errors = np.zeros((nb_zones, nb_timesteps))
-            self.combined_max_abs_errors = np.zeros((nb_zones, nb_timesteps))
+            self.combined_mean_abs_errors = np.zeros((nb_sets, nb_timesteps))
+            self.combined_max_abs_errors = np.zeros((nb_sets, nb_timesteps))
 
-        for iz in range(nb_zones):
+        for iz in range(nb_sets):
             for it in range(nb_timesteps):
                 (
                     self.relative_errors[iz,it],
@@ -699,7 +729,7 @@ class WindModel2D(BaseWindModel):
                     errs = np.asarray(errs, dtype=float)
                     self.combined_mean_abs_errors[iz, it] = float(np.nanmean(errs))
                     self.combined_max_abs_errors[iz, it] = float(np.nanmax(errs))
-            print("zone", iz, "fitted")
+            print("set", iz, "fitted")
         _print_wind_fit_summary(
             "WindModel2D",
             self.mean_abs_errors,
@@ -753,9 +783,7 @@ class WindModel1D(BaseWindModel):
         problem = cp.Problem(objective, constraints)
         problem.solve(solver="MOSEK", verbose=debug)
 
-        # Check solve status
-        if problem.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-            raise RuntimeError(f"Power fit problem not solved optimally: {problem.status}")
+        _require_cvxpy_success(problem, "Power fit")
 
         abs_err = np.abs(R_fit.value - Resistance)
 
@@ -778,27 +806,27 @@ class WindModel1D(BaseWindModel):
         )
 
     def fit_convex_models(
-        #fit convex wind models for every zone and timestep combination based on weather
+        #fit convex wind models for every set and timestep combination based on weather
         self,
-        wind_speed_x, #wind speed m/s [nb_zones, nb_timestep]
-        wind_speed_y, #wind speed m/s [nb_zones, nb_timestep]
-        course_angles, #angle of the ship [nb_zones, nb_timestep]
+        wind_speed_x, #wind speed m/s [nb_sets, nb_timestep]
+        wind_speed_y, #wind speed m/s [nb_sets, nb_timestep]
+        course_angles, #angle of the ship [nb_sets, nb_timestep]
         nb_steps : float = 40,
         debug = False,
         diagnostic_wind_samples=None,
     ):
-        nb_zones                = wind_speed_x.shape[0]
+        nb_sets                = wind_speed_x.shape[0]
         nb_timesteps            = wind_speed_x.shape[1]
-        self.thrust_coeffs      = np.zeros((nb_zones,nb_timesteps,5))
-        self.relative_errors    = np.zeros((nb_zones,nb_timesteps))
-        self.mean_abs_errors    = np.zeros((nb_zones,nb_timesteps))
-        self.max_convex_resistance    = np.zeros((nb_zones,nb_timesteps))
-        self.min_convex_resistance    = np.zeros((nb_zones,nb_timesteps))
+        self.thrust_coeffs      = np.zeros((nb_sets,nb_timesteps,5))
+        self.relative_errors    = np.zeros((nb_sets,nb_timesteps))
+        self.mean_abs_errors    = np.zeros((nb_sets,nb_timesteps))
+        self.max_convex_resistance    = np.zeros((nb_sets,nb_timesteps))
+        self.min_convex_resistance    = np.zeros((nb_sets,nb_timesteps))
         if diagnostic_wind_samples is not None:
-            self.combined_mean_abs_errors = np.zeros((nb_zones, nb_timesteps))
-            self.combined_max_abs_errors = np.zeros((nb_zones, nb_timesteps))
+            self.combined_mean_abs_errors = np.zeros((nb_sets, nb_timesteps))
+            self.combined_max_abs_errors = np.zeros((nb_sets, nb_timesteps))
 
-        for iz in range(nb_zones):
+        for iz in range(nb_sets):
             for it in range(nb_timesteps):
                 (
                     self.relative_errors[iz,it],
@@ -829,7 +857,7 @@ class WindModel1D(BaseWindModel):
                     errs = np.asarray(errs, dtype=float)
                     self.combined_mean_abs_errors[iz, it] = float(np.nanmean(errs))
                     self.combined_max_abs_errors[iz, it] = float(np.nanmax(errs))
-            print("zone", iz, "fitted")
+            print("set", iz, "fitted")
         _print_wind_fit_summary(
             "WindModel1D",
             self.mean_abs_errors,
@@ -857,29 +885,29 @@ class WindModelTransition1D(WindModel1D):
         course_angles = np.asarray(course_angles, dtype=float)
         valid_pairs = np.asarray(valid_pairs, dtype=bool)
 
-        nb_zones = wind_speed_x.shape[0]
+        nb_sets = wind_speed_x.shape[0]
         nb_timesteps = wind_speed_x.shape[2]
-        if wind_speed_x.shape != (nb_zones, nb_zones, nb_timesteps):
-            raise ValueError("wind_speed_x must have shape (nb_zones, nb_zones, nb_timesteps).")
+        if wind_speed_x.shape != (nb_sets, nb_sets, nb_timesteps):
+            raise ValueError("wind_speed_x must have shape (nb_sets, nb_sets, nb_timesteps).")
         if wind_speed_y.shape != wind_speed_x.shape:
             raise ValueError("wind_speed_y must match wind_speed_x shape.")
         if course_angles.shape != wind_speed_x.shape:
             raise ValueError("course_angles must match wind_speed_x shape.")
-        if valid_pairs.shape != (nb_zones, nb_zones):
-            raise ValueError("valid_pairs must have shape (nb_zones, nb_zones).")
+        if valid_pairs.shape != (nb_sets, nb_sets):
+            raise ValueError("valid_pairs must have shape (nb_sets, nb_sets).")
 
         self.valid_pairs = valid_pairs
-        self.thrust_coeffs = np.full((nb_zones, nb_zones, nb_timesteps, 5), np.nan, dtype=float)
-        self.relative_errors = np.full((nb_zones, nb_zones, nb_timesteps), np.nan, dtype=float)
-        self.mean_abs_errors = np.full((nb_zones, nb_zones, nb_timesteps), np.nan, dtype=float)
-        self.max_convex_resistance = np.full((nb_zones, nb_zones, nb_timesteps), np.nan, dtype=float)
-        self.min_convex_resistance = np.full((nb_zones, nb_zones, nb_timesteps), np.nan, dtype=float)
+        self.thrust_coeffs = np.full((nb_sets, nb_sets, nb_timesteps, 5), np.nan, dtype=float)
+        self.relative_errors = np.full((nb_sets, nb_sets, nb_timesteps), np.nan, dtype=float)
+        self.mean_abs_errors = np.full((nb_sets, nb_sets, nb_timesteps), np.nan, dtype=float)
+        self.max_convex_resistance = np.full((nb_sets, nb_sets, nb_timesteps), np.nan, dtype=float)
+        self.min_convex_resistance = np.full((nb_sets, nb_sets, nb_timesteps), np.nan, dtype=float)
         if diagnostic_wind_samples is not None:
-            self.combined_mean_abs_errors = np.full((nb_zones, nb_zones, nb_timesteps), np.nan, dtype=float)
-            self.combined_max_abs_errors = np.full((nb_zones, nb_zones, nb_timesteps), np.nan, dtype=float)
+            self.combined_mean_abs_errors = np.full((nb_sets, nb_sets, nb_timesteps), np.nan, dtype=float)
+            self.combined_max_abs_errors = np.full((nb_sets, nb_sets, nb_timesteps), np.nan, dtype=float)
 
-        for z0 in range(nb_zones):
-            for z1 in range(nb_zones):
+        for z0 in range(nb_sets):
+            for z1 in range(nb_sets):
                 if not valid_pairs[z0, z1]:
                     continue
                 for t in range(nb_timesteps):
@@ -1048,8 +1076,7 @@ class WindModelPathAligned2D(BaseWindModel):
         problem = cp.Problem(objective, constraints)
         problem.solve(solver="MOSEK", verbose=debug)
 
-        if problem.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-            raise RuntimeError(f"Wind fit problem not solved optimally: {problem.status}")
+        _require_cvxpy_success(problem, "Wind fit")
 
         abs_err = np.abs(R_fit.value - Resistance)
 
@@ -1491,8 +1518,7 @@ class PropulsionModel:
         prob = cp.Problem(objective, constraints)
         prob.solve(solver="MOSEK", verbose=debug)
 
-        if prob.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-            raise RuntimeError(f"Feasibility-boundary fit failed: {prob.status}")
+        _require_cvxpy_success(prob, "Feasibility-boundary fit")
 
         constraint_params = np.array([a.value,b.value])
 
@@ -1573,8 +1599,7 @@ class PropulsionModel:
         objective = cp.Minimize(cp.sum_squares(cp.multiply(Pow_fit-self.P_real,mask_fit)))
         problem = cp.Problem(objective, constraints)
         problem.solve(solver="MOSEK", verbose=debug)
-        if problem.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-            raise RuntimeError(f"Power fit problem not solved optimally: {problem.status}")
+        _require_cvxpy_success(problem, "Power fit")
 
         # Save coefficients in the object
         self.power_coeffs = np.array([
@@ -1590,8 +1615,7 @@ class PropulsionModel:
         self.P_fit = Pow_fit.value
 
         # Check solve status
-        if problem.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-            raise RuntimeError(f"Power fit problem not solved optimally: {problem.status}")
+        _require_cvxpy_success(problem, "Power fit")
         abs_err_P = np.abs(Pow_fit.value[mask_fit] - self.P_real[mask_fit])
         self.mask_fit = mask_fit
 

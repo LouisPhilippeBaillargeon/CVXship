@@ -1,4 +1,4 @@
-name = "sept-iles-gaspe"
+name = "sept-iles-gaspe_speed_limit"
 description = "Current root config copied into a reusable test case."
 
 [run]
@@ -7,7 +7,7 @@ new_ship = true
 new_weather = true
 solver_verbose = true
 unit_commitment = false
-ordered_zones = false
+ordered_sets = false
 
 [cache]
 scope = "case"

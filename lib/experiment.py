@@ -16,14 +16,8 @@ from typing import Any, Iterable
 
 import numpy as np
 
-from lib.paths import ATMO, CACHE, CONFIG, CURRENTS, RESULTS, ROOT, SUN
-
-
-WEATHER_DEFAULTS = {
-    "currents": CURRENTS,
-    "atmo": ATMO,
-    "sun": SUN,
-}
+from lib.paths import CACHE, CONFIG, RESULTS, ROOT
+from lib.weather_interpolation import resolve_weather_files_from_toml
 
 CACHE_FILENAMES = {
     "wind_model_1d": "WindModel1D.pkl",
@@ -31,7 +25,6 @@ CACHE_FILENAMES = {
     "wind_model_2d": "WindModel2D.pkl",
     "wind_model_path_aligned_2d": "WindModelPathAligned2D.pkl",
     "propulsion_model": "PropulsionModel.pkl",
-    "generator_model": "GeneratorModel.pkl",
     "calm_model": "CalmModel.pkl",
 }
 
@@ -107,27 +100,7 @@ def load_case_cache_options(case_dir: Path | str | None) -> dict[str, Any]:
 
 
 def resolve_weather_files(case_dir: Path | str | None) -> dict[str, Path]:
-    weather_files = {key: Path(path).resolve() for key, path in WEATHER_DEFAULTS.items()}
-
-    if case_dir is None:
-        return weather_files
-
-    case_dir = Path(case_dir).resolve()
-    weather_toml = case_dir / "weather.toml"
-    if not weather_toml.exists():
-        return weather_files
-
-    data = read_toml(weather_toml)
-    files = data.get("files", {})
-    for key in WEATHER_DEFAULTS:
-        if key not in files:
-            continue
-        path = Path(files[key])
-        if not path.is_absolute():
-            path = weather_toml.parent / path
-        weather_files[key] = path.resolve()
-
-    return weather_files
+    return resolve_weather_files_from_toml(case_dir)
 
 
 def create_run_context(
@@ -139,7 +112,7 @@ def create_run_context(
 ) -> RunContext:
     case_path = Path(case_dir).resolve() if case_dir is not None else None
     settings = load_case_settings(case_path)
-    case_name = _slug(str(settings.get("name") or (case_path.name if case_path else "default")))
+    case_name = _slug(str(case_path.name if case_path else settings.get("name") or "default"))
     clean_run_name = _slug(run_name or case_name)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_id = _unique_run_id(timestamp, clean_run_name)
@@ -283,6 +256,8 @@ def summarize_solution(key: str, label: str, sol: Any) -> dict[str, Any]:
         "is_valid": bool(getattr(sol, "is_valid", True)),
         "validation_error_count": len(validation_errors),
         "validation_warning_count": len(validation_warnings),
+        "solver_status": getattr(sol, "solver_status", "") or "",
+        "failure_reason": getattr(sol, "failure_reason", "") or "",
     }
 
 
@@ -418,6 +393,8 @@ def _write_summary_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "is_valid",
         "validation_error_count",
         "validation_warning_count",
+        "solver_status",
+        "failure_reason",
         "solution_file",
     ]
     with open(path, "w", newline="", encoding="utf-8") as f:

@@ -31,29 +31,38 @@ def xy_from_path_distance(waypoints, d_abs):
     alpha = (d_abs - D_breaks[s]) / seg_lens[s]
     return waypoints[s] + alpha * seg_vecs[s]
 
-def _compute_tight_big_M_zone(map_obj, zone_ineq, safety_margin=1.0):
+
+def safe_unit(vec, eps: float = 1e-12):
+    vec = np.asarray(vec, dtype=float)
+    n = float(np.linalg.norm(vec))
+    if n <= eps:
+        return np.zeros_like(vec), 0.0
+    return vec / n, n
+
+
+def _compute_tight_big_M_set(map_obj, set_ineq, safety_margin=1.0):
     """
-    Compute a tight disabling Big-M for zone inequalities:
-        Ay*y + Ax*x + Ac >= M[z] * (1 - zone[t,z])
+    Compute a tight disabling Big-M for set inequalities:
+        Ay*y + Ax*x + Ac >= M[z] * (1 - set_selection[t,z])
 
     Parameters
     ----------
     map_obj : Map
-        Map object with span_km_east, span_km_north, nb_zones.
-    zone_ineq : np.ndarray
-        Shape (3, n_ineq, nb_zones)
-        zone_ineq[0, j, z] = Ay
-        zone_ineq[1, j, z] = Ax
-        zone_ineq[2, j, z] = Ac
+        Map object with span_km_east, span_km_north, nb_sets.
+    set_ineq : np.ndarray
+        Shape (3, n_ineq, nb_sets)
+        set_ineq[0, j, z] = Ay
+        set_ineq[1, j, z] = Ax
+        set_ineq[2, j, z] = Ac
     safety_margin : float
         Extra negative slack added to guarantee deactivation.
 
     Returns
     -------
     np.ndarray
-        Shape (nb_zones,)
+        Shape (nb_sets,)
     """
-    nb_zones = map_obj.nb_zones
+    nb_sets = map_obj.nb_sets
     x_max = map_obj.info.span_km_east
     y_max = map_obj.info.span_km_north
 
@@ -64,12 +73,12 @@ def _compute_tight_big_M_zone(map_obj, zone_ineq, safety_margin=1.0):
         [x_max, y_max],  # top-right
     ])
 
-    big_M = np.zeros(nb_zones)
+    big_M = np.zeros(nb_sets)
 
-    for z in range(nb_zones):
-        Ay = zone_ineq[0, :, z]
-        Ax = zone_ineq[1, :, z]
-        Ac = zone_ineq[2, :, z]
+    for z in range(nb_sets):
+        Ay = set_ineq[0, :, z]
+        Ax = set_ineq[1, :, z]
+        Ac = set_ineq[2, :, z]
 
         min_val = np.inf
         for x, y in corners:
@@ -81,32 +90,32 @@ def _compute_tight_big_M_zone(map_obj, zone_ineq, safety_margin=1.0):
     return big_M
 
 
-def _ordered_zone_corner_ids(zone_corners_df: pd.DataFrame) -> dict[int, list[int]]:
+def _ordered_set_corner_ids(set_corners_df: pd.DataFrame) -> dict[int, list[int]]:
     """
-    Returns {zone_id: [corner_id_1, corner_id_2, ...]} ordered by the 'order' column.
+    Returns {set_id: [corner_id_1, corner_id_2, ...]} ordered by the 'order' column.
     """
     out = {}
-    for zone_id, g in zone_corners_df.groupby("zone_id"):
+    for set_id, g in set_corners_df.groupby("set_id"):
         g = g.sort_values("order")
-        out[int(zone_id)] = g["corner_id"].astype(int).tolist()
+        out[int(set_id)] = g["corner_id"].astype(int).tolist()
     return out
 
 
-def _zone_edges_from_corner_ids(zone_corner_ids: dict[int, list[int]]) -> dict[int, set[frozenset[int]]]:
+def _set_edges_from_corner_ids(set_corner_ids: dict[int, list[int]]) -> dict[int, set[frozenset[int]]]:
     """
-    Returns unordered polygon edges for each zone.
+    Returns unordered polygon edges for each set.
     Each edge is represented as frozenset({corner_i, corner_j}).
     """
-    zone_edges = {}
-    for zone_id, corners in zone_corner_ids.items():
+    set_edges = {}
+    for set_id, corners in set_corner_ids.items():
         edges = set()
         n = len(corners)
         for i in range(n):
             c1 = int(corners[i])
             c2 = int(corners[(i + 1) % n])
             edges.add(frozenset((c1, c2)))
-        zone_edges[zone_id] = edges
-    return zone_edges
+        set_edges[set_id] = edges
+    return set_edges
 
 
 def _segment_segment_distance_2d(a0, a1, b0, b1) -> float:
@@ -161,52 +170,52 @@ def _segment_segment_distance_2d(a0, a1, b0, b1) -> float:
     return float(np.linalg.norm(p - q))
 
 
-def _compute_min_crossing_distance_per_zone(corners_path, zone_corners_path) -> dict[int, float]:
+def _compute_min_crossing_distance_per_set(corners_path, set_corners_path) -> dict[int, float]:
     """
-    For each zone, compute the true minimum crossing distance [km].
+    For each set, compute the true minimum crossing distance [km].
 
-    Interior zone:
+    Interior set:
         shortest distance between two frontier edges shared with two different
-        neighboring zones.
+        neighboring sets.
 
-    Terminal zone:
+    Terminal set:
         shortest distance between the single frontier edge and any non-frontier
-        edge of the terminal zone.
+        edge of the terminal set.
 
     This replaces the previous corner-pair approximation.
     """
     corners_df = pd.read_csv(corners_path)
-    zone_corners_df = pd.read_csv(zone_corners_path)
+    set_corners_df = pd.read_csv(set_corners_path)
 
     corner_xy = {
         int(r.corner_id): np.array([float(r.x), float(r.y)], dtype=float)
         for r in corners_df.itertuples(index=False)
     }
 
-    zone_corner_ids = _ordered_zone_corner_ids(zone_corners_df)
-    zone_edges = _zone_edges_from_corner_ids(zone_corner_ids)
+    set_corner_ids = _ordered_set_corner_ids(set_corners_df)
+    set_edges = _set_edges_from_corner_ids(set_corner_ids)
 
-    # edge -> zones sharing that edge
-    edge_to_zones: dict[frozenset[int], set[int]] = {}
-    for zid, edges in zone_edges.items():
+    # edge -> sets sharing that edge
+    edge_to_sets: dict[frozenset[int], set[int]] = {}
+    for zid, edges in set_edges.items():
         for e in edges:
-            edge_to_zones.setdefault(e, set()).add(int(zid))
+            edge_to_sets.setdefault(e, set()).add(int(zid))
 
     min_dist: dict[int, float] = {}
 
-    for z, edges in zone_edges.items():
+    for z, edges in set_edges.items():
         z = int(z)
 
         frontier_edges = []
         non_frontier_edges = []
 
         for e in edges:
-            shared_by = edge_to_zones.get(e, {z})
-            other_zones = set(shared_by) - {z}
+            shared_by = edge_to_sets.get(e, {z})
+            other_sets = set(shared_by) - {z}
 
-            if len(other_zones) > 0:
+            if len(other_sets) > 0:
                 # In your map this should normally be exactly one neighbor.
-                for oz in other_zones:
+                for oz in other_sets:
                     frontier_edges.append((e, int(oz)))
             else:
                 non_frontier_edges.append(e)
@@ -216,7 +225,7 @@ def _compute_min_crossing_distance_per_zone(corners_path, zone_corners_path) -> 
         best = np.inf
 
         if len(distinct_neighbors) >= 2:
-            # Interior zone: crossing from one neighboring frontier to another.
+            # Interior set: crossing from one neighboring frontier to another.
             for i in range(len(frontier_edges)):
                 e1, n1 = frontier_edges[i]
                 for j in range(i + 1, len(frontier_edges)):
@@ -235,7 +244,7 @@ def _compute_min_crossing_distance_per_zone(corners_path, zone_corners_path) -> 
                     best = min(best, d)
 
         elif len(distinct_neighbors) == 1:
-            # Terminal zone: crossing from the shared frontier into/out of the zone.
+            # Terminal set: crossing from the shared frontier into/out of the set.
             for e_frontier, _ in frontier_edges:
                 c10, c11 = tuple(e_frontier)
 
@@ -250,15 +259,15 @@ def _compute_min_crossing_distance_per_zone(corners_path, zone_corners_path) -> 
 
         else:
             raise ValueError(
-                f"Zone {z} has no neighboring zone based on shared edges. "
+                f"Set {z} has no neighboring set based on shared edges. "
                 "Cannot compute a crossing distance."
             )
 
         if not np.isfinite(best):
             raise ValueError(
-                f"Could not determine minimum crossing distance for zone {z}. "
+                f"Could not determine minimum crossing distance for set {z}. "
                 f"Neighbors found: {distinct_neighbors}. "
-                "Check corners.csv / zones.csv consistency."
+                "Check corners.csv / sets.csv consistency."
             )
 
         min_dist[z] = float(best)
@@ -266,7 +275,7 @@ def _compute_min_crossing_distance_per_zone(corners_path, zone_corners_path) -> 
     return min_dist
 
 
-def _compute_min_zone_timesteps(corners_path, zone_corners_path, ship_max_speed_mps: float, timestep_h: float) -> dict[int, int]:
+def _compute_min_set_timesteps(corners_path, set_corners_path, ship_max_speed_mps: float, timestep_h: float) -> dict[int, int]:
     """
     Convert min crossing distance [km] into minimum required number of timesteps.
     """
@@ -275,7 +284,7 @@ def _compute_min_zone_timesteps(corners_path, zone_corners_path, ship_max_speed_
     if timestep_h <= 0:
         raise ValueError("timestep_h must be > 0.")
 
-    min_dist_km = _compute_min_crossing_distance_per_zone(corners_path, zone_corners_path)
+    min_dist_km = _compute_min_crossing_distance_per_set(corners_path, set_corners_path)
 
     max_dist_per_timestep_km = ship_max_speed_mps * timestep_h * 3600.0 / 1000.0
 
@@ -286,13 +295,13 @@ def _compute_min_zone_timesteps(corners_path, zone_corners_path, ship_max_speed_
     return min_steps
 
 
-def point_in_zones(ship_pos: np.ndarray, zone_ineq: np.ndarray, eps: float = 0.0) -> np.ndarray:
+def point_in_sets(ship_pos: np.ndarray, set_ineq: np.ndarray, eps: float = 0.0) -> np.ndarray:
     """
-    Point is in zone z if for all j=0..3:
-        y * zone_ineq[0,j,z] + x * zone_ineq[1,j,z] + zone_ineq[2,j,z] >= 0
+    Point is in set z if for all j=0..3:
+        y * set_ineq[0,j,z] + x * set_ineq[1,j,z] + set_ineq[2,j,z] >= 0
     """
     x, y = float(ship_pos[0]), float(ship_pos[1])
-    vals = y * zone_ineq[0, :, :] + x * zone_ineq[1, :, :] + zone_ineq[2, :, :]
+    vals = y * set_ineq[0, :, :] + x * set_ineq[1, :, :] + set_ineq[2, :, :]
     return np.all(vals >= -eps, axis=0).astype(int)
 
 def _halfspace_polygon_4ineq(A: np.ndarray, b: np.ndarray, eps: float = 1e-9):
@@ -567,26 +576,26 @@ def build_variable_timestep_grid(itinerary, states=None, eps=1e-9):
     }
 
 
-def compute_port_zone_indices(map, itinerary):
-    nb_zones = map.nb_zones
-    port_zone_idx = []
+def compute_port_set_indices(map, itinerary):
+    nb_sets = map.nb_sets
+    port_set_idx = []
 
     for tr in itinerary.transits:
         x, y, _ = dx_dy_km(map, tr.lat, tr.lon)  # km coordinates
         z_found = -1
-        for z in range(nb_zones):
-            Ay = map.zone_ineq[0, :, z]  # (4,)
-            Ax = map.zone_ineq[1, :, z]
-            Ac = map.zone_ineq[2, :, z]
+        for z in range(nb_sets):
+            Ay = map.set_ineq[0, :, z]  # (4,)
+            Ax = map.set_ineq[1, :, z]
+            Ac = map.set_ineq[2, :, z]
             vals = Ay * y + Ax * x + Ac
             if np.all(vals >= 0.0):
                 z_found = z
                 break
         if z_found < 0:
-            raise ValueError(f"Port {tr.city} not found in any zone")
-        port_zone_idx.append(z_found)
+            raise ValueError(f"Port {tr.city} not found in any set")
+        port_set_idx.append(z_found)
 
-    return np.array(port_zone_idx, dtype=int)
+    return np.array(port_set_idx, dtype=int)
 
 
 def bisection(f, a, b, tol=1e-6, max_iter=60):
@@ -629,10 +638,10 @@ def _path_segment_index(distance_breaks_km, d_km):
     return int(np.clip(s, 0, len(distance_breaks_km) - 2))
 
 
-def _active_speed_limit_mps(map_obj, zone_idx, midpoint, ship_max_speed_mps):
+def _active_speed_limit_mps(map_obj, set_idx, midpoint, ship_max_speed_mps):
     limit = float(ship_max_speed_mps)
     for band in getattr(map_obj, "speed_limit_bands", []) or []:
-        if int(zone_idx) not in band.get("zones", []):
+        if int(set_idx) not in band.get("sets", []):
             continue
         start = band.get("start")
         end = band.get("end")
@@ -648,17 +657,20 @@ def _balanced_speed_profile_mps(total_distance_km, timestep_dt_h, interval_sail_
     active = sail_h > eps
 
     if not np.any(active):
+        if total_distance_km > eps:
+            raise ValueError(
+                "Cannot build constant-speed path reference: "
+                "there is no sailing time available to cover the path."
+            )
         return speed_kmh / 3.6, 0.0
 
     max_distance_km = float(np.sum(caps_kmh[active] * sail_h[active]))
     if total_distance_km > max_distance_km + 1e-9:
-        speed_kmh[active] = caps_kmh[active]
-        print(
-            "WARNING: speed limits make the naive reference infeasible. "
+        raise ValueError(
+            "Speed limits make the constant-speed path reference infeasible. "
             f"Maximum capped distance is {max_distance_km:.3f} km, "
             f"but the path requires {total_distance_km:.3f} km."
         )
-        return speed_kmh / 3.6, float(np.max(speed_kmh[active]) / 3.6)
 
     lo = 0.0
     hi = float(np.max(caps_kmh[active]))
@@ -677,7 +689,7 @@ def _balanced_speed_profile_mps(total_distance_km, timestep_dt_h, interval_sail_
 
 def build_constant_speed_path_reference(
     waypoints,
-    path_zone_ids,
+    path_set_ids,
     itinerary,
     states,
     map_obj,
@@ -691,7 +703,7 @@ def build_constant_speed_path_reference(
     Returns a dict with:
         path_distance        [T_future+1]
         ship_pos             [T_future+1, 2]
-        zone                 [T_future+1, nb_zones]
+        set                 [T_future+1, nb_sets]
         ship_speed           [T_future, 2]
         speed_mag            [T_future]
         segment_dirs         [n_segments, 2]
@@ -702,7 +714,7 @@ def build_constant_speed_path_reference(
         constant_speed_mps   float
     """
     waypoints = np.asarray(waypoints, dtype=float)
-    path_zone_ids = np.asarray(path_zone_ids, dtype=int)
+    path_set_ids = np.asarray(path_set_ids, dtype=int)
 
     t0 = int(getattr(states, "timesteps_completed", 0))
     if hasattr(itinerary, "timestep_dt_h") and len(getattr(itinerary, "timestep_dt_h")) > 0:
@@ -734,10 +746,10 @@ def build_constant_speed_path_reference(
     if np.any(segment_lengths_km <= eps):
         raise ValueError("Consecutive shortest-path waypoints must be distinct.")
 
-    if len(path_zone_ids) != len(segment_lengths_km):
+    if len(path_set_ids) != len(segment_lengths_km):
         raise ValueError(
-            f"path_zone_ids length must match number of path segments. "
-            f"Got {len(path_zone_ids)} and {len(segment_lengths_km)}."
+            f"path_set_ids length must match number of path segments. "
+            f"Got {len(path_set_ids)} and {len(segment_lengths_km)}."
         )
 
     segment_dirs = segment_vecs / segment_lengths_km[:, None]
@@ -777,7 +789,7 @@ def build_constant_speed_path_reference(
             midpoint = itinerary_start + pd.to_timedelta(float(timestep_mid_offset_h[t]), unit="h")
             speed_limit_mps[t] = _active_speed_limit_mps(
                 map_obj,
-                int(path_zone_ids[s]),
+                int(path_set_ids[s]),
                 midpoint,
                 float(ship.info.max_speed),
             )
@@ -804,16 +816,21 @@ def build_constant_speed_path_reference(
             * float(interval_sail_fraction[t])
         )
     path_distance = np.clip(path_distance, 0.0, total_distance_km)
+    if path_distance[-1] < total_distance_km - 1e-7:
+        raise ValueError(
+            "Constant-speed path reference did not reach the destination. "
+            f"Covered {path_distance[-1]:.3f} km of {total_distance_km:.3f} km."
+        )
     path_distance[-1] = total_distance_km
 
     ship_pos = np.zeros((T_future + 1, 2), dtype=float)
     for i, d_km in enumerate(path_distance):
         ship_pos[i, :] = xy_from_path_distance(waypoints, d_km)
 
-    zone = np.zeros((T_future + 1, map_obj.nb_zones), dtype=float)
+    set_selection = np.zeros((T_future + 1, map_obj.nb_sets), dtype=float)
     for t, d_km in enumerate(path_distance):
         s = _path_segment_index(distance_breaks_km, d_km)
-        zone[t, int(path_zone_ids[s])] = 1.0
+        set_selection[t, int(path_set_ids[s])] = 1.0
 
     ship_speed = np.zeros((T_future, 2), dtype=float)
     speed_mag = np.zeros(T_future, dtype=float)
@@ -845,7 +862,7 @@ def build_constant_speed_path_reference(
         "interval_port_idx": interval_port_idx,
         "path_distance": path_distance,
         "ship_pos": ship_pos,
-        "zone": zone,
+        "set_selection": set_selection,
         "ship_speed": ship_speed,
         "speed_mag": speed_mag,
         "segment_dirs": segment_dirs,

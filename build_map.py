@@ -50,7 +50,7 @@ def _parse_args(argv: list[str] | None = None):
     parser.add_argument(
         "--no-import-existing",
         action="store_true",
-        help="Open the zone editor without importing existing corners.csv/zones.csv.",
+        help="Open the set editor without importing existing corners.csv/sets.csv.",
     )
     args = parser.parse_args(_normalize_argv(sys.argv[1:] if argv is None else argv))
     if args.case is not None and args.case_path is not None:
@@ -91,7 +91,7 @@ def main():
 
     builder.fetch_or_load_depth(force=args.force_depth)
     builder.build_or_load_navigability(force=args.force_nav or builder.depth_rebuilt)
-    builder.launch_zone_editor(import_existing=not args.no_import_existing)
+    builder.launch_set_editor(import_existing=not args.no_import_existing)
 
 
 if __name__ == "__main__":

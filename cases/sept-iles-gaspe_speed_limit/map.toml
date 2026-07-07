@@ -5,29 +5,29 @@ span_km_east = 300
 span_km_north = 300
 resolution_km = 1.0
 
-# Optional zone/set speed limits in m/s. Zone indices are zero-based and match
-# the generated zone index. Omitted zones/times default to ship.info.max_speed.
-# zone = id
+# Optional set speed limits in m/s. Set indices are zero-based and match
+# the generated set index. Omitted sets/times default to ship.info.max_speed.
+# set = id
 # speed = max
 # from = "2024-03-21T18:00"
 # until = "2024-03-22T18:00"
 [[speed_limit]]
-zone = 0
+set = 0
 speed = 5.14444444
 
 [[speed_limit]]
-zone = 1
+set = 1
 speed = 5.14444444
 
 [[speed_limit]]
-zone = 2
+set = 2
 speed = 5.14444444
 
 [[speed_limit]]
-zone = 4
+set = 4
 speed = 5.14444444
 
 [[speed_limit]]
-zone = 5
+set = 5
 speed = 5.14444444
 

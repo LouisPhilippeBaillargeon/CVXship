@@ -19,44 +19,6 @@ init_speed          = 0
 # until              : Optional end datetime. Omit on the last band to use it for the rest of the trip.
 # from/start_datetime: Optional explicit start datetime. If omitted, bands are contiguous in file order.
 # ============================
-# [[auxiliary_load]]
-# power              = 1.0
-# until              = "2024-03-21T18:00"
-#
-# [[auxiliary_load]]
-# power              = 0.8
-# until              = "2024-03-22T18:00"
-#
-# [[auxiliary_load]]
-# power              = 1.1
-
-# ============================
-# List of transit cities considered in the problem
-#city                : Name
-#arrival_datetime    : "YYYY-MM-DDTHH:MM" in the UTC timezone
-#departure_datetime  : "YYYY-MM-DDTHH:MM" in the UTC timezone
-#lat                 : lattitude
-#lon                 : longitude
-#power_cost          : ($/MWh)
-# ============================
-[[transit]]
-city                = "Halifax"
-arrival_datetime    = "2024-03-20T00:00"
-departure_datetime  = "2024-03-20T04:00"
-lat                 = 44.5513889#47.047967
-lon                 = -63.384444#-60.698573#
-power_cost          = 183
-max_charge_power    = 5
-
-[[transit]]
-city                = "GrandeEntree"
-arrival_datetime    = "2024-03-22T12:30"#"2024-03-22T08:30"
-departure_datetime  = "2024-03-22T18:00"
-lat                 = 45.970663
-lon                 = -62.350969
-power_cost          = 36.81
-max_charge_power    = 5
-# ============================
 [[auxiliary_load]]
 power = 0.1
 until = "2024-03-21T18:00"
@@ -67,4 +29,32 @@ until = "2024-03-22T18:00"
 
 [[auxiliary_load]]
 power = 0.11
+
+# ============================
+# List of transit cities considered in the problem
+#city                : Name
+#arrival_datetime    : "YYYY-MM-DDTHH:MM" in the UTC timezone
+#departure_datetime  : "YYYY-MM-DDTHH:MM" in the UTC timezone
+#lat                 : latitude
+#lon                 : longitude
+#power_cost          : ($/MWh)
+# ============================
+[[transit]]
+city                = "Halifax"
+arrival_datetime    = "2025-06-01T00:00"
+departure_datetime  = "2025-06-01T02:00"
+lat                 = 44.5513889#47.047967
+lon                 = -63.384444#-60.698573#
+power_cost          = 183
+max_charge_power    = 5
+
+[[transit]]
+city                = "GrandeEntree"
+arrival_datetime    = "2025-06-02T10:00"
+departure_datetime  = "2025-06-02T14:00"
+lat                 = 45.970663
+lon                 = -62.350969
+power_cost          = 36.81
+max_charge_power    = 5
+# ============================
 

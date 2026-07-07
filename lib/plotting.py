@@ -104,16 +104,16 @@ def _get_solution_positions(sol, n_expected=None):
     return pos
 
 
-def _zone_polygons_from_ineq(zone_ineq, eps_poly=1e-9):
+def _set_polygons_from_ineq(set_ineq, eps_poly=1e-9):
     polygons = []
-    nb_zones = zone_ineq.shape[2]
+    nb_sets = set_ineq.shape[2]
 
-    for z in range(nb_zones):
+    for z in range(nb_sets):
         A = np.column_stack([
-            zone_ineq[1, :, z],  # x coefficient
-            zone_ineq[0, :, z],  # y coefficient
+            set_ineq[1, :, z],  # x coefficient
+            set_ineq[0, :, z],  # y coefficient
         ])
-        b = zone_ineq[2, :, z].astype(float)
+        b = set_ineq[2, :, z].astype(float)
 
         verts, _ = _halfspace_polygon_4ineq(A, b, eps=eps_poly)
         if verts is not None:
@@ -147,8 +147,8 @@ def _draw_feasibility_map(ax, map_obj, alpha=0.35):
     return True
 
 
-def _draw_colored_zones(ax, zone_ineq, alpha=0.25, eps_poly=1e-9, label_zones=True):
-    polygons = _zone_polygons_from_ineq(zone_ineq, eps_poly=eps_poly)
+def _draw_colored_sets(ax, set_ineq, alpha=0.25, eps_poly=1e-9, label_sets=True):
+    polygons = _set_polygons_from_ineq(set_ineq, eps_poly=eps_poly)
     cmap = plt.get_cmap("tab20")
 
     all_verts = []
@@ -172,7 +172,7 @@ def _draw_colored_zones(ax, zone_ineq, alpha=0.25, eps_poly=1e-9, label_zones=Tr
             zorder=3,
         )
 
-        if label_zones:
+        if label_sets:
             c = verts.mean(axis=0)
             ax.text(
                 c[0],
@@ -196,7 +196,7 @@ def _plot_solution_map_overlay(
     directory=PLOTS,
     name="cmp_ship_pos_xy_map",
     draw_feasibility=True,
-    draw_zones=True,
+    draw_sets=True,
     show_positions=False,
     show_crossing_points=False,
 ):
@@ -213,9 +213,9 @@ def _plot_solution_map_overlay(
     if draw_feasibility:
         _draw_feasibility_map(ax, map_obj)
 
-    if draw_zones:
-        zone_polys = _draw_colored_zones(ax, map_obj.zone_ineq)
-        all_xy.extend(zone_polys)
+    if draw_sets:
+        set_polys = _draw_colored_sets(ax, map_obj.set_ineq)
+        all_xy.extend(set_polys)
 
     for sol, pos, label in zip(solutions, positions, labels):
         if pos is None or pos.shape[0] == 0:
@@ -425,10 +425,27 @@ def _print_cost_summary_vs_benchmark(solutions, labels, benchmark_label):
     Positive percentage  -> more expensive than benchmark
     """
 
-    costs = np.array(
-        [float(sol.estimated_cost) for sol in solutions],
-        dtype=float
-    )
+    def _cost_or_nan(sol):
+        try:
+            return float(sol.estimated_cost)
+        except (TypeError, ValueError, AttributeError):
+            return np.nan
+
+    def _failure_status(sol):
+        status = getattr(sol, "solver_status", None)
+        if status:
+            return str(status)
+
+        reason = getattr(sol, "failure_reason", None)
+        if isinstance(reason, str) and reason.startswith("solver_status:"):
+            return reason.split(":", 1)[1]
+
+        if getattr(sol, "is_valid", True) is False and not np.isfinite(_cost_or_nan(sol)):
+            return "failed"
+
+        return None
+
+    costs = np.array([_cost_or_nan(sol) for sol in solutions], dtype=float)
 
     print("\n" + "=" * 80)
     print("COST SUMMARY VS BENCHMARK")
@@ -442,6 +459,10 @@ def _print_cost_summary_vs_benchmark(solutions, labels, benchmark_label):
 
     benchmark_idx = labels.index(benchmark_label)
     benchmark_cost = costs[benchmark_idx]
+    if not np.isfinite(benchmark_cost):
+        raise ValueError(
+            f"Benchmark '{benchmark_label}' does not have a finite cost."
+        )
 
     print(f"Benchmark: {benchmark_label}")
     print("-" * 80)
@@ -450,6 +471,19 @@ def _print_cost_summary_vs_benchmark(solutions, labels, benchmark_label):
 
         solve_time = getattr(sol, "solve_time", np.nan)
         validity_label = "" if getattr(sol, "is_valid", True) else " [INVALID]"
+        failure_status = _failure_status(sol)
+
+        if not np.isfinite(cost):
+            status_text = failure_status or "N/A"
+            solve_text = f"{solve_time:>8.2f} s" if np.isfinite(solve_time) else f"{'N/A':>8s} s"
+            print(
+                f"{label:<35s}: "
+                f"{'N/A':>12s} $          "
+                f"{solve_text}   "
+                f"{status_text:>10s}   "
+                f"{'N/A':>10s}"
+            )
+            continue
 
         if abs(benchmark_cost) < 1e-12:
             percent_diff = np.nan
@@ -540,6 +574,9 @@ def _print_cost_summary_vs_benchmark(solutions, labels, benchmark_label):
     )
 
     for label, sol in zip(labels, solutions):
+        required = ("gen_costs", "shore_power_cost", "prop_power", "SOC")
+        if any(not hasattr(sol, name) for name in required):
+            continue
         transition_cost = float(getattr(sol, "generator_transition_cost", 0.0) or 0.0)
         gen_cost = _generator_time_weighted_sum(sol, sol.gen_costs) + transition_cost
         shore_cost = _time_weighted_sum(sol, sol.shore_power_cost)
@@ -575,15 +612,31 @@ def plot_solutions(
     if len(labels) != len(solutions):
         raise ValueError("labels must have the same length as solutions.")
 
+    summary_solutions = list(solutions)
+    summary_labels = list(labels)
+    plot_pairs = []
+    for label, sol in zip(summary_labels, summary_solutions):
+        try:
+            cost = float(getattr(sol, "estimated_cost", np.nan))
+        except (TypeError, ValueError):
+            cost = np.nan
+        if hasattr(sol, "T_future") and np.isfinite(cost):
+            plot_pairs.append((label, sol))
+    labels = [label for label, _ in plot_pairs]
+    solutions = [sol for _, sol in plot_pairs]
+
     directory = output_root if output_root is not None else PLOTS
     if subfolder is not None:
         directory = os.path.join(directory, subfolder)
     os.makedirs(directory, exist_ok=True)
 
-    T = max(int(sol.T_future) for sol in solutions)
-
     if benchmark_label is not None:
-        _print_cost_summary_vs_benchmark(solutions, labels, benchmark_label)
+        _print_cost_summary_vs_benchmark(summary_solutions, summary_labels, benchmark_label)
+
+    if not solutions:
+        return
+
+    T = max(int(sol.T_future) for sol in solutions)
 
     def _uses_two_segments(sol):
         arr = getattr(sol, "speed_mag", None)
@@ -661,7 +714,7 @@ def plot_solutions(
             directory=directory,
             name="cmp_ship_pos_xy_map",
             draw_feasibility=True,
-            draw_zones=True,
+            draw_sets=True,
         )
 
     # ============================================================
@@ -765,20 +818,20 @@ def plot_solutions(
     _save_and_maybe_show(fig, "cmp_total_generator_cost", show, directory=directory, font_scale=2.0)
 
     # ============================================================
-    # 6) Zone index
+    # 6) Set index
     # ============================================================
     fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=150)
 
     for sol, label in zip(solutions, labels):
-        zone = np.asarray(sol.zone, dtype=float)
-        zone_idx = np.argmax(zone, axis=1)
+        set_selection = np.asarray(sol.set_selection, dtype=float)
+        set_idx = np.argmax(set_selection, axis=1)
 
         if force_two_segments:
-            zone_idx_plot = np.repeat(zone_idx[:-1], 2)
-            x = np.arange(len(zone_idx_plot))
+            set_idx_plot = np.repeat(set_idx[:-1], 2)
+            x = np.arange(len(set_idx_plot))
             ax.step(
                 x,
-                zone_idx_plot,
+                set_idx_plot,
                 where="post",
                 linestyle="--",
                 linewidth=1.2,
@@ -787,8 +840,8 @@ def plot_solutions(
             )
         else:
             ax.step(
-                np.arange(len(zone_idx)),
-                zone_idx,
+                np.arange(len(set_idx)),
+                set_idx,
                 where="post",
                 linestyle="--",
                 linewidth=1.2,
@@ -800,10 +853,10 @@ def plot_solutions(
     _finalize_axis(
         ax,
         xlabel="time index",
-        ylabel="zone index",
-        title="Selected zone",
+        ylabel="set index",
+        title="Selected set",
     )
-    _save_and_maybe_show(fig, "cmp_zone_index", show, directory=directory, font_scale=2.0)
+    _save_and_maybe_show(fig, "cmp_set_index", show, directory=directory, font_scale=2.0)
 
     # ============================================================
     # 7) Total estimated cost summary
@@ -879,7 +932,7 @@ def plot_weather_snapshot(map, weather, variable="current_x", t_index=0, show: b
     set_ieee_plot_style()
 
     data = getattr(weather, variable)[:, t_index]
-    centroids = map.zone_centroids
+    centroids = map.set_centroids
 
     xs = centroids[:, 0]
     ys = centroids[:, 1]
@@ -901,12 +954,12 @@ def plot_weather_snapshot(map, weather, variable="current_x", t_index=0, show: b
     directory = output_root if output_root is not None else PLOTS
     _save_and_maybe_show(fig, f"weather_snapshot_{variable}_t{t_index}", show, directory=directory, font_scale = 2.0)
 
-def plot_zones_and_points(
+def plot_sets_and_points(
     ship_pos: np.ndarray,
-    zone_ineq: np.ndarray,
+    set_ineq: np.ndarray,
     eps_in: float = 0.0,
     eps_poly: float = 1e-9,
-    name: str = "zones_and_trajectory",
+    name: str = "sets_and_trajectory",
     show: bool = False,
     output_root=None,
 ):
@@ -921,28 +974,28 @@ def plot_zones_and_points(
         f"ship_pos must be shape (T,2), got {ship_pos.shape}"
 
     T = ship_pos.shape[0]
-    nb_zones = zone_ineq.shape[2]
+    nb_sets = set_ineq.shape[2]
 
     x = ship_pos[:, 0]
     y = ship_pos[:, 1]
 
     vals_all = (
-        y[:, None, None] * zone_ineq[0, :, :]
-        + x[:, None, None] * zone_ineq[1, :, :]
-        + zone_ineq[2, :, :]
+        y[:, None, None] * set_ineq[0, :, :]
+        + x[:, None, None] * set_ineq[1, :, :]
+        + set_ineq[2, :, :]
     )
-    in_zone = np.all(vals_all >= -eps_in, axis=1).astype(int)
+    in_set = np.all(vals_all >= -eps_in, axis=1).astype(int)
 
     fig, ax = plt.subplots(figsize=(7.2, 6.0), dpi=140)
     cmap = plt.get_cmap("tab20")
     any_poly = False
 
-    for z in range(nb_zones):
+    for z in range(nb_sets):
         A = np.column_stack([
-            zone_ineq[1, :, z],
-            zone_ineq[0, :, z],
+            set_ineq[1, :, z],
+            set_ineq[0, :, z],
         ])
-        b = zone_ineq[2, :, z].astype(float)
+        b = set_ineq[2, :, z].astype(float)
 
         verts, _ = _halfspace_polygon_4ineq(A, b, eps=eps_poly)
 
@@ -965,9 +1018,9 @@ def plot_zones_and_points(
 
     if any_poly:
         all_verts = []
-        for z in range(nb_zones):
-            A = np.column_stack([zone_ineq[1, :, z], zone_ineq[0, :, z]])
-            b = zone_ineq[2, :, z].astype(float)
+        for z in range(nb_sets):
+            A = np.column_stack([set_ineq[1, :, z], set_ineq[0, :, z]])
+            b = set_ineq[2, :, z].astype(float)
             verts, _ = _halfspace_polygon_4ineq(A, b, eps=eps_poly)
             if verts is not None:
                 all_verts.append(verts)
@@ -991,9 +1044,9 @@ def plot_zones_and_points(
     ax.grid(True, which="both", linestyle="--", linewidth=0.6, alpha=0.6)
     ax.set_xlabel("x")
     ax.set_ylabel("y")
-    ax.set_title("Zones (filled) and ship trajectory")
+    ax.set_title("Sets (filled) and ship trajectory")
     ax.legend()
 
     directory = output_root if output_root is not None else PLOTS
     _save_and_maybe_show(fig, name, show, directory=directory, font_scale = 2.0)
-    return in_zone
+    return in_set
