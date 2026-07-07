@@ -7,7 +7,6 @@ from pathlib import Path
 
 from lib.load_params import MapInfo, load_ship
 from lib.map_builder import MapBuilder
-from lib.paths import CONFIG
 
 
 def _normalize_argv(argv: list[str]) -> list[str]:
@@ -35,7 +34,7 @@ def _parse_args(argv: list[str] | None = None):
         "--cases",
         dest="case",
         type=Path,
-        help="Case directory containing map.toml and ship.toml. Defaults to cases/baseline.",
+        help="Case directory containing map.toml and ship.toml.",
     )
     parser.add_argument(
         "--force-depth",
@@ -55,7 +54,9 @@ def _parse_args(argv: list[str] | None = None):
     args = parser.parse_args(_normalize_argv(sys.argv[1:] if argv is None else argv))
     if args.case is not None and args.case_path is not None:
         parser.error("provide the case directory either positionally or with --case, not both")
-    args.case = args.case or args.case_path or CONFIG
+    if args.case is None and args.case_path is None:
+        parser.error("provide a case directory with --case or as a positional argument")
+    args.case = args.case or args.case_path
     del args.case_path
     return args
 

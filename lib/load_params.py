@@ -7,7 +7,6 @@ import math
 from pathlib import Path
 
 from lib.utils import build_variable_timestep_grid, dx_dy_km, point_in_sets
-from lib.paths import SHIP, MAP_TOML, ITINERARY, SET_INEQ, TRANSITION_INEQ, SET_ADJ, NAVIGABILITY_MAP, CORNERS, SETS
 from lib.weather import weather_from_nc_file
 from lib.weather_interpolation import resolve_weather_files_from_toml
 
@@ -84,20 +83,22 @@ class Ship:
     battery         : Battery
     solarPanels     : SolarPanels
 
-def _case_file(case_dir, filename, default_path):
+def _case_dir(case_dir):
     if case_dir is None:
-        return Path(default_path)
-    return Path(case_dir).resolve() / filename
+        raise ValueError("case_dir is required. Pass a named case directory with --case.")
+    return Path(case_dir).resolve()
 
 
-def _case_map_file(case_dir, filename, default_path):
-    if case_dir is None:
-        return Path(default_path)
-    return Path(case_dir).resolve() / "map" / filename
+def _case_file(case_dir, filename):
+    return _case_dir(case_dir) / filename
+
+
+def _case_map_file(case_dir, filename):
+    return _case_dir(case_dir) / "map" / filename
 
 
 def load_ship(case_dir=None) -> Ship:
-    with open(_case_file(case_dir, "ship.toml", SHIP), "rb") as f:
+    with open(_case_file(case_dir, "ship.toml"), "rb") as f:
         data = tomllib.load(f)
 
     propulsion = Propulsion(**data["propulsion"])
@@ -315,18 +316,18 @@ def _load_speed_limit_bands(data, nb_sets: int) -> List[dict]:
 
 
 def load_map(case_dir=None) -> Map:
-    with open(_case_file(case_dir, "map.toml", MAP_TOML), "rb") as f:
+    with open(_case_file(case_dir, "map.toml"), "rb") as f:
         toml_data = tomllib.load(f)
 
     info = MapInfo(**toml_data["params"])
 
-    set_data = np.load(_case_map_file(case_dir, "sets_ineq.npz", SET_INEQ))
+    set_data = np.load(_case_map_file(case_dir, "sets_ineq.npz"))
     set_ineq = set_data["lambda_array"]
     nb_sets = set_ineq.shape[2]
 
-    set_adj = np.load(_case_map_file(case_dir, "sets_adj.npy", SET_ADJ))
+    set_adj = np.load(_case_map_file(case_dir, "sets_adj.npy"))
 
-    trans_data = np.load(_case_map_file(case_dir, "transition_ineq.npz", TRANSITION_INEQ))
+    trans_data = np.load(_case_map_file(case_dir, "transition_ineq.npz"))
     trans_from = np.nan_to_num(trans_data["transition_ineqs_from"], nan=0.0)
     trans_to = np.nan_to_num(trans_data["transition_ineqs_to"], nan=0.0)
     speed_limit_bands = _load_speed_limit_bands(toml_data, nb_sets)
@@ -339,9 +340,9 @@ def load_map(case_dir=None) -> Map:
         set_adj=set_adj,
         nb_sets=nb_sets,
         speed_limit_bands=speed_limit_bands,
-        navigability_map_path=_case_map_file(case_dir, "navigability_map.npy", NAVIGABILITY_MAP),
-        corners_path=_case_map_file(case_dir, "corners.csv", CORNERS),
-        set_corners_path=_case_map_file(case_dir, "sets.csv", SETS),
+        navigability_map_path=_case_map_file(case_dir, "navigability_map.npy"),
+        corners_path=_case_map_file(case_dir, "corners.csv"),
+        set_corners_path=_case_map_file(case_dir, "sets.csv"),
     )
     m.set_centroids = _compute_set_centroids(m.info, m.set_ineq)
     return m
@@ -449,7 +450,7 @@ def _compute_auxiliary_power_profile(itinerary):
 
 
 def load_itinerary(map, case_dir=None) -> Itinerary:
-    with open(_case_file(case_dir, "itinerary.toml", ITINERARY), "rb") as f:
+    with open(_case_file(case_dir, "itinerary.toml"), "rb") as f:
         data = tomllib.load(f)
     params = data.get("params", {})
     soc_i=params["soc_i"]

@@ -11,9 +11,8 @@ faulthandler.enable()
 from lib.load_params import Ship, Map, Itinerary, States
 from lib.models import BaseWindModel, WindModel1D, WindModelTransition1D, WindModel2D, WindModelPathAligned2D, PropulsionModel, GeneratorModel, CalmWaterModel
 from lib.weather import Weather
-from lib.utils import classify_timesteps, dx_dy_km, compute_port_set_indices, point_in_sets, _compute_tight_big_M_set, _compute_min_set_timesteps, _compute_min_crossing_distance_per_set, build_constant_speed_path_reference, xy_from_path_distance, _ordered_set_corner_ids, _set_edges_from_corner_ids
+from lib.utils import classify_timesteps, dx_dy_km, compute_port_set_indices, point_in_sets, _compute_tight_big_M_set, _compute_min_set_timesteps, _compute_min_crossing_distance_per_set, build_constant_speed_path_reference, xy_from_path_distance, _ordered_set_corner_ids, _set_edges_from_corner_ids, ship_speed_limit_matrix, build_speed_limit_partitions
 from lib.weather_interpolation import build_path_segment_weather_inputs, interpolated_weather_at, query_time_for_segment
-from lib.paths import CORNERS, SETS
 from lib.debug_diagnostics import record_optimizer_debug
 
 
@@ -47,9 +46,22 @@ def _propulsion_physical_feasibility_constraints(
     ]
 
 
+def _jpcse_normal_wind_inactive_expr(set_selection, t: int, z: int, use_transition_wind_model: bool):
+    if use_transition_wind_model:
+        return 2 - set_selection[t, z] - set_selection[t + 1, z]
+    return 1 - set_selection[t, z]
+
+
+def _jpcse_transition_wind_inactive_expr(set_selection, t: int, z: int, z_next: int):
+    return 2 - set_selection[t, z] - set_selection[t + 1, z_next]
+
+
 def _minimum_set_steps_for_optimizer(map_obj, itinerary, ship, debug=False):
-    corners_path = getattr(map_obj, "corners_path", CORNERS)
-    set_corners_path = getattr(map_obj, "set_corners_path", SETS)
+    corners_path = getattr(map_obj, "corners_path", None)
+    set_corners_path = getattr(map_obj, "set_corners_path", None)
+    if corners_path is None or set_corners_path is None:
+        raise ValueError("map object must include corners_path and set_corners_path.")
+
     min_dist_by_id = _compute_min_crossing_distance_per_set(corners_path, set_corners_path)
 
     if min_dist_by_id and all(float(d) <= 1e-9 for d in min_dist_by_id.values()):
@@ -129,6 +141,7 @@ class Solution:
     solar_power_available   : Optional[np.ndarray] = None
     first_stage_optimizer   : Optional[str] = None
     power_management_optimizer: Optional[str] = None
+    power_management_solver_status: Optional[str] = None
     energy_solve_time       : Optional[float] = None
     gen_startup             : Optional[np.ndarray] = None
     gen_shutdown            : Optional[np.ndarray] = None
@@ -137,6 +150,15 @@ class Solution:
     solar_curtailment       : Optional[np.ndarray] = None
     solver_status           : Optional[str] = None
     failure_reason          : Optional[str] = None
+    is_valid                : bool = True
+    validation_warnings     : Dict = field(default_factory=dict)
+    validation_errors       : Dict = field(default_factory=dict)
+    route_validation_warnings: Dict = field(default_factory=dict)
+    route_validation_errors : Dict = field(default_factory=dict)
+    ems_validation_warnings : Dict = field(default_factory=dict)
+    ems_validation_errors   : Dict = field(default_factory=dict)
+    pre_redispatch_ems_validation_warnings: Dict = field(default_factory=dict)
+    pre_redispatch_ems_validation_errors: Dict = field(default_factory=dict)
 
 
 @dataclass
@@ -692,29 +714,129 @@ def _ship_speed_limit_matrix(map_obj, itinerary, states, ship, T_future: int) ->
     Return speed limits in m/s with shape [nb_sets, T_future].
     Undefined sets/times default to the ship max speed.
     """
-    nb_sets = int(map_obj.nb_sets)
-    ship_max_speed = float(ship.info.max_speed)
-    limits = np.full((nb_sets, T_future), ship_max_speed, dtype=float)
-    bands = getattr(map_obj, "speed_limit_bands", None) or []
-    if not bands:
-        return limits
+    return ship_speed_limit_matrix(map_obj, itinerary, states, ship, T_future)
 
-    midpoints = _future_timestep_midpoints(itinerary, states, T_future)
-    for band in bands:
-        start = band.get("start")
-        end = band.get("end")
-        active_t = [
-            t for t, midpoint in enumerate(midpoints)
-            if (start is None or midpoint >= start) and (end is None or midpoint < end)
+
+def _jpcse_leg_metrics(
+    ship_pos,
+    crossing_point,
+    set_selection,
+    current_x_future,
+    current_y_future,
+    timestep_dt_h,
+    interval_sail_fraction=None,
+):
+    """
+    Compute JPCSE geometry and water-relative leg metrics from solved positions.
+
+    Positions are in km, currents are in m/s, and returned speeds are in m/s.
+    This mirrors the paper formulation: crossing time stays free, scalar speed
+    comes from total leg distance, and water-relative speed comes from
+    water-relative leg distances using equal-duration current displacement.
+    """
+    ship_pos = np.asarray(ship_pos, dtype=float)
+    crossing_point = np.asarray(crossing_point, dtype=float)
+    set_selection = np.asarray(set_selection, dtype=float)
+    current_x_future = np.asarray(current_x_future, dtype=float)
+    current_y_future = np.asarray(current_y_future, dtype=float)
+    timestep_dt_h = np.asarray(timestep_dt_h, dtype=float).reshape(-1)
+
+    T_future = timestep_dt_h.size
+    if interval_sail_fraction is None:
+        sail_mask = np.ones(T_future, dtype=bool)
+    else:
+        interval_sail_fraction = np.asarray(interval_sail_fraction, dtype=float).reshape(-1)
+        if interval_sail_fraction.shape != (T_future,):
+            raise ValueError(
+                f"interval_sail_fraction must have shape {(T_future,)}, "
+                f"got {interval_sail_fraction.shape}."
+            )
+        sail_mask = interval_sail_fraction > 0.01
+
+    if ship_pos.shape != (T_future + 1, 2):
+        raise ValueError(f"ship_pos must have shape {(T_future + 1, 2)}, got {ship_pos.shape}.")
+    if crossing_point.shape != (T_future, 2):
+        raise ValueError(f"crossing_point must have shape {(T_future, 2)}, got {crossing_point.shape}.")
+    if set_selection.shape[0] != T_future + 1:
+        raise ValueError(
+            f"set_selection must have {T_future + 1} rows, got {set_selection.shape}."
+        )
+    if current_x_future.shape != current_y_future.shape:
+        raise ValueError("current_x_future and current_y_future must have matching shapes.")
+    if current_x_future.shape[1] != T_future:
+        raise ValueError(
+            f"current arrays must have {T_future} columns, got {current_x_future.shape}."
+        )
+
+    leg_vec = np.stack(
+        [
+            crossing_point - ship_pos[:-1, :],
+            ship_pos[1:, :] - crossing_point,
+        ],
+        axis=1,
+    )
+    step_distance = np.linalg.norm(leg_vec, axis=2)
+
+    speed_mag = np.zeros(T_future, dtype=float)
+    positive_dt = timestep_dt_h > 0.0
+    speed_mag[positive_dt] = (
+        np.sum(step_distance[positive_dt, :], axis=1)
+        / timestep_dt_h[positive_dt]
+        * 1000.0
+        / 3600.0
+    )
+
+    current_start = np.column_stack(
+        [
+            np.sum(set_selection[:-1, :] * current_x_future.T, axis=1),
+            np.sum(set_selection[:-1, :] * current_y_future.T, axis=1),
         ]
-        if not active_t:
-            continue
+    )
+    current_end = np.column_stack(
+        [
+            np.sum(set_selection[1:, :] * current_x_future.T, axis=1),
+            np.sum(set_selection[1:, :] * current_y_future.T, axis=1),
+        ]
+    )
+    half_current_displacement_km = (0.5 * timestep_dt_h * 3.6)[:, None]
+    water_leg_vec = np.stack(
+        [
+            leg_vec[:, 0, :] - half_current_displacement_km * current_start,
+            leg_vec[:, 1, :] - half_current_displacement_km * current_end,
+        ],
+        axis=1,
+    )
+    water_leg_distance = np.linalg.norm(water_leg_vec, axis=2)
+    water_leg_distance[~sail_mask, :] = 0.0
+    speed_rel_water_mag = np.zeros(T_future, dtype=float)
+    positive_sail_dt = positive_dt & sail_mask
+    speed_rel_water_mag[positive_sail_dt] = (
+        np.sum(water_leg_distance[positive_sail_dt, :], axis=1)
+        / timestep_dt_h[positive_sail_dt]
+        * 1000.0
+        / 3600.0
+    )
 
-        limit = min(float(band["speed"]), ship_max_speed)
-        for z in band["sets"]:
-            limits[int(z), active_t] = limit
+    ship_speed = np.zeros((T_future, 2), dtype=float)
+    ship_speed[positive_dt, :] = (
+        (ship_pos[1:, :] - ship_pos[:-1, :])[positive_dt, :]
+        / timestep_dt_h[positive_dt, None]
+        * 1000.0
+        / 3600.0
+    )
+    speed_rel_water = ship_speed - 0.5 * (current_start + current_end)
+    speed_rel_water[~sail_mask, :] = 0.0
 
-    return limits
+    return {
+        "step_distance": step_distance,
+        "speed_mag": speed_mag,
+        "water_leg_distance": water_leg_distance,
+        "ship_speed": ship_speed,
+        "speed_rel_water": speed_rel_water,
+        "speed_rel_water_mag": speed_rel_water_mag,
+        "current_start": current_start,
+        "current_end": current_end,
+    }
 
 
 @dataclass
@@ -734,6 +856,7 @@ class EnergyOnlyOptimizer:
     source_optimizer_name: Optional[str] = None
 
     sol: Optional[Solution] = field(default=None, init=False)
+    power_management_solver_status: Optional[str] = field(default=None, init=False)
 
     @staticmethod
     def _as_segment_matrix(value, T: int, H: int, name: str) -> np.ndarray:
@@ -1019,6 +1142,8 @@ class EnergyOnlyOptimizer:
             if problem.solver_stats is not None:
                 print("Solver reported solve time:", problem.solver_stats.solve_time, "seconds")
 
+        self.power_management_solver_status = problem.status
+
         if not _solver_succeeded(problem, "EnergyOnlyOptimizer"):
             print(f"Energy-only optimization status: {problem.status}")
             return 0
@@ -1108,6 +1233,7 @@ class EnergyOnlyOptimizer:
             solar_power_available=solar_power_available,
             first_stage_optimizer=first_stage_optimizer,
             power_management_optimizer=type(self).__name__,
+            power_management_solver_status=problem.status,
             energy_solve_time=solve_time,
             gen_startup=gen_startup_out,
             gen_shutdown=gen_shutdown_out,
@@ -1949,9 +2075,9 @@ class JPCSE:
                 ordered_set_ids,
             )
 
-        # ================================ SAFE TRANSITIONS WITH TWO SEGMENTS ===================================
+        # ================================ SAFE TRANSITIONS WITH TWO LEGS =======================================
         crossing_point = cp.Variable((T_future, 2))
-        step_distance = cp.Variable((T_future, 2), nonneg=True)
+        leg_distance = cp.Variable((T_future, 2), nonneg=True)
 
         big_M_set = _compute_tight_big_M_set(self.map, self.map.set_ineq)
 
@@ -1969,13 +2095,13 @@ class JPCSE:
                 constraints += [
                     q[0] == ship_pos[t, 0],
                     q[1] == ship_pos[t, 1],
-                    step_distance[t, 0] == 0,
-                    step_distance[t, 1] == 0,
+                    leg_distance[t, 0] == 0,
+                    leg_distance[t, 1] == 0,
                 ]
 
             constraints += [
-                step_distance[t, 0] >= cp.norm(q - ship_pos[t, :], 2),
-                step_distance[t, 1] >= cp.norm(ship_pos[t + 1, :] - q, 2),
+                leg_distance[t, 0] >= cp.norm(q - ship_pos[t, :], 2),
+                leg_distance[t, 1] >= cp.norm(ship_pos[t + 1, :] - q, 2),
             ]
 
             for z in range(self.map.nb_sets):
@@ -2075,9 +2201,6 @@ class JPCSE:
                 print(f"Restricted JPCSE sets to base +/- {base_set_radius}.")
 
         # ================================================ EARTH-FIXED SPEED ==========================================
-        speed_mag_split = cp.Variable((T_future, 2), nonneg=True)
-        ship_speed_x_split = cp.Variable((T_future, 2))
-        ship_speed_y_split = cp.Variable((T_future, 2))
         ship_speed_x = cp.Variable(T_future)
         ship_speed_y = cp.Variable(T_future)
         speed_mag = cp.Variable(T_future, nonneg=True)
@@ -2089,32 +2212,22 @@ class JPCSE:
         constraints += [speed_mag<=self.ship.info.max_speed]
 
         for t in range(T_future):
-            q = crossing_point[t, :]
             constraints += [
-                ship_speed_x_split[t, 0] == ((q[0] - ship_pos[t, 0]) / half_dt_h[t]) * 1000 / 3600,
-                ship_speed_y_split[t, 0] == ((q[1] - ship_pos[t, 1]) / half_dt_h[t]) * 1000 / 3600,
-                ship_speed_x_split[t, 1] == ((ship_pos[t + 1, 0] - q[0]) / half_dt_h[t]) * 1000 / 3600,
-                ship_speed_y_split[t, 1] == ((ship_pos[t + 1, 1] - q[1]) / half_dt_h[t]) * 1000 / 3600,
                 ship_speed_x[t] == ((ship_pos[t + 1, 0] - ship_pos[t, 0]) / timestep_dt_h[t]) * 1000 / 3600,
                 ship_speed_y[t] == ((ship_pos[t + 1, 1] - ship_pos[t, 1]) / timestep_dt_h[t]) * 1000 / 3600,
-                speed_mag_split[t, 0] <= set_selection[t, :] @ ship_speed_limit[:, t],
-                speed_mag_split[t, 1] <= set_selection[t + 1, :] @ ship_speed_limit[:, t],
-            ]
-            for h in range(2):
-                constraints += [
-                    speed_mag_split[t, h] >= cp.norm(
-                        cp.hstack([ship_speed_x_split[t, h], ship_speed_y_split[t, h]]),
-                        2,
-                    )
+                speed_mag[t] == cp.sum(leg_distance[t, :]) / timestep_dt_h[t] * 1000 / 3600,
                 ]
-        constraints += [speed_mag ==cp.sum(speed_mag_split,axis=1)/2]
+
+        for t in range(T_future):
+            # JPCSE keeps crossing time free; legal speed applies to the scalar
+            # speed magnitude from total leg distance, not to helper-leg speeds.
+            constraints += [
+                speed_mag[t] <= set_selection[t, :] @ ship_speed_limit[:, t],
+                speed_mag[t] <= set_selection[t + 1, :] @ ship_speed_limit[:, t],
+            ]
 
         # ================================================ RELATIVE SPEEDS =============================================
-        ship_speed_x_split_rel_water = cp.Variable((T_future, 2))
-        ship_speed_y_split_rel_water = cp.Variable((T_future, 2))
-        ship_speed_x_rel_water = cp.Variable(T_future) #only valid when there are no set transitions.
-        ship_speed_y_rel_water = cp.Variable(T_future) #only valid when there are no set transitions.
-        ship_speed_rel_water_mag_split = cp.Variable((T_future, 2), nonneg=True)
+        water_leg_distance = cp.Variable((T_future, 2), nonneg=True)
         speed_rel_water_mag = cp.Variable(T_future, nonneg=True)
 
         current_x_future = self.weather.current_x[:, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
@@ -2122,30 +2235,39 @@ class JPCSE:
 
         constraints += [speed_rel_water_mag<=self.ship.info.max_speed+1]  #adding 1m/s to account for currents that can go up to 1m/s
         for t in range(T_future):
-            constraints += [
-                ship_speed_x_rel_water[t] ==
-                ship_speed_x[t] - set_selection[t, :] @ current_x_future[:, t],
-
-                ship_speed_y_rel_water[t] ==
-                ship_speed_y[t] - set_selection[t, :] @ current_y_future[:, t],
-            ]
-
-        for t in range(T_future):
-            constraints += [ship_speed_x_split_rel_water[t,0]==ship_speed_x_split[t,0]-set_selection[t,:]@current_x_future[:,t]]
-            constraints += [ship_speed_x_split_rel_water[t,1]==ship_speed_x_split[t,1]-set_selection[t+1,:]@current_x_future[:,t]]
-            constraints += [ship_speed_y_split_rel_water[t,0]==ship_speed_y_split[t,0]-set_selection[t,:]@current_y_future[:,t]]
-            constraints += [ship_speed_y_split_rel_water[t,1]==ship_speed_y_split[t,1]-set_selection[t+1,:]@current_y_future[:,t]]
-            for j in range(2):
+            if interval_sail_fraction[t] <= 0.01:
                 constraints += [
-                    ship_speed_rel_water_mag_split[t, j] >= cp.norm(
-                        cp.hstack([
-                            ship_speed_x_split_rel_water[t, j],
-                            ship_speed_y_split_rel_water[t, j]
-                        ]),
-                        2
-                    )
+                    water_leg_distance[t, 0] == 0,
+                    water_leg_distance[t, 1] == 0,
+                    speed_rel_water_mag[t] == 0,
                 ]
-        constraints += [speed_rel_water_mag >= cp.sum(ship_speed_rel_water_mag_split,axis=1)/2]
+                continue
+
+            q = crossing_point[t, :]
+            current_scale_km = half_dt_h[t] * 3.6
+            current_start_x = set_selection[t, :] @ current_x_future[:, t]
+            current_start_y = set_selection[t, :] @ current_y_future[:, t]
+            current_end_x = set_selection[t + 1, :] @ current_x_future[:, t]
+            current_end_y = set_selection[t + 1, :] @ current_y_future[:, t]
+
+            constraints += [
+                water_leg_distance[t, 0] >= cp.norm(
+                    cp.hstack([
+                        q[0] - ship_pos[t, 0] - current_scale_km * current_start_x,
+                        q[1] - ship_pos[t, 1] - current_scale_km * current_start_y,
+                    ]),
+                    2,
+                ),
+                water_leg_distance[t, 1] >= cp.norm(
+                    cp.hstack([
+                        ship_pos[t + 1, 0] - q[0] - current_scale_km * current_end_x,
+                        ship_pos[t + 1, 1] - q[1] - current_scale_km * current_end_y,
+                    ]),
+                    2,
+                ),
+                speed_rel_water_mag[t]
+                == cp.sum(water_leg_distance[t, :]) / timestep_dt_h[t] * 1000 / 3600,
+            ]
         # ================================================= RESISTANCE =================================================
         wind_resistance = cp.Variable(T_future)
         calm_water_resistance = cp.Variable(T_future, nonneg = True)
@@ -2188,6 +2310,12 @@ class JPCSE:
             if interval_sail_fraction[t] > 0.01:
 
                 for z in range(self.map.nb_sets):
+                    normal_inactive = _jpcse_normal_wind_inactive_expr(
+                        set_selection,
+                        t,
+                        z,
+                        use_transition_wind_model,
+                    )
                     if ordered_sets and hasattr(self.wind_model, "speed_constraint_A"):
                         A = self.wind_model.speed_constraint_A[z][:2]
                         b = self.wind_model.speed_constraint_b[z][:2]
@@ -2196,17 +2324,16 @@ class JPCSE:
                             constraints += [
                                 A[k, 0] * ship_speed_x[t]
                                 + A[k, 1] * ship_speed_y[t]
-                                >= b[k] - 1000 * (2 - set_selection[t, z] - set_selection[t+1, z])
+                                >= b[k] - 1000 * normal_inactive
                             ]
 
                     c = wind_model_future[z, t, :]
                     normal_expr_z = normal_wind_expr(c, t)
 
-                    #wind constraints applied when there is no transitions
                     constraints += [
                         wind_resistance[t] >=
                         normal_expr_z
-                        - WIND_BIG_M * (2 - set_selection[t, z] - set_selection[t+1, z])
+                        - WIND_BIG_M * normal_inactive
                     ]
 
                     if use_transition_wind_model:
@@ -2218,7 +2345,12 @@ class JPCSE:
                             if transition_valid_pairs is not None and not transition_valid_pairs[z, z_next]:
                                 continue
 
-                            transition_inactive = 2 - set_selection[t, z] - set_selection[t+1, z_next]
+                            transition_inactive = _jpcse_transition_wind_inactive_expr(
+                                set_selection,
+                                t,
+                                z,
+                                z_next,
+                            )
                             cnd = wind_model_nd_future[z, z_next, t, :]
                             constraints += [
                                 wind_resistance[t] >=
@@ -2397,39 +2529,24 @@ class JPCSE:
             gen_shutdown_out = _value_array(generator_dispatch.shutdown)
             generator_transition_cost = float(_value_array(generator_dispatch.transition_cost))
 
-            ship_speed_out = np.stack(
-                [np.array(ship_speed_x.value), np.array(ship_speed_y.value)],
-                axis=1,
-            )  # [T_future, 2(x,y), 2(segment)]
-            ship_speed_split_out = np.stack(
-                [
-                    np.asarray(ship_speed_x_split.value),
-                    np.asarray(ship_speed_y_split.value),
-                ],
-                axis=1,
-            )
-            speed_mag_out = np.mean(
-                np.linalg.norm(np.moveaxis(ship_speed_split_out, 1, -1), axis=-1),
-                axis=1,
-            )
-
-            speed_rel_water_out = np.stack(
-                [np.array(ship_speed_x_split_rel_water.value), np.array(ship_speed_y_split_rel_water.value)],
-                axis=1,
-            )  # [T_future, 2(x,y), 2(segment)]
-            speed_rel_water_mag_out = np.mean(
-                np.linalg.norm(np.moveaxis(speed_rel_water_out, 1, -1), axis=-1),
-                axis=1,
-            )
+            set_selection_out = np.asarray(set_selection.value, dtype=float)
             ship_pos_out = np.asarray(ship_pos.value, dtype=float)
             crossing_point_out = np.asarray(crossing_point.value, dtype=float)
-            step_distance_out = np.stack(
-                [
-                    np.linalg.norm(crossing_point_out - ship_pos_out[:-1, :], axis=1),
-                    np.linalg.norm(ship_pos_out[1:, :] - crossing_point_out, axis=1),
-                ],
-                axis=1,
+            leg_metrics = _jpcse_leg_metrics(
+                ship_pos_out,
+                crossing_point_out,
+                set_selection_out,
+                current_x_future,
+                current_y_future,
+                timestep_dt_h,
+                interval_sail_fraction,
             )
+            ship_speed_out = leg_metrics["ship_speed"]
+            speed_mag_out = leg_metrics["speed_mag"]
+            speed_rel_water_out = leg_metrics["speed_rel_water"]
+            speed_rel_water_mag_out = leg_metrics["speed_rel_water_mag"]
+            step_distance_out = leg_metrics["step_distance"]
+            water_leg_distance_out = leg_metrics["water_leg_distance"]
             shore_power_cost = np.array(shore_power.value).astype(float) * shore_cost.astype(float)
 
             self.sol = Solution(
@@ -2441,7 +2558,7 @@ class JPCSE:
                 interval_sail_fraction  = interval_sail_fraction,
                 total_distance          = float(np.sum(step_distance_out)),
 
-                set_selection          = np.array(set_selection.value),
+                set_selection          = set_selection_out,
                 ship_pos                = ship_pos_out,
                 ship_speed              = ship_speed_out,
                 speed_mag               = speed_mag_out,
@@ -2466,6 +2583,7 @@ class JPCSE:
 
                 crossing_point          = crossing_point_out,
                 step_distance           = step_distance_out,
+                segment_dt_h            = None,
                 path_set_ids           = np.array(self.path_set_ids),
                 timestep_dt_h           = timestep_dt_h,
                 interval_port_idx       = interval_port_idx,
@@ -2474,15 +2592,17 @@ class JPCSE:
                 generator_transition_cost= generator_transition_cost,
                 generator_unit_commitment=unit_commitment,
                 first_stage_optimizer   = (
-                    "JPCSE"
+                    "JPCSE_transit_wind"
                     if use_transition_wind_model
-                    else "JPCSE_NormalWindTransitions"
+                    else "JPCSE_departure_wind"
                 ),
                 solver_status=problem.status,
             )
             if debug:
                 record_optimizer_debug(
-                    "JPCSE" if use_transition_wind_model else "JPCSE_NormalWindTransitions",
+                    "JPCSE_transit_wind"
+                    if use_transition_wind_model
+                    else "JPCSE_departure_wind",
                     self,
                     {
                         "mode": "JPCSE",
@@ -2490,22 +2610,9 @@ class JPCSE:
                         "set_selection": set_selection.value,
                         "ship_speed_x": ship_speed_x.value,
                         "ship_speed_y": ship_speed_y.value,
-                        "ship_speed_split_vec": np.stack(
-                            [
-                                np.asarray(ship_speed_x_split.value),
-                                np.asarray(ship_speed_y_split.value),
-                            ],
-                            axis=1,
-                        ),
-                        "ship_speed_x_rel_water": ship_speed_x_rel_water.value,
-                        "ship_speed_y_rel_water": ship_speed_y_rel_water.value,
-                        "rel_speed_split_vec": np.stack(
-                            [
-                                np.asarray(ship_speed_x_split_rel_water.value),
-                                np.asarray(ship_speed_y_split_rel_water.value),
-                            ],
-                            axis=1,
-                        ),
+                        "leg_distance": leg_distance.value,
+                        "water_leg_distance": water_leg_distance.value,
+                        "water_leg_distance_from_geometry": water_leg_distance_out,
                         "speed_mag": speed_mag.value,
                         "speed_rel_water_mag": speed_rel_water_mag.value,
                         "wind_resistance": wind_resistance.value,
@@ -2814,6 +2921,9 @@ class FPJSE:
             constraints += [cp.sum(speed_set_end[t, :]) == speed_mag[t]]
 
             for s in range(nb_path_sets):
+                # FPJSE uses one legal speed per timestep. Start/end auxiliaries
+                # only select heading/current approximations, so both endpoints
+                # conservatively cap the full timestep speed.
                 constraints += [
                     speed_set_start[t, s] <= path_set_speed_limit[s, t] * path_set_selection[t, s],
                     speed_set_end[t, s] <= path_set_speed_limit[s, t] * path_set_selection[t + 1, s],
@@ -3433,6 +3543,17 @@ class FR_O:
         cos_seg = np.cos(theta_seg)
         sin_seg = np.sin(theta_seg)
 
+        ship_speed_limit = _ship_speed_limit_matrix(
+            self.map, self.itinerary, self.states, self.ship, T_future
+        )
+        speed_limit_partitions = build_speed_limit_partitions(
+            D_breaks,
+            path_set_ids,
+            ship_speed_limit,
+            ship_max_speed_mps=float(self.ship.info.max_speed),
+        )
+        use_speed_limit_partitions = bool(speed_limit_partitions["has_active_limit"])
+
         # ================================= DISTANCE VARIABLES =================================
         d = cp.Variable(T_future + 1, nonneg=True)
 
@@ -3453,6 +3574,43 @@ class FR_O:
                 else:
                     constraints += [d[t] == total_path_length]
 
+        path_partition_selection = None
+        partition_caps = None
+        if use_speed_limit_partitions:
+            partition_breaks = np.asarray(
+                speed_limit_partitions["distance_breaks_km"],
+                dtype=float,
+            )
+            partition_caps = np.asarray(speed_limit_partitions["caps_mps"], dtype=float)
+            nb_partitions = len(partition_breaks) - 1
+            path_partition_selection = cp.Variable((T_future + 1, nb_partitions), boolean=True)
+
+            for t in range(T_future + 1):
+                constraints += [cp.sum(path_partition_selection[t, :]) == 1]
+                lower_expr = 0
+                upper_expr = 0
+                for p in range(nb_partitions):
+                    lower_expr += partition_breaks[p] * path_partition_selection[t, p]
+                    upper_expr += partition_breaks[p + 1] * path_partition_selection[t, p]
+                constraints += [d[t] >= lower_expr]
+                constraints += [d[t] <= upper_expr]
+
+            for t in range(T_future):
+                for p_next in range(nb_partitions):
+                    if p_next == 0:
+                        constraints += [
+                            path_partition_selection[t + 1, p_next]
+                            <= path_partition_selection[t, p_next]
+                        ]
+                    else:
+                        constraints += [
+                            path_partition_selection[t + 1, p_next]
+                            <= (
+                                path_partition_selection[t, p_next]
+                                + path_partition_selection[t, p_next - 1]
+                            )
+                        ]
+
         # ================================= SPEED =================================
         step_distance = cp.Variable(T_future, nonneg=True)
         speed_mag = cp.Variable(T_future, nonneg=True)
@@ -3460,6 +3618,12 @@ class FR_O:
         constraints += [step_distance == d[1:] - d[:-1]]
         constraints += [speed_mag == cp.multiply(step_distance, 1.0 / timestep_dt_h) * 1000.0 / 3600.0]
         constraints += [speed_mag <= self.ship.info.max_speed]
+        if use_speed_limit_partitions:
+            for t in range(T_future):
+                constraints += [
+                    speed_mag[t] <= path_partition_selection[t, :] @ partition_caps[:, t],
+                    speed_mag[t] <= path_partition_selection[t + 1, :] @ partition_caps[:, t],
+                ]
 
         cos_t = np.cos(self.sampled_course_angle)
         sin_t = np.sin(self.sampled_course_angle)
@@ -4262,8 +4426,11 @@ class ShortestPath:
         return self.sol
 
     def _load_set_geometry(self):
-        corners_path = getattr(self.map, "corners_path", CORNERS)
-        set_corners_path = getattr(self.map, "set_corners_path", SETS)
+        corners_path = getattr(self.map, "corners_path", None)
+        set_corners_path = getattr(self.map, "set_corners_path", None)
+        if corners_path is None or set_corners_path is None:
+            raise ValueError("map object must include corners_path and set_corners_path.")
+
         corners_df = pd.read_csv(corners_path)
         set_corners_df = pd.read_csv(set_corners_path)
 

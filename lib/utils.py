@@ -4,6 +4,8 @@ import pandas as pd
 from pyproj import Geod
 GEOD = Geod(ellps="WGS84")
 
+SPEED_LIMIT_TOUCH_TOL_KM = 1e-5
+
 def _assert_finite(name, arr):
     arr = np.asarray(arr)
     if not np.isfinite(arr).all():
@@ -638,6 +640,236 @@ def _path_segment_index(distance_breaks_km, d_km):
     return int(np.clip(s, 0, len(distance_breaks_km) - 2))
 
 
+def future_timestep_interval_bounds(itinerary, states, T_future: int):
+    """
+    Return future itinerary interval start/end timestamps.
+
+    Speed-limit activation is based on interval overlap, not midpoint samples:
+    a limit active on [from, until) applies to every timestep interval that
+    overlaps that window by positive time.
+    """
+    t0 = int(getattr(states, "timesteps_completed", 0))
+    times = getattr(itinerary, "time_points", None)
+    if times is not None and len(times) >= t0 + T_future + 1:
+        times = [pd.to_datetime(x) for x in times[t0 : t0 + T_future + 1]]
+        return np.asarray(times[:-1], dtype=object), np.asarray(times[1:], dtype=object)
+
+    if not getattr(itinerary, "transits", None):
+        raise ValueError("Cannot build time-varying speed limits without itinerary times.")
+
+    itinerary_start = pd.to_datetime(itinerary.transits[0].arrival_datetime)
+    start_offsets = getattr(itinerary, "timestep_start_offset_h", None)
+    end_offsets = getattr(itinerary, "timestep_end_offset_h", None)
+    if (
+        start_offsets is not None
+        and end_offsets is not None
+        and len(start_offsets) >= t0 + T_future
+        and len(end_offsets) >= t0 + T_future
+    ):
+        starts = [
+            itinerary_start + pd.to_timedelta(float(start_offsets[t0 + t]), unit="h")
+            for t in range(T_future)
+        ]
+        ends = [
+            itinerary_start + pd.to_timedelta(float(end_offsets[t0 + t]), unit="h")
+            for t in range(T_future)
+        ]
+        return np.asarray(starts, dtype=object), np.asarray(ends, dtype=object)
+
+    dt = np.asarray(getattr(itinerary, "timestep_dt_h", []), dtype=float)
+    if dt.size >= t0 + T_future:
+        all_dt = dt[: t0 + T_future]
+        elapsed_h = float(np.sum(all_dt[:t0]))
+        future_dt = all_dt[t0 : t0 + T_future]
+    else:
+        base_dt = float(getattr(itinerary, "timestep", 0.0))
+        if base_dt <= 0.0:
+            raise ValueError("Cannot infer itinerary interval bounds from nonpositive timestep.")
+        elapsed_h = float(t0) * base_dt
+        future_dt = np.full(T_future, base_dt, dtype=float)
+
+    starts = []
+    ends = []
+    cursor = itinerary_start + pd.to_timedelta(elapsed_h, unit="h")
+    for dt_h in future_dt:
+        start = cursor
+        end = start + pd.to_timedelta(float(dt_h), unit="h")
+        starts.append(start)
+        ends.append(end)
+        cursor = end
+
+    return np.asarray(starts, dtype=object), np.asarray(ends, dtype=object)
+
+
+def ship_speed_limit_matrix(map_obj, itinerary, states, ship, T_future: int) -> np.ndarray:
+    """
+    Return speed limits in m/s with shape [nb_sets, T_future].
+
+    A band is active for a timestep when the timestep interval overlaps the
+    band's [from, until) window. This conservatively applies sub-timestep
+    limits to the whole interval.
+    """
+    nb_sets = int(map_obj.nb_sets)
+    ship_max_speed = float(ship.info.max_speed)
+    limits = np.full((nb_sets, T_future), ship_max_speed, dtype=float)
+    bands = getattr(map_obj, "speed_limit_bands", None) or []
+    if not bands or T_future <= 0:
+        return limits
+
+    starts, ends = future_timestep_interval_bounds(itinerary, states, T_future)
+    for band in bands:
+        start = band.get("start")
+        end = band.get("end")
+        limit = min(float(band["speed"]), ship_max_speed)
+
+        for t, (interval_start, interval_end) in enumerate(zip(starts, ends)):
+            if start is not None and interval_end <= start:
+                continue
+            if end is not None and interval_start >= end:
+                continue
+            for z in band["sets"]:
+                limits[int(z), t] = min(limits[int(z), t], limit)
+
+    return limits
+
+
+def path_touched_segment_indices(
+    distance_breaks_km,
+    d_start,
+    d_end,
+    *,
+    touch_tol_km: float = SPEED_LIMIT_TOUCH_TOL_KM,
+) -> list[int]:
+    breaks = np.asarray(distance_breaks_km, dtype=float).reshape(-1)
+    if breaks.ndim != 1 or breaks.size < 2:
+        raise ValueError("distance_breaks_km must contain at least two entries.")
+
+    lo = float(min(d_start, d_end))
+    hi = float(max(d_start, d_end))
+    lo = float(np.clip(lo, breaks[0], breaks[-1]))
+    hi = float(np.clip(hi, breaks[0], breaks[-1]))
+    if hi - lo <= float(touch_tol_km):
+        return []
+
+    touched = []
+    for s in range(len(breaks) - 1):
+        overlap = min(hi, float(breaks[s + 1])) - max(lo, float(breaks[s]))
+        if overlap > float(touch_tol_km):
+            touched.append(int(s))
+    return touched
+
+
+def path_interval_speed_limit_mps(
+    distance_breaks_km,
+    path_set_ids,
+    set_speed_limit_mps,
+    t: int,
+    d_start,
+    d_end,
+    *,
+    default_limit_mps: float,
+    touch_tol_km: float = SPEED_LIMIT_TOUCH_TOL_KM,
+) -> float:
+    set_speed_limit_mps = np.asarray(set_speed_limit_mps, dtype=float)
+    path_set_ids = np.asarray(path_set_ids, dtype=int).reshape(-1)
+    touched = path_touched_segment_indices(
+        distance_breaks_km,
+        d_start,
+        d_end,
+        touch_tol_km=touch_tol_km,
+    )
+    if not touched:
+        return float(default_limit_mps)
+
+    limit = float(default_limit_mps)
+    for s in touched:
+        limit = min(limit, float(set_speed_limit_mps[int(path_set_ids[s]), int(t)]))
+    return limit
+
+
+def path_timestep_speed_limits_mps(
+    distance_breaks_km,
+    path_set_ids,
+    set_speed_limit_mps,
+    path_distance,
+    *,
+    default_limit_mps: float,
+    touch_tol_km: float = SPEED_LIMIT_TOUCH_TOL_KM,
+) -> np.ndarray:
+    path_distance = np.asarray(path_distance, dtype=float).reshape(-1)
+    T = path_distance.size - 1
+    out = np.full(T, float(default_limit_mps), dtype=float)
+    for t in range(T):
+        out[t] = path_interval_speed_limit_mps(
+            distance_breaks_km,
+            path_set_ids,
+            set_speed_limit_mps,
+            t,
+            path_distance[t],
+            path_distance[t + 1],
+            default_limit_mps=default_limit_mps,
+            touch_tol_km=touch_tol_km,
+        )
+    return out
+
+
+def build_speed_limit_partitions(
+    distance_breaks_km,
+    path_set_ids,
+    set_speed_limit_mps,
+    *,
+    ship_max_speed_mps: float,
+    touch_tol_km: float = SPEED_LIMIT_TOUCH_TOL_KM,
+):
+    """
+    Merge consecutive fixed-path segments with identical speed-limit vectors.
+    Returns partition breaks, caps [n_partitions, T], and source segment ranges.
+    """
+    breaks = np.asarray(distance_breaks_km, dtype=float).reshape(-1)
+    path_set_ids = np.asarray(path_set_ids, dtype=int).reshape(-1)
+    set_speed_limit_mps = np.asarray(set_speed_limit_mps, dtype=float)
+
+    if path_set_ids.size != breaks.size - 1:
+        raise ValueError("path_set_ids must have one id per path segment.")
+
+    segment_caps = set_speed_limit_mps[path_set_ids, :]
+    partitions = []
+    part_breaks = [float(breaks[0])]
+    start_s = 0
+    current = segment_caps[0].copy()
+
+    for s in range(1, path_set_ids.size):
+        same_caps = np.allclose(segment_caps[s], current, rtol=0.0, atol=1e-12)
+        if same_caps:
+            continue
+        if float(breaks[s] - part_breaks[-1]) > touch_tol_km:
+            partitions.append((start_s, s))
+            part_breaks.append(float(breaks[s]))
+        start_s = s
+        current = segment_caps[s].copy()
+
+    if float(breaks[-1] - part_breaks[-1]) > touch_tol_km:
+        partitions.append((start_s, path_set_ids.size))
+        part_breaks.append(float(breaks[-1]))
+
+    if not partitions:
+        partitions = [(0, path_set_ids.size)]
+        part_breaks = [float(breaks[0]), float(breaks[-1])]
+
+    caps = []
+    for start_s, _end_s in partitions:
+        caps.append(segment_caps[start_s])
+
+    caps = np.asarray(caps, dtype=float)
+    has_active_limit = bool(np.any(caps < float(ship_max_speed_mps) - 1e-9))
+    return {
+        "distance_breaks_km": np.asarray(part_breaks, dtype=float),
+        "caps_mps": caps,
+        "segment_ranges": partitions,
+        "has_active_limit": has_active_limit,
+    }
+
+
 def _active_speed_limit_mps(map_obj, set_idx, midpoint, ship_max_speed_mps):
     limit = float(ship_max_speed_mps)
     for band in getattr(map_obj, "speed_limit_bands", []) or []:
@@ -767,55 +999,77 @@ def build_constant_speed_path_reference(
             f"{ship.info.max_speed:.3f} m/s."
         )
 
-    nominal_path_distance = np.zeros(T_future + 1, dtype=float)
-    for t in range(T_future):
-        nominal_path_distance[t + 1] = (
-            nominal_path_distance[t]
-            + nominal_speed_kmh
-            * timestep_dt_h[t]
-            * float(interval_sail_fraction[t])
-        )
-    nominal_path_distance = np.clip(nominal_path_distance, 0.0, total_distance_km)
-    nominal_path_distance[-1] = total_distance_km
-
     if ship is not None:
-        itinerary_start = pd.to_datetime(itinerary.transits[0].arrival_datetime)
+        set_speed_limit_mps = ship_speed_limit_matrix(
+            map_obj,
+            itinerary,
+            states,
+            ship,
+            T_future,
+        )
         speed_limit_mps = np.full(T_future, float(ship.info.max_speed), dtype=float)
-        for t in range(T_future):
-            if interval_sail_fraction[t] <= eps:
-                continue
-            d_mid = 0.5 * (nominal_path_distance[t] + nominal_path_distance[t + 1])
-            s = _path_segment_index(distance_breaks_km, d_mid)
-            midpoint = itinerary_start + pd.to_timedelta(float(timestep_mid_offset_h[t]), unit="h")
-            speed_limit_mps[t] = _active_speed_limit_mps(
-                map_obj,
-                int(path_set_ids[s]),
-                midpoint,
+
+        max_cap_iterations = 32
+        for _cap_iter in range(max_cap_iterations):
+            speed_profile_mps, constant_speed_mps = _balanced_speed_profile_mps(
+                total_distance_km,
+                timestep_dt_h,
+                interval_sail_fraction,
+                speed_limit_mps,
+                eps,
+            )
+
+            trial_path_distance = np.zeros(T_future + 1, dtype=float)
+            for t in range(T_future):
+                trial_path_distance[t + 1] = (
+                    trial_path_distance[t]
+                    + speed_profile_mps[t]
+                    * 3.6
+                    * timestep_dt_h[t]
+                    * float(interval_sail_fraction[t])
+                )
+            trial_path_distance = np.clip(trial_path_distance, 0.0, total_distance_km)
+            trial_path_distance[-1] = total_distance_km
+
+            touched_caps = path_timestep_speed_limits_mps(
+                distance_breaks_km,
+                path_set_ids,
+                set_speed_limit_mps,
+                trial_path_distance,
+                default_limit_mps=float(ship.info.max_speed),
+            )
+            touched_caps = np.where(
+                np.asarray(interval_sail_fraction, dtype=float) > eps,
+                touched_caps,
                 float(ship.info.max_speed),
             )
-        speed_profile_mps, constant_speed_mps = _balanced_speed_profile_mps(
-            total_distance_km,
-            timestep_dt_h,
-            interval_sail_fraction,
-            speed_limit_mps,
-            eps,
-        )
+            monotone_caps = np.minimum(speed_limit_mps, touched_caps)
+            if np.allclose(monotone_caps, speed_limit_mps, rtol=0.0, atol=1e-12):
+                path_distance = trial_path_distance
+                break
+            speed_limit_mps = monotone_caps
+        else:
+            raise ValueError(
+                "Constant-speed path reference speed-limit caps did not stabilize. "
+                "Reduce the itinerary timestep or inspect speed-limit geometry."
+            )
     else:
         speed_limit_mps = np.full(T_future, np.inf, dtype=float)
         speed_profile_mps = np.full(T_future, nominal_speed_mps, dtype=float)
         constant_speed_mps = nominal_speed_mps
+        path_distance = np.zeros(T_future + 1, dtype=float)
+        for t in range(T_future):
+            path_distance[t + 1] = (
+                path_distance[t]
+                + speed_profile_mps[t]
+                * 3.6
+                * timestep_dt_h[t]
+                * float(interval_sail_fraction[t])
+            )
+        path_distance = np.clip(path_distance, 0.0, total_distance_km)
+        path_distance[-1] = total_distance_km
     constant_speed_kmh = constant_speed_mps * 3.6
 
-    path_distance = np.zeros(T_future + 1, dtype=float)
-    for t in range(T_future):
-        path_distance[t + 1] = (
-            path_distance[t]
-            + speed_profile_mps[t]
-            * 3.6
-            * timestep_dt_h[t]
-            * float(interval_sail_fraction[t])
-        )
-    path_distance = np.clip(path_distance, 0.0, total_distance_km)
     if path_distance[-1] < total_distance_km - 1e-7:
         raise ValueError(
             "Constant-speed path reference did not reach the destination. "

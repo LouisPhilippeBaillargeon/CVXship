@@ -75,53 +75,143 @@ class FitRange:
         upper_prop_factor: float = 1.2,
         eps: float = 1e-9,
     ) -> "FitRange":
-        seg_dt_h = np.asarray(sol.segment_dt_h, dtype=float)
-        mask = seg_dt_h > eps
+        seg_dt_source = getattr(sol, "segment_dt_h", None)
+        if seg_dt_source is None:
+            timestep_dt = np.asarray(getattr(sol, "timestep_dt_h", []), dtype=float)
+            if timestep_dt.size == 0:
+                raise ValueError("Cannot build FitRange: solution has no segment durations.")
+            seg_dt_h = timestep_dt.reshape(-1, 1)
+        else:
+            seg_dt_h = np.asarray(seg_dt_source, dtype=float)
+            if seg_dt_h.ndim == 1:
+                seg_dt_h = seg_dt_h[:, None]
 
-        speed_rel = np.asarray(sol.speed_rel_water_mag, dtype=float)
-        speed_ship = np.asarray(sol.speed_mag, dtype=float)
-        resistance = np.asarray(sol.total_resistance, dtype=float)
-        prop_power = np.asarray(sol.prop_power, dtype=float)
+        if seg_dt_h.ndim != 2:
+            raise ValueError(f"sol.segment_dt_h must be 1D or 2D, got shape {seg_dt_h.shape}.")
 
-        valid_speed_rel = speed_rel[mask]
-        valid_speed_ship = speed_ship[mask]
-        valid_resistance = resistance[mask]
-        valid_prop_power = prop_power[mask]
+        T, H = seg_dt_h.shape
 
-        if valid_speed_rel.size == 0:
+        def _match_segment_shape(value, name):
+            arr = np.asarray(value, dtype=float)
+            if arr.shape == (T, H):
+                return arr
+            if arr.shape == (T,):
+                return np.repeat(arr[:, None], H, axis=1)
+            if arr.shape == (T, 1):
+                return np.repeat(arr, H, axis=1)
+            raise ValueError(f"sol.{name} must have shape {(T,)}, {(T, 1)}, or {(T, H)}, got {arr.shape}.")
+
+        speed_rel = _match_segment_shape(sol.speed_rel_water_mag, "speed_rel_water_mag")
+        speed_ship = _match_segment_shape(sol.speed_mag, "speed_mag")
+        resistance = _match_segment_shape(sol.total_resistance, "total_resistance")
+        prop_power = _match_segment_shape(sol.prop_power, "prop_power")
+
+        sail_fraction = np.asarray(
+            getattr(sol, "interval_sail_fraction", np.ones(T)),
+            dtype=float,
+        ).reshape(-1)
+        if sail_fraction.shape != (T,):
+            raise ValueError(
+                f"sol.interval_sail_fraction must have shape {(T,)}, got {sail_fraction.shape}."
+            )
+        sail_mask = sail_fraction[:, None] > eps
+        duration_mask = seg_dt_h > eps
+        mask = duration_mask & sail_mask
+
+        def _finite_values(arr, *, positive=False):
+            value_mask = mask & np.isfinite(arr)
+            if positive:
+                value_mask &= arr > eps
+            return arr[value_mask]
+
+        valid_speed_rel = _finite_values(speed_rel, positive=True)
+        valid_speed_ship = _finite_values(speed_ship, positive=True)
+        valid_resistance = _finite_values(resistance)
+        valid_resistance_positive = _finite_values(resistance, positive=True)
+        valid_prop_power = _finite_values(prop_power)
+        valid_prop_power_positive = _finite_values(prop_power, positive=True)
+
+        if valid_speed_rel.size == 0 and valid_speed_ship.size == 0:
             raise ValueError("Cannot build FitRange: no sailing segment found in evaluated solution.")
 
-        speed_max_source = max(
-            np.nanmax(valid_speed_rel),
-            np.nanmax(valid_speed_ship),
-        )
+        speed_min_candidates = []
+        speed_max_candidates = []
+        if valid_speed_rel.size:
+            speed_min_candidates.append(float(np.nanmin(valid_speed_rel)))
+            speed_max_candidates.append(float(np.nanmax(valid_speed_rel)))
+        if valid_speed_ship.size:
+            speed_min_candidates.append(float(np.nanmin(valid_speed_ship)))
+            speed_max_candidates.append(float(np.nanmax(valid_speed_ship)))
+
+        speed_min_source = min(speed_min_candidates)
+        speed_max_source = max(speed_max_candidates)
 
         max_prop_pow_physical = ship.propulsion.max_pow * ship.propulsion.nb_propellers
         min_prop_pow_physical = ship.propulsion.min_pow * ship.propulsion.nb_propellers
+        resistance_min_source = (
+            float(np.nanmin(valid_resistance_positive))
+            if valid_resistance_positive.size
+            else 0.0
+        )
+        resistance_max_source = (
+            float(np.nanmax(valid_resistance))
+            if valid_resistance.size
+            else 0.0
+        )
+        prop_min_source = (
+            float(np.nanmin(valid_prop_power_positive))
+            if valid_prop_power_positive.size
+            else 0.0
+        )
+        prop_max_source = (
+            float(np.nanmax(valid_prop_power))
+            if valid_prop_power.size
+            else 0.0
+        )
+
+        ship_max_speed = float(ship.info.max_speed)
+        min_speed = max(eps, lower_speed_factor * float(speed_min_source))
+        max_speed = min(
+            ship_max_speed,
+            upper_speed_factor * float(speed_max_source),
+        )
+        if max_speed <= min_speed:
+            if ship_max_speed <= eps:
+                raise ValueError("ship.info.max_speed must be positive to build FitRange.")
+            max_speed = ship_max_speed
+            min_speed = min(min_speed, max(eps, 0.99 * max_speed))
+
+        min_resistance = max(
+            eps,
+            lower_res_factor * resistance_min_source,
+        )
+        max_resistance = max(
+            min_resistance + eps,
+            upper_res_factor * resistance_max_source,
+        )
+
+        min_prop_power = max(
+            0.0,
+            lower_prop_factor * prop_min_source,
+            float(min_prop_pow_physical),
+        )
+        max_prop_power = min(
+            float(max_prop_pow_physical),
+            max(
+                min_prop_power + eps,
+                upper_prop_factor * prop_max_source,
+            ),
+        )
+        if max_prop_power < min_prop_power:
+            max_prop_power = min_prop_power
 
         return cls(
-            min_speed=max(1.0, lower_speed_factor * float(np.nanmax(valid_speed_rel))),
-            max_speed=min(
-                float(ship.info.max_speed),
-                upper_speed_factor * float(speed_max_source),
-            ),
-            min_resistance=max(
-                eps,
-                lower_res_factor * float(np.nanmax(valid_resistance)),
-            ),
-            max_resistance=max(
-                eps,
-                upper_res_factor * float(np.nanmax(valid_resistance)),
-            ),
-            min_prop_power=max(
-                0.0,
-                lower_prop_factor * float(np.nanmax(valid_prop_power)),
-                float(min_prop_pow_physical),
-            ),
-            max_prop_power=min(
-                float(max_prop_pow_physical),
-                upper_prop_factor * float(np.nanmax(valid_prop_power)),
-            ),
+            min_speed=min_speed,
+            max_speed=max_speed,
+            min_resistance=min_resistance,
+            max_resistance=max_resistance,
+            min_prop_power=min_prop_power,
+            max_prop_power=max_prop_power,
         )
 
 

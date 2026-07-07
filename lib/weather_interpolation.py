@@ -7,7 +7,6 @@ import xarray as xr
 from pyproj import Geod
 from pathlib import Path
 
-from lib.paths import CORNERS, SETS
 from lib.utils import _halfspace_polygon_4ineq, _ordered_set_corner_ids, _set_edges_from_corner_ids, safe_unit
 
 
@@ -391,8 +390,11 @@ def set_sample_points(map_obj, set_idx: int, n_side: int = 3) -> np.ndarray:
 
 
 def _load_map_corner_geometry(map_obj):
-    corners_path = getattr(map_obj, "corners_path", None) or CORNERS
-    set_corners_path = getattr(map_obj, "set_corners_path", None) or SETS
+    corners_path = getattr(map_obj, "corners_path", None)
+    set_corners_path = getattr(map_obj, "set_corners_path", None)
+    if corners_path is None or set_corners_path is None:
+        raise ValueError("map object must include corners_path and set_corners_path.")
+
     corners_df = pd.read_csv(corners_path)
     set_corners_df = pd.read_csv(set_corners_path)
     corner_xy = {

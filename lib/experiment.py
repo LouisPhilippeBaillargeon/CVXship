@@ -16,7 +16,7 @@ from typing import Any, Iterable
 
 import numpy as np
 
-from lib.paths import CACHE, CONFIG, RESULTS, ROOT
+from lib.paths import CACHE, RESULTS, ROOT
 from lib.weather_interpolation import resolve_weather_files_from_toml
 
 CACHE_FILENAMES = {
@@ -110,9 +110,12 @@ def create_run_context(
     options: dict[str, Any],
     cache_scope: str = "case",
 ) -> RunContext:
-    case_path = Path(case_dir).resolve() if case_dir is not None else None
+    if case_dir is None:
+        raise ValueError("case_dir is required. Pass a named case directory with --case.")
+
+    case_path = Path(case_dir).resolve()
     settings = load_case_settings(case_path)
-    case_name = _slug(str(case_path.name if case_path else settings.get("name") or "default"))
+    case_name = _slug(str(case_path.name))
     clean_run_name = _slug(run_name or case_name)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_id = _unique_run_id(timestamp, clean_run_name)
@@ -158,7 +161,7 @@ def create_run_context(
 
 
 def copy_input_snapshot(ctx: RunContext) -> None:
-    source_dir = ctx.case_dir if ctx.case_dir is not None else CONFIG
+    source_dir = ctx.case_dir
 
     for name in ("case.toml", "ship.toml", "map.toml", "itinerary.toml", "weather.toml"):
         source = source_dir / name
@@ -171,7 +174,7 @@ def copy_input_snapshot(ctx: RunContext) -> None:
 
 
 def write_initial_manifest(ctx: RunContext, *, options: dict[str, Any], cache_scope: str) -> None:
-    source_dir = ctx.case_dir if ctx.case_dir is not None else CONFIG
+    source_dir = ctx.case_dir
     manifest = {
         "status": "running",
         "run_id": ctx.run_id,
@@ -242,6 +245,16 @@ def summarize_solution(key: str, label: str, sol: Any) -> dict[str, Any]:
 
     validation_errors = getattr(sol, "validation_errors", {}) or {}
     validation_warnings = getattr(sol, "validation_warnings", {}) or {}
+    route_validation_errors = getattr(sol, "route_validation_errors", {}) or {}
+    route_validation_warnings = getattr(sol, "route_validation_warnings", {}) or {}
+    ems_validation_errors = getattr(sol, "ems_validation_errors", {}) or {}
+    ems_validation_warnings = getattr(sol, "ems_validation_warnings", {}) or {}
+    pre_redispatch_ems_validation_errors = (
+        getattr(sol, "pre_redispatch_ems_validation_errors", {}) or {}
+    )
+    pre_redispatch_ems_validation_warnings = (
+        getattr(sol, "pre_redispatch_ems_validation_warnings", {}) or {}
+    )
 
     return {
         "key": key,
@@ -256,9 +269,39 @@ def summarize_solution(key: str, label: str, sol: Any) -> dict[str, Any]:
         "is_valid": bool(getattr(sol, "is_valid", True)),
         "validation_error_count": len(validation_errors),
         "validation_warning_count": len(validation_warnings),
-        "solver_status": getattr(sol, "solver_status", "") or "",
+        "route_validation_error_count": len(route_validation_errors),
+        "route_validation_warning_count": len(route_validation_warnings),
+        "ems_validation_error_count": len(ems_validation_errors),
+        "ems_validation_warning_count": len(ems_validation_warnings),
+        "pre_redispatch_ems_validation_error_count": len(
+            pre_redispatch_ems_validation_errors
+        ),
+        "pre_redispatch_ems_validation_warning_count": len(
+            pre_redispatch_ems_validation_warnings
+        ),
+        "solver_status": solution_solver_status(sol),
+        "power_management_solver_status": solution_power_management_solver_status(sol),
         "failure_reason": getattr(sol, "failure_reason", "") or "",
     }
+
+
+def solution_solver_status(sol: Any) -> str:
+    status = getattr(sol, "solver_status", None)
+    if status:
+        return str(status)
+
+    reason = getattr(sol, "failure_reason", None)
+    if isinstance(reason, str) and reason.startswith("solver_status:"):
+        return reason.split(":", 1)[1]
+
+    return ""
+
+
+def solution_power_management_solver_status(sol: Any) -> str:
+    status = getattr(sol, "power_management_solver_status", None)
+    if status:
+        return str(status)
+    return ""
 
 
 def update_manifest(ctx: RunContext, updates: dict[str, Any]) -> None:
@@ -393,7 +436,14 @@ def _write_summary_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "is_valid",
         "validation_error_count",
         "validation_warning_count",
+        "route_validation_error_count",
+        "route_validation_warning_count",
+        "ems_validation_error_count",
+        "ems_validation_warning_count",
+        "pre_redispatch_ems_validation_error_count",
+        "pre_redispatch_ems_validation_warning_count",
         "solver_status",
+        "power_management_solver_status",
         "failure_reason",
         "solution_file",
     ]

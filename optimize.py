@@ -5,6 +5,7 @@ import argparse
 import atexit
 import hashlib
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 from lib.load_params import load_config
@@ -23,6 +24,8 @@ from lib.experiment import (
     load_case_run_options,
     mark_failed_if_running,
     save_run_results,
+    solution_power_management_solver_status,
+    solution_solver_status,
 )
 
 new_weather = True
@@ -32,11 +35,11 @@ solver_verbose = True
 unit_commitment = False
 
 
-def _parse_args():
+def _parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Run a CVXship optimization case and store configs/results in a run folder."
     )
-    parser.add_argument("--case", help="Case directory containing ship/map/itinerary/weather TOMLs.")
+    parser.add_argument("--case", type=Path, required=True, help="Case directory containing ship/map/itinerary/weather TOMLs.")
     parser.add_argument("--name", help="Optional run name used in the result folder.")
     parser.add_argument("--dimensions", choices=["1D", "2D", "both"], default=None)
     parser.add_argument("--new-ship", dest="new_ship", action="store_true", default=None)
@@ -56,7 +59,7 @@ def _parse_args():
     parser.add_argument("--save-solutions", dest="save_solutions", action="store_true")
     parser.add_argument("--no-console-log", dest="save_console_log", action="store_false", default=None)
     parser.add_argument("--console-log", dest="save_console_log", action="store_true")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def _option(cli_value, toml_options, key, default):
@@ -85,6 +88,7 @@ def _failed_optimizer_summary(optimizer, first_stage_optimizer):
         solve_time=getattr(optimizer, "solve_time", None),
         first_stage_optimizer=first_stage_optimizer,
         power_management_optimizer="",
+        power_management_solver_status="",
         is_valid=False,
         solver_status=solver_status or "",
         failure_reason=failure_reason or "",
@@ -98,6 +102,24 @@ def _cost_or_nan(sol):
         return float(getattr(sol, "estimated_cost", np.nan))
     except (TypeError, ValueError):
         return np.nan
+
+
+def _status_or_na(sol):
+    if sol is None:
+        return "n/a"
+    return solution_solver_status(sol) or "n/a"
+
+
+def _power_status_or_na(sol):
+    if sol is None:
+        return "n/a"
+    return solution_power_management_solver_status(sol) or "n/a"
+
+
+def _validity_or_na(sol):
+    if sol is None:
+        return "n/a"
+    return "valid" if getattr(sol, "is_valid", True) else "invalid"
 
 
 def _enable_console_log(path):
@@ -592,6 +614,7 @@ if __name__ == "__main__":
             f"{label} re-evaluated: "
             f"first_stage={sol.first_stage_optimizer}, "
             f"power_management={sol.power_management_optimizer}, "
+            f"energy_solver_status={_power_status_or_na(sol)}, "
             f"energy_solve_time={energy_solve_label}, "
             f"cost={sol.estimated_cost:.6f} $"
         )
@@ -610,6 +633,7 @@ if __name__ == "__main__":
             f"{label} rule-based EMS: "
             f"first_stage={sol.first_stage_optimizer}, "
             f"power_management={sol.power_management_optimizer}, "
+            f"route_validity={_validity_or_na(sol)}, "
             f"cost={sol.estimated_cost:.6f} $"
         )
         return result
@@ -875,39 +899,42 @@ if __name__ == "__main__":
             return optimizer, rule_sol, energy_sol
 
         jpcse_optimizer, JPCSE_rule_sol, JPCSE_energy_sol = run_jpcse_variant(
-            "JPCSE_transition_wind",
-            "JPCSE transition wind",
+            "JPCSE_transit_wind",
+            "JPCSE_transit_wind",
             True,
         )
         (
-            jpcse_normal_transition_optimizer,
-            JPCSE_normal_transition_rule_sol,
-            JPCSE_normal_transition_energy_sol,
+            jpcse_departure_wind_optimizer,
+            JPCSE_departure_wind_rule_sol,
+            JPCSE_departure_wind_energy_sol,
         ) = run_jpcse_variant(
-            "JPCSE_normal_wind_transitions",
-            "JPCSE normal wind transitions",
+            "JPCSE_departure_wind",
+            "JPCSE_departure_wind",
             False,
         )
 
         print("\nJPCSE performance comparison")
         print(
-            "variant                         optimizer_cost      solve_s    "
-            "rule_cost       energy_cost     energy_solve_s"
+            "variant                         optimizer_cost      solve_s   opt_status          "
+            "rule_cost       rule_valid  energy_cost     energy_status       energy_solve_s"
         )
         for label, optimizer, rule_sol, energy_sol in [
-            ("transition wind", jpcse_optimizer, JPCSE_rule_sol, JPCSE_energy_sol),
+            ("JPCSE_transit_wind", jpcse_optimizer, JPCSE_rule_sol, JPCSE_energy_sol),
             (
-                "normal wind transitions",
-                jpcse_normal_transition_optimizer,
-                JPCSE_normal_transition_rule_sol,
-                JPCSE_normal_transition_energy_sol,
+                "JPCSE_departure_wind",
+                jpcse_departure_wind_optimizer,
+                JPCSE_departure_wind_rule_sol,
+                JPCSE_departure_wind_energy_sol,
             ),
         ]:
             opt_sol = getattr(optimizer, "sol", None)
             opt_cost = _cost_or_nan(opt_sol)
             opt_solve = np.nan if opt_sol is None else float(opt_sol.solve_time)
+            opt_status = _status_or_na(opt_sol)
             rule_cost = _cost_or_nan(rule_sol)
+            rule_validity = _validity_or_na(rule_sol)
             energy_cost = _cost_or_nan(energy_sol)
+            energy_status = _power_status_or_na(energy_sol)
             energy_solve = (
                 np.nan
                 if energy_sol is None or getattr(energy_sol, "energy_solve_time", None) is None
@@ -915,8 +942,9 @@ if __name__ == "__main__":
             )
             print(
                 f"{label:<30} "
-                f"{opt_cost:>14.6f} {opt_solve:>10.2f} "
-                f"{rule_cost:>14.6f} {energy_cost:>14.6f} {energy_solve:>14.2f}"
+                f"{opt_cost:>14.6f} {opt_solve:>10.2f} {opt_status:>14s} "
+                f"{rule_cost:>14.6f} {rule_validity:>10s} "
+                f"{energy_cost:>14.6f} {energy_status:>17s} {energy_solve:>14.2f}"
             )
 
         print_debug_report()
@@ -930,10 +958,10 @@ if __name__ == "__main__":
         ("fpjse_energy", "FPJSE + energy", locals().get("FPJSE_energy_sol")),
         ("jpdse_rule", "JPDSE + rule-based", locals().get("JPDSE_rule_sol")),
         ("jpdse_energy", "JPDSE + energy", locals().get("JPDSE_energy_sol")),
-        ("jpcse_transition_rule", "JPCSE transition wind + rule-based", locals().get("JPCSE_rule_sol")),
-        ("jpcse_transition_energy", "JPCSE transition wind + energy", locals().get("JPCSE_energy_sol")),
-        ("jpcse_normal_transition_rule", "JPCSE normal wind transitions + rule-based", locals().get("JPCSE_normal_transition_rule_sol")),
-        ("jpcse_normal_transition_energy", "JPCSE normal wind transitions + energy", locals().get("JPCSE_normal_transition_energy_sol")),
+        ("jpcse_transit_wind_rule", "JPCSE_transit_wind + rule-based", locals().get("JPCSE_rule_sol")),
+        ("jpcse_transit_wind_energy", "JPCSE_transit_wind + energy", locals().get("JPCSE_energy_sol")),
+        ("jpcse_departure_wind_rule", "JPCSE_departure_wind + rule-based", locals().get("JPCSE_departure_wind_rule_sol")),
+        ("jpcse_departure_wind_energy", "JPCSE_departure_wind + energy", locals().get("JPCSE_departure_wind_energy_sol")),
     ]
 
     available_comparison = [

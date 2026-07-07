@@ -18,15 +18,6 @@ from matplotlib.widgets import Button
 from matplotlib.gridspec import GridSpec
 
 from lib.load_params import MapInfo, Ship
-from lib.paths import (
-    DEPTH_GRID,
-    NAVIGABILITY_MAP,
-    CORNERS,
-    SETS,
-    SET_INEQ,
-    TRANSITION_INEQ,
-    SET_ADJ,
-)
 
 
 # ======================================================================
@@ -442,11 +433,14 @@ class SetEditor:
         nav,
         artifact_callback,
         pixel_extent=None,
-        corners_path=CORNERS,
-        sets_path=SETS,
+        corners_path=None,
+        sets_path=None,
         cmap="Greys",
         origin="lower",
     ):
+        if corners_path is None or sets_path is None:
+            raise ValueError("corners_path and sets_path are required.")
+
         self.nav = nav
         self.pixel_extent = pixel_extent
         self.artifact_callback = artifact_callback
@@ -950,17 +944,7 @@ class MapBuilder:
 
     def __post_init__(self):
         if self.map_dir is None:
-            self.depth_grid_path = Path(DEPTH_GRID)
-            self.depth_metadata_path = self.depth_grid_path.with_suffix(".meta.json")
-            self.navigability_map_path = Path(NAVIGABILITY_MAP)
-            self.navigability_metadata_path = self.navigability_map_path.with_suffix(".meta.json")
-            self.map_params_path = self.depth_grid_path.parent / "map_params.csv"
-            self.corners_path = Path(CORNERS)
-            self.sets_path = Path(SETS)
-            self.set_ineq_path = Path(SET_INEQ)
-            self.transition_ineq_path = Path(TRANSITION_INEQ)
-            self.adj_path = Path(SET_ADJ)
-            return
+            raise ValueError("map_dir is required; pass the selected case's map directory.")
 
         map_dir = Path(self.map_dir).resolve()
         self.map_dir = map_dir

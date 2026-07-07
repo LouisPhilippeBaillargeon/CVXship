@@ -1,9 +1,11 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import cvxpy as cp
 import numpy as np
 
-from lib.evaluation import apply_rule_based_power_balance_interval
+from lib.evaluation import apply_rule_based_power_balance_interval, compute_non_convex_cost_all_timesteps_nc_interpolated
 from lib.load_params import (
     Battery,
     Generator,
@@ -243,6 +245,180 @@ class RuleBasedPowerBalanceTests(unittest.TestCase):
         self.assertEqual(result["soc_next"], 0.0)
 
 
+class SpeedLimitEvaluatorTests(unittest.TestCase):
+    def _runner_for_fixed_path(self, path_distance, *, speed_limit=1.0):
+        generator = SimpleNamespace(
+            name="g0",
+            min_power=0.0,
+            max_power=10.0,
+            fuel_intercept=0.0,
+            fuel_linear=1.0,
+            fuel_quadratic=0.0,
+        )
+        ship = SimpleNamespace(
+            info=SimpleNamespace(max_speed=10.0),
+            generators=[generator],
+            battery=SimpleNamespace(
+                capacity=10.0,
+                max_charge_pow=5.0,
+                max_discharge_pow=5.0,
+                discharge_eff=1.0,
+                charge_eff=1.0,
+                leak=1.0,
+            ),
+            solarPanels=SimpleNamespace(area=0.0, efficiency=0.0),
+            propulsion=SimpleNamespace(nb_propellers=1, wake_fraction=0.0),
+        )
+        itinerary = SimpleNamespace(
+            timestep=1.0,
+            time_points=np.array(
+                [
+                    np.datetime64("2024-01-01T00:00"),
+                    np.datetime64("2024-01-01T01:00"),
+                ],
+                dtype=object,
+            ),
+            transits=[SimpleNamespace(arrival_datetime="2024-01-01T00:00")],
+            fuel_price=1.0,
+            soc_f=0.0,
+        )
+        states = SimpleNamespace(timesteps_completed=0, soc=5.0)
+        map_obj = SimpleNamespace(
+            nb_sets=2,
+            speed_limit_bands=[
+                {"sets": [1], "start": None, "end": None, "speed": speed_limit}
+            ],
+        )
+        wind_model = SimpleNamespace(compute_resistance=lambda wind, speed: 0.0)
+        calm_model = SimpleNamespace(compute_resistance=lambda speed: 0.0)
+        propulsion_model = SimpleNamespace(
+            compute_power_from_ua_res=lambda *args, **kwargs: (0.0, 0.0, True, 0.0)
+        )
+
+        path_distance = np.asarray(path_distance, dtype=float)
+        sol = Solution(
+            estimated_cost=0.0,
+            solve_time=0.0,
+            T_future=1,
+            instant_sail=np.array([1.0, 1.0]),
+            port_idx=np.array([-1, -1]),
+            interval_sail_fraction=np.array([1.0]),
+            total_distance=float(path_distance[-1] - path_distance[0]),
+            set_selection=np.array([[1.0, 0.0], [0.0, 1.0]]),
+            ship_pos=np.array([[path_distance[0], 0.0], [path_distance[-1], 0.0]]),
+            ship_speed=np.zeros((1, 2)),
+            speed_mag=np.array([(path_distance[-1] - path_distance[0]) * 1000.0 / 3600.0]),
+            speed_rel_water=np.zeros((1, 2)),
+            speed_rel_water_mag=np.zeros(1),
+            prop_power=np.zeros(1),
+            auxiliary_power=np.zeros(1),
+            wind_resistance=np.zeros(1),
+            calm_water_resistance=np.zeros(1),
+            total_resistance=np.zeros(1),
+            generation_power=np.zeros((1, 1)),
+            gen_costs=np.zeros((1, 1)),
+            gen_on=np.ones((1, 1)),
+            solar_power=np.zeros(1),
+            shore_power=np.zeros(1),
+            shore_power_cost=np.zeros(1),
+            battery_charge=np.zeros(1),
+            battery_discharge=np.zeros(1),
+            SOC=np.array([5.0, 5.0]),
+            path_distance=path_distance,
+            fixed_path_waypoints=np.array([[0.0, 0.0], [5.0, 0.0], [10.0, 0.0]]),
+            path_set_ids=np.array([0, 1]),
+            timestep_dt_h=np.ones(1),
+            interval_port_idx=np.array([-1]),
+            gen_startup=np.zeros((1, 1)),
+            gen_shutdown=np.zeros((1, 1)),
+            generator_transition_cost=0.0,
+            generator_unit_commitment=True,
+        )
+
+        return SimpleNamespace(
+            sol=sol,
+            ship=ship,
+            itinerary=itinerary,
+            states=states,
+            map=map_obj,
+            wind_model=wind_model,
+            calm_model=calm_model,
+            propulsion_model=propulsion_model,
+            generator_models=[object()],
+            nc_sources={"dummy": object()},
+        )
+
+    def _evaluate(self, runner, **kwargs):
+        weather = {
+            "irradiance": 0.0,
+            "current": np.zeros(2),
+            "wind": np.zeros(2),
+            "lat": 0.0,
+            "lon": 0.0,
+        }
+        with patch("lib.evaluation.interpolated_weather_at", return_value=weather):
+            return compute_non_convex_cost_all_timesteps_nc_interpolated(
+                runner,
+                **kwargs,
+            )[1]
+
+    def test_fixed_path_speed_limit_violation_marks_solution_invalid(self):
+        evaluated = self._evaluate(self._runner_for_fixed_path([0.0, 10.0]))
+
+        self.assertFalse(evaluated.is_valid)
+        self.assertIn("speed_limit_violation", evaluated.validation_errors)
+
+    def test_fixed_path_boundary_only_contact_does_not_trigger_speed_limit(self):
+        evaluated = self._evaluate(self._runner_for_fixed_path([0.0, 5.0]))
+
+        self.assertTrue(evaluated.is_valid)
+        self.assertNotIn("speed_limit_violation", evaluated.validation_errors)
+
+    def test_rule_based_ems_error_remains_active_without_energy_redispatch(self):
+        runner = self._runner_for_fixed_path([0.0, 5.0])
+        runner.itinerary.soc_f = 6.0
+
+        evaluated = self._evaluate(runner, energy_solver=cp.CLARABEL)
+
+        self.assertFalse(evaluated.is_valid)
+        self.assertIn("terminal_soc_shortfall", evaluated.validation_errors)
+        self.assertIn("terminal_soc_shortfall", evaluated.ems_validation_errors)
+        self.assertEqual(evaluated.route_validation_errors, {})
+        self.assertEqual(evaluated.pre_redispatch_ems_validation_errors, {})
+
+    def test_energy_redispatch_moves_preliminary_ems_errors_out_of_active_validity(self):
+        runner = self._runner_for_fixed_path([0.0, 5.0])
+        runner.itinerary.soc_f = 6.0
+
+        evaluated = self._evaluate(
+            runner,
+            redispatch_energy=True,
+            energy_solver=cp.CLARABEL,
+        )
+
+        self.assertTrue(evaluated.is_valid)
+        self.assertEqual(evaluated.validation_errors, {})
+        self.assertEqual(evaluated.ems_validation_errors, {})
+        self.assertIn(
+            "terminal_soc_shortfall",
+            evaluated.pre_redispatch_ems_validation_errors,
+        )
+
+    def test_route_error_survives_successful_energy_redispatch(self):
+        runner = self._runner_for_fixed_path([0.0, 10.0])
+
+        evaluated = self._evaluate(
+            runner,
+            redispatch_energy=True,
+            energy_solver=cp.CLARABEL,
+        )
+
+        self.assertFalse(evaluated.is_valid)
+        self.assertIn("speed_limit_violation", evaluated.validation_errors)
+        self.assertIn("speed_limit_violation", evaluated.route_validation_errors)
+        self.assertEqual(evaluated.ems_validation_errors, {})
+
+
 class EnergyRedispatchRegressionTest(unittest.TestCase):
     def _tiny_ship(self, *, min_power=0.0, max_charge_pow=5.0, leak=1.0):
         generator = Generator(
@@ -401,6 +577,7 @@ class EnergyRedispatchRegressionTest(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertIsNotNone(optimizer.sol)
         self.assertEqual(optimizer.sol.power_management_optimizer, "EnergyOnlyOptimizer")
+        self.assertEqual(optimizer.sol.power_management_solver_status, cp.OPTIMAL)
 
     def test_energy_only_accounts_for_battery_leak(self):
         ship = self._tiny_ship(leak=0.5)

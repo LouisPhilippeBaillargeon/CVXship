@@ -4,8 +4,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pickle
 
-from lib.paths import PLOTS, NAVIGABILITY_MAP
+from lib.paths import PLOTS
 from lib.utils import _halfspace_polygon_4ineq
+from lib.experiment import solution_power_management_solver_status, solution_solver_status
 
 # ====================== PLOTTING UTILITIES ======================
 
@@ -123,9 +124,13 @@ def _set_polygons_from_ineq(set_ineq, eps_poly=1e-9):
 
 
 def _draw_feasibility_map(ax, map_obj, alpha=0.35):
-    navigability_map = getattr(map_obj, "navigability_map_path", NAVIGABILITY_MAP)
+    navigability_map = getattr(map_obj, "navigability_map_path", None)
+    if navigability_map is None:
+        print("[WARN] map object has no navigability_map_path")
+        return False
+
     if not os.path.exists(navigability_map):
-        print(f"[WARN] NAVIGABILITY_MAP not found: {navigability_map}")
+        print(f"[WARN] navigability map not found: {navigability_map}")
         return False
 
     nav = np.load(navigability_map)
@@ -431,19 +436,18 @@ def _print_cost_summary_vs_benchmark(solutions, labels, benchmark_label):
         except (TypeError, ValueError, AttributeError):
             return np.nan
 
-    def _failure_status(sol):
-        status = getattr(sol, "solver_status", None)
+    def _status_label(sol):
+        status = solution_solver_status(sol)
+        power_status = solution_power_management_solver_status(sol)
+        if status and power_status:
+            return f"{status}/{power_status}"
         if status:
-            return str(status)
-
-        reason = getattr(sol, "failure_reason", None)
-        if isinstance(reason, str) and reason.startswith("solver_status:"):
-            return reason.split(":", 1)[1]
-
+            return status
+        if power_status:
+            return f"energy:{power_status}"
         if getattr(sol, "is_valid", True) is False and not np.isfinite(_cost_or_nan(sol)):
             return "failed"
-
-        return None
+        return "N/A"
 
     costs = np.array([_cost_or_nan(sol) for sol in solutions], dtype=float)
 
@@ -471,10 +475,9 @@ def _print_cost_summary_vs_benchmark(solutions, labels, benchmark_label):
 
         solve_time = getattr(sol, "solve_time", np.nan)
         validity_label = "" if getattr(sol, "is_valid", True) else " [INVALID]"
-        failure_status = _failure_status(sol)
+        status_text = _status_label(sol)
 
         if not np.isfinite(cost):
-            status_text = failure_status or "N/A"
             solve_text = f"{solve_time:>8.2f} s" if np.isfinite(solve_time) else f"{'N/A':>8s} s"
             print(
                 f"{label:<35s}: "
@@ -499,6 +502,7 @@ def _print_cost_summary_vs_benchmark(solutions, labels, benchmark_label):
                 f"{label:<35s}: "
                 f"{cost:>12,.6f} ${validity_label:<10s}"
                 f"{solve_time:>8.2f} s   "
+                f"{status_text:>24s}   "
                 f"(benchmark)"
             )
         else:
@@ -506,6 +510,7 @@ def _print_cost_summary_vs_benchmark(solutions, labels, benchmark_label):
                 f"{label:<35s}: "
                 f"{cost:>12,.6f} ${validity_label:<10s}"
                 f"{solve_time:>8.2f} s   "
+                f"{status_text:>24s}   "
                 f"{percent_diff:>10.4f}%   "
                 f"(Delta = {delta:,.6f} $)"
             )

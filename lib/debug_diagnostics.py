@@ -496,12 +496,35 @@ def _record_cjpe(report: OptimizerDebugReport, runner, ctx: Dict[str, Any], eval
     speed_vec = np.stack([_value(ctx["ship_speed_x"]), _value(ctx["ship_speed_y"])], axis=1)
     speed_rel_mag = _value(ctx["speed_rel_water_mag"])
     sail = np.asarray(runner.sol.interval_sail_fraction, dtype=float).reshape(-1) > 0.01
+    timestep_dt_h = np.asarray(getattr(runner.sol, "timestep_dt_h", np.ones_like(sail)), dtype=float).reshape(-1)
     if "ship_speed_split_vec" in ctx:
         ship_split = np.moveaxis(_value(ctx["ship_speed_split_vec"]), 1, -1)
         report.add("slack.speed_mag_minus_avg_split_norm", (_value(ctx["speed_mag"]) - np.mean(np.linalg.norm(ship_split, axis=-1), axis=1))[sail])
+    if "leg_distance" in ctx:
+        leg_distance = _value(ctx["leg_distance"])
+        leg_speed = np.zeros(leg_distance.shape[0], dtype=float)
+        positive_dt = timestep_dt_h > 0.0
+        leg_speed[positive_dt] = (
+            np.sum(leg_distance[positive_dt, :], axis=1)
+            / timestep_dt_h[positive_dt]
+            * 1000.0
+            / 3600.0
+        )
+        report.add("slack.speed_mag_minus_leg_speed", (_value(ctx["speed_mag"]) - leg_speed)[sail])
     if "rel_speed_split_vec" in ctx:
         rel_split = np.moveaxis(_value(ctx["rel_speed_split_vec"]), 1, -1)
         report.add("slack.rel_speed_mag_minus_avg_split_norm", (speed_rel_mag - np.mean(np.linalg.norm(rel_split, axis=-1), axis=1))[sail])
+    if "water_leg_distance" in ctx:
+        water_leg_distance = _value(ctx["water_leg_distance"])
+        water_leg_speed = np.zeros(water_leg_distance.shape[0], dtype=float)
+        positive_dt = timestep_dt_h > 0.0
+        water_leg_speed[positive_dt] = (
+            np.sum(water_leg_distance[positive_dt, :], axis=1)
+            / timestep_dt_h[positive_dt]
+            * 1000.0
+            / 3600.0
+        )
+        report.add("slack.rel_speed_mag_minus_water_leg_speed", (speed_rel_mag - water_leg_speed)[sail])
     wind_coeffs = np.asarray(ctx["wind_model_future"], dtype=float)
     use_transition_wind_model = bool(ctx.get("use_transition_wind_model", True))
     wind_nd = ctx.get("wind_model_nd_future")

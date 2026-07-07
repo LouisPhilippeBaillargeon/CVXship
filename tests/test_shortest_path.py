@@ -14,7 +14,7 @@ from lib.utils import build_constant_speed_path_reference, dx_dy_km
 
 
 CASE_DIR = Path("cases/sept-iles-gaspe")
-BASELINE_CASE_DIR = Path("cases/baseline")
+HALIFAX_GRANDE_ENTREE_CASE_DIR = Path("cases/halifax-grande-entree")
 
 
 class ShortestPathTests(unittest.TestCase):
@@ -87,10 +87,10 @@ class ShortestPathTests(unittest.TestCase):
         self.assertAlmostEqual(ref["total_distance_km"], sol.total_distance, places=6)
 
     def test_ordered_sets_use_route_sequence_when_node_samples_skip_short_set(self):
-        map_obj = load_map(BASELINE_CASE_DIR)
-        itinerary = load_itinerary(map_obj, BASELINE_CASE_DIR)
+        map_obj = load_map(HALIFAX_GRANDE_ENTREE_CASE_DIR)
+        itinerary = load_itinerary(map_obj, HALIFAX_GRANDE_ENTREE_CASE_DIR)
         states = load_states(map_obj, itinerary)
-        ship = load_ship(BASELINE_CASE_DIR)
+        ship = load_ship(HALIFAX_GRANDE_ENTREE_CASE_DIR)
         x, y, _ = dx_dy_km(
             map_obj,
             itinerary.transits[-1].lat,
