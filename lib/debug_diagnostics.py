@@ -6,6 +6,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 
 from lib.models import WindModel1D
+from lib import logging_utils as log
 from lib.weather_interpolation import interpolated_weather_at, query_time_for_segment
 from lib.utils import safe_unit, xy_from_path_distance
 
@@ -64,27 +65,29 @@ def clear_debug_reports() -> None:
 
 def print_debug_report() -> None:
     if not _REPORTS:
-        print("\n=== Optimizer debug diagnostics ===")
-        print("No debug diagnostics were recorded.")
+        log.debug("=== Optimizer debug diagnostics ===")
+        log.debug("No debug diagnostics were recorded.")
         return
 
-    print("\n=== Optimizer debug diagnostics ===")
+    log.debug("=== Optimizer debug diagnostics ===")
     for report in _REPORTS:
-        print(f"\n[{report.optimizer}]")
+        log.debug("[%s]", report.optimizer)
         if report.notes:
             for note in report.notes:
-                print(f"  note: {note}")
+                log.debug("  note: %s", note)
         for name in sorted(report.metrics):
             summary = report.metrics[name].summary()
             if summary is None:
                 continue
-            print(
-                "  "
-                f"{name}: n={int(summary['count'])}, "
-                f"mean={summary['mean']:.6g}, "
-                f"mean_abs={summary['mean_abs']:.6g}, "
-                f"max_abs={summary['max_abs']:.6g}, "
-                f"range=[{summary['min']:.6g}, {summary['max']:.6g}]"
+            log.debug(
+                "  %s: n=%d, mean=%.6g, mean_abs=%.6g, max_abs=%.6g, range=[%.6g, %.6g]",
+                name,
+                int(summary["count"]),
+                summary["mean"],
+                summary["mean_abs"],
+                summary["max_abs"],
+                summary["min"],
+                summary["max"],
             )
 
 
@@ -177,7 +180,6 @@ def _local_1d_fit_value(kind: str, base_model, ship, fit_range, weather_key: Tup
                 wy,
                 course,
                 nb_steps=REFIT_NB_STEPS,
-                debug=False,
             )
         else:
             raise ValueError(f"Unknown local fit kind: {kind}")

@@ -1,5 +1,7 @@
 from dataclasses import dataclass, field, replace
 from collections import deque
+import json
+from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 import cvxpy as cp
 import numpy as np
@@ -13,7 +15,19 @@ from lib.models import BaseWindModel, WindModel1D, WindModelTransition1D, WindMo
 from lib.weather import Weather
 from lib.utils import classify_timesteps, dx_dy_km, compute_port_set_indices, point_in_sets, _compute_tight_big_M_set, _compute_min_set_timesteps, _compute_min_crossing_distance_per_set, build_constant_speed_path_reference, xy_from_path_distance, _ordered_set_corner_ids, _set_edges_from_corner_ids, ship_speed_limit_matrix, build_speed_limit_partitions
 from lib.weather_interpolation import build_path_segment_weather_inputs, interpolated_weather_at, query_time_for_segment
+from lib.wrt_adapter import (
+    drop_duplicate_waypoints,
+    find_wrt_route_file,
+    map_set_tolerance_km,
+    parse_wrt_route_geojson,
+    prepare_wrt_run_files,
+    run_weather_routing_tool,
+    sets_containing_point,
+    snap_waypoints_to_map_sets,
+)
 from lib.debug_diagnostics import record_optimizer_debug
+from lib import logging_utils as log
+from lib.logging_utils import solve_with_logging
 
 
 _CVXPY_SUCCESS_STATUSES = {cp.OPTIMAL, cp.OPTIMAL_INACCURATE}
@@ -22,11 +36,37 @@ _CVXPY_SUCCESS_STATUSES = {cp.OPTIMAL, cp.OPTIMAL_INACCURATE}
 def _solver_succeeded(problem, optimizer_name: str) -> bool:
     status = problem.status
     if status == cp.OPTIMAL_INACCURATE:
-        print(
+        log.warning(
             f"[WARN] {optimizer_name} solve status is optimal_inaccurate; "
             "using the solution, but it is not an exact optimal solve."
         )
     return status in _CVXPY_SUCCESS_STATUSES
+
+
+def _require_convex_ship_models(runner, optimizer_name: str) -> None:
+    context = f"{optimizer_name} optimizer"
+    calm_model = getattr(runner, "calm_model", None)
+    propulsion_model = getattr(runner, "propulsion_model", None)
+
+    if calm_model is None:
+        raise ValueError(f"{context} requires a calm-water model.")
+    if propulsion_model is None:
+        raise ValueError(f"{context} requires a propulsion model.")
+
+    calm_require = getattr(calm_model, "require_convex_fit", None)
+    if callable(calm_require):
+        calm_require(context)
+    elif getattr(calm_model, "res_coeffs", None) is None:
+        raise ValueError(f"{context} requires CalmWaterModel.fit_convex_model() first.")
+
+    propulsion_require = getattr(propulsion_model, "require_convex_fit", None)
+    if callable(propulsion_require):
+        propulsion_require(context)
+    elif (
+        getattr(propulsion_model, "power_coeffs", None) is None
+        or getattr(propulsion_model, "constraint_params", None) is None
+    ):
+        raise ValueError(f"{context} requires PropulsionModel.fit_convex_model() first.")
 
 
 def _propulsion_physical_feasibility_constraints(
@@ -39,11 +79,135 @@ def _propulsion_physical_feasibility_constraints(
         raise ValueError("Missing propulsion physical feasibility boundary. Run fit_convex_model() first.")
 
     a, b = float(params[0]), float(params[1])
+    physical_max_ua = float(
+        getattr(propulsion_model, "physical_max_ua", propulsion_model.max_ua)
+    )
+    physical_max_thrust = float(
+        getattr(propulsion_model, "physical_max_thrust", propulsion_model.max_thrust)
+    )
     return [
-        advance_speed <= float(propulsion_model.max_ua),
-        res_per_prop <= float(propulsion_model.max_thrust),
+        advance_speed <= physical_max_ua,
+        res_per_prop <= physical_max_thrust,
         a * advance_speed + res_per_prop + b <= 0.0,
     ]
+
+
+def _broadcast_sailing_mask(sol, values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values)
+    sail = np.asarray(getattr(sol, "interval_sail_fraction", []), dtype=float).reshape(-1)
+    if sail.size == 0 or values.ndim == 0 or values.shape[0] != sail.size:
+        return np.ones(values.shape, dtype=bool)
+
+    shape = (sail.size,) + (1,) * (values.ndim - 1)
+    return np.broadcast_to((sail > 0.01).reshape(shape), values.shape)
+
+
+def _range_violation_record(
+    sol,
+    values,
+    lower: float,
+    upper: float,
+    *,
+    key: str,
+    message: str,
+    tol: float = 1e-6,
+):
+    arr = np.asarray(values, dtype=float)
+    mask = np.isfinite(arr) & _broadcast_sailing_mask(sol, arr)
+    if not np.any(mask):
+        return None
+
+    lower_violation = float(lower) - arr
+    upper_violation = arr - float(upper)
+    violation = np.maximum(lower_violation, upper_violation)
+    bad = mask & (violation > tol)
+    if not np.any(bad):
+        return None
+
+    return key, {
+        "message": message,
+        "count": int(np.sum(bad)),
+        "max_amount": float(np.nanmax(violation[bad])),
+    }
+
+
+def _wind_fit_speed_bounds(wind_model, ship):
+    if wind_model is None:
+        return None
+
+    # WindModel2D fits over the full circular ship-speed domain; its inherited
+    # fit_range is metadata, not the training domain for that model.
+    if type(wind_model).__name__ == "WindModel2D":
+        return 0.0, float(ship.info.max_speed)
+
+    fit_range = getattr(wind_model, "fit_range", None)
+    if fit_range is None:
+        return None
+    return float(fit_range.min_speed), float(fit_range.max_speed)
+
+
+def annotate_fit_range_warnings(sol, propulsion_model=None, wind_model=None, ship=None):
+    if sol is None:
+        return sol
+
+    known_keys = {
+        "propulsion_advance_speed_outside_fit_range",
+        "propulsion_resistance_outside_fit_range",
+        "wind_speed_outside_fit_range",
+    }
+    warnings = {
+        k: v
+        for k, v in (getattr(sol, "fit_range_warnings", {}) or {}).items()
+        if k not in known_keys
+    }
+
+    if propulsion_model is not None and ship is not None:
+        advance_speed = (
+            np.asarray(sol.speed_rel_water_mag, dtype=float)
+            * (1.0 - float(ship.propulsion.wake_fraction))
+        )
+        rec = _range_violation_record(
+            sol,
+            advance_speed,
+            float(propulsion_model.min_ua),
+            float(propulsion_model.max_ua),
+            key="propulsion_advance_speed_outside_fit_range",
+            message="Optimizer advance speed is outside the propulsion power-fit range.",
+        )
+        if rec is not None:
+            warnings[rec[0]] = rec[1]
+
+        res_per_prop = (
+            np.asarray(sol.total_resistance, dtype=float)
+            / float(ship.propulsion.nb_propellers)
+        )
+        rec = _range_violation_record(
+            sol,
+            res_per_prop,
+            float(propulsion_model.min_thrust),
+            float(propulsion_model.max_thrust),
+            key="propulsion_resistance_outside_fit_range",
+            message="Optimizer resistance per propeller is outside the propulsion power-fit range.",
+        )
+        if rec is not None:
+            warnings[rec[0]] = rec[1]
+
+    if wind_model is not None and ship is not None:
+        bounds = _wind_fit_speed_bounds(wind_model, ship)
+        if bounds is not None:
+            rec = _range_violation_record(
+                sol,
+                sol.speed_mag,
+                bounds[0],
+                bounds[1],
+                key="wind_speed_outside_fit_range",
+                message="Optimizer ship speed is outside the wind model fit range.",
+            )
+            if rec is not None:
+                warnings[rec[0]] = rec[1]
+
+    sol.fit_range_warnings = warnings
+    return sol
 
 
 def _jpcse_normal_wind_inactive_expr(set_selection, t: int, z: int, use_transition_wind_model: bool):
@@ -56,7 +220,7 @@ def _jpcse_transition_wind_inactive_expr(set_selection, t: int, z: int, z_next: 
     return 2 - set_selection[t, z] - set_selection[t + 1, z_next]
 
 
-def _minimum_set_steps_for_optimizer(map_obj, itinerary, ship, debug=False):
+def _minimum_set_steps_for_optimizer(map_obj, itinerary, ship):
     corners_path = getattr(map_obj, "corners_path", None)
     set_corners_path = getattr(map_obj, "set_corners_path", None)
     if corners_path is None or set_corners_path is None:
@@ -65,12 +229,10 @@ def _minimum_set_steps_for_optimizer(map_obj, itinerary, ship, debug=False):
     min_dist_by_id = _compute_min_crossing_distance_per_set(corners_path, set_corners_path)
 
     if min_dist_by_id and all(float(d) <= 1e-9 for d in min_dist_by_id.values()):
-        if debug:
-            print(
-                "Skipping minimum timestep constraints: "
-                "all minimum crossing distances are zero."
-            )
-            print("Minimum crossing distance per set [km]:", min_dist_by_id)
+        log.debug(
+            "Skipping minimum timestep constraints: all minimum crossing distances are zero."
+        )
+        log.debug("Minimum crossing distance per set [km]: %s", min_dist_by_id)
         return None, {}, min_dist_by_id
 
     min_set_steps_by_id = _compute_min_set_timesteps(
@@ -94,7 +256,7 @@ def _minimum_set_steps_for_optimizer(map_obj, itinerary, ship, debug=False):
 
 @dataclass
 class Solution:
-    estimated_cost          : float
+    estimated_cost          : Optional[float]
     solve_time              : float
 
     T_future                : int
@@ -159,6 +321,7 @@ class Solution:
     ems_validation_errors   : Dict = field(default_factory=dict)
     pre_redispatch_ems_validation_warnings: Dict = field(default_factory=dict)
     pre_redispatch_ems_validation_errors: Dict = field(default_factory=dict)
+    fit_range_warnings    : Dict = field(default_factory=dict)
 
 
 @dataclass
@@ -857,6 +1020,7 @@ class EnergyOnlyOptimizer:
 
     sol: Optional[Solution] = field(default=None, init=False)
     power_management_solver_status: Optional[str] = field(default=None, init=False)
+    energy_solve_time: Optional[float] = field(default=None, init=False)
 
     @staticmethod
     def _as_segment_matrix(value, T: int, H: int, name: str) -> np.ndarray:
@@ -890,7 +1054,6 @@ class EnergyOnlyOptimizer:
         self,
         evaluated_solution: Solution,
         solar_power_available: Optional[np.ndarray] = None,
-        debug: bool = False,
         solver=cp.MOSEK,
         verbose: bool = False,
     ) -> int:
@@ -1130,22 +1293,23 @@ class EnergyOnlyOptimizer:
         problem = cp.Problem(objective, constraints)
 
         start_solve = time.time()
-        problem.solve(
+        solve_with_logging(
+            problem,
             solver=solver,
-            verbose=verbose,
+            echo_verbose=verbose,
         )
         solve_time = time.time() - start_solve
 
-        if debug:
-            print("ENERGY ONLY SOLVE: status =", problem.status, "value =", problem.value)
-            print(f"Energy-only solve time (wall clock): {solve_time:.2f} seconds")
-            if problem.solver_stats is not None:
-                print("Solver reported solve time:", problem.solver_stats.solve_time, "seconds")
+        log.debug("ENERGY ONLY SOLVE: status = %s value = %s", problem.status, problem.value)
+        log.debug("Energy-only solve time (wall clock): %.2f seconds", solve_time)
+        if problem.solver_stats is not None:
+            log.debug("Solver reported solve time: %s seconds", problem.solver_stats.solve_time)
 
         self.power_management_solver_status = problem.status
+        self.energy_solve_time = solve_time
 
         if not _solver_succeeded(problem, "EnergyOnlyOptimizer"):
-            print(f"Energy-only optimization status: {problem.status}")
+            log.error("Energy-only optimization status: %s", problem.status)
             return 0
 
         generation_flat = np.asarray(generation_power.value, dtype=float)
@@ -1271,7 +1435,6 @@ class JPDSE:
     def optimize(self,
         unit_commitment = False,
         initial_gen_on = None,
-        debug = False,
         ordered_sets = False,
         min_timestep = False,
         enforce_adjacency=True,
@@ -1281,6 +1444,7 @@ class JPDSE:
         verbose=False,
     ):
         constraints = []
+        _require_convex_ship_models(self, "JPDSE")
 
         if self.states.timesteps_completed >= self.itinerary.nb_timesteps:
             raise ValueError("No timesteps left to optimize; trip is finished.")
@@ -1376,8 +1540,7 @@ class JPDSE:
                 optimizer_name="JPDSE",
             )
 
-            if debug:
-                print(f"Ordered set ids from {ordered_set_source}:", ordered_set_ids)
+            log.debug("Ordered set ids from %s: %s", ordered_set_source, ordered_set_ids)
 
             _add_ordered_set_constraints(
                 constraints,
@@ -1440,17 +1603,15 @@ class JPDSE:
                     self.map,
                     self.itinerary,
                     self.ship,
-                    debug=debug,
                 )
             )
 
             if min_set_steps is not None:
-                if debug:
-                    print("min_set_steps_by_id:", min_set_steps_by_id)
-                    print("min_set_steps array:", min_set_steps)
-                    print("port_set_idx from set_ineq:", compute_port_set_indices(self.map, self.itinerary))
-                    print("map.set_adj shape:", self.map.set_adj.shape)
-                    print("map.set_ineq nb_sets:", self.map.set_ineq.shape[2])
+                log.debug("min_set_steps_by_id: %s", min_set_steps_by_id)
+                log.debug("min_set_steps array: %s", min_set_steps)
+                log.debug("port_set_idx from set_ineq: %s", compute_port_set_indices(self.map, self.itinerary))
+                log.debug("map.set_adj shape: %s", self.map.set_adj.shape)
+                log.debug("map.set_ineq nb_sets: %s", self.map.set_ineq.shape[2])
 
                 set_used = cp.Variable(self.map.nb_sets, boolean=True)
                 base_step_weights = _base_timestep_weights(
@@ -1480,9 +1641,8 @@ class JPDSE:
                     constraints += [node_occ_z <= (T_future + 1) * set_used[z]]
                     constraints += [interval_occ_z >= float(min_set_steps[z]) * set_used[z]]
 
-                if debug:
-                    print("Minimum crossing distance per set [km]:", min_dist_by_id)
-                    print("Minimum crossing timesteps per set:", min_set_steps_by_id)
+                log.debug("Minimum crossing distance per set [km]: %s", min_dist_by_id)
+                log.debug("Minimum crossing timesteps per set: %s", min_set_steps_by_id)
 
         # ========================================== RESTRICT TO BASE +/- R SETS =====================================
         if restrict_to_base:
@@ -1508,8 +1668,7 @@ class JPDSE:
                     if allowed_set_mask[t, z] < 0.5:
                         constraints += [set_selection[t, z] == 0]
 
-            if debug:
-                print(f"Restricted JPDSE sets to base +/- {base_set_radius}.")
+            log.debug("Restricted JPDSE sets to base +/- %s.", base_set_radius)
 
         # ================================================ EARTH-FIXED SPEED ==========================================
         ship_speed_x = cp.Variable((T_future, H))
@@ -1790,16 +1949,18 @@ class JPDSE:
 
         start_solve = time.time()
 
-        problem.solve(
+        solve_with_logging(
+            problem,
             solver=cp.MOSEK,
-            verbose=verbose,
+            echo_verbose=verbose,
         )
 
         solve_time = time.time() - start_solve
 
-        print("AFTER SOLVE: status =", problem.status, "value =", problem.value)
-        print(f"MICP solve time (wall clock): {solve_time:.2f} seconds")
-        print("MOSEK reported solve time:", problem.solver_stats.solve_time, "seconds")
+        log.debug("AFTER SOLVE: status = %s value = %s", problem.status, problem.value)
+        log.debug("MICP solve time (wall clock): %.2f seconds", solve_time)
+        if problem.solver_stats is not None:
+            log.debug("MOSEK reported solve time: %s seconds", problem.solver_stats.solve_time)
         self.solver_status = problem.status
         self.solve_time = solve_time
 
@@ -1888,32 +2049,37 @@ class JPDSE:
                 generator_unit_commitment=unit_commitment,
                 solver_status=problem.status,
             )
-            if debug:
-                record_optimizer_debug(
-                    "JPDSE",
-                    self,
-                    {
-                        "mode": "JPDSE",
-                        "set_selection": set_selection.value,
-                        "ship_speed_vec": ship_speed_out,
-                        "rel_speed_vec": speed_rel_water_out,
-                        "speed_mag": speed_mag.value,
-                        "speed_rel_water_mag": speed_rel_water_mag.value,
-                        "wind_resistance": wind_resistance.value,
-                        "calm_water_resistance": calm_water_resistance.value,
-                        "total_resistance": total_resistance.value,
-                        "prop_power": prop_power.value,
-                        "generation_power": gen_power_out,
-                        "gen_costs": gen_costs_out,
-                        "gen_on": gen_on_out,
-                        "wind_model_future": wind_model_future,
-                        "nc_sources": self.nc_sources,
-                    },
-                )
+            annotate_fit_range_warnings(
+                self.sol,
+                propulsion_model=self.propulsion_model,
+                wind_model=self.wind_model,
+                ship=self.ship,
+            )
+            record_optimizer_debug(
+                "JPDSE",
+                self,
+                {
+                    "mode": "JPDSE",
+                    "set_selection": set_selection.value,
+                    "ship_speed_vec": ship_speed_out,
+                    "rel_speed_vec": speed_rel_water_out,
+                    "speed_mag": speed_mag.value,
+                    "speed_rel_water_mag": speed_rel_water_mag.value,
+                    "wind_resistance": wind_resistance.value,
+                    "calm_water_resistance": calm_water_resistance.value,
+                    "total_resistance": total_resistance.value,
+                    "prop_power": prop_power.value,
+                    "generation_power": gen_power_out,
+                    "gen_costs": gen_costs_out,
+                    "gen_on": gen_on_out,
+                    "wind_model_future": wind_model_future,
+                    "nc_sources": self.nc_sources,
+                },
+            )
             return 1
 
         else:
-            print(f"Optimization status: {problem.status}")
+            log.error("JPDSE optimization status: %s", problem.status)
             self.failure_reason = f"solver_status:{problem.status}"
             return 0
 
@@ -1945,7 +2111,6 @@ class JPCSE:
     def optimize(self,
         unit_commitment = False,
         initial_gen_on = None,
-        debug = False,
         ordered_sets = False,
         min_timestep = False,
         enforce_adjacency=True,
@@ -1956,6 +2121,7 @@ class JPCSE:
         verbose=False,
     ):
         constraints = []
+        _require_convex_ship_models(self, "JPCSE")
         if use_transition_wind_model is None:
             use_transition_wind_model = bool(self.use_transition_wind_model)
 
@@ -2065,8 +2231,7 @@ class JPCSE:
                 optimizer_name="JPCSE",
             )
 
-            if debug:
-                print(f"Ordered set ids from {ordered_set_source}:", ordered_set_ids)
+            log.debug("Ordered set ids from %s: %s", ordered_set_source, ordered_set_ids)
 
             _add_ordered_set_constraints(
                 constraints,
@@ -2129,17 +2294,15 @@ class JPCSE:
                     self.map,
                     self.itinerary,
                     self.ship,
-                    debug=debug,
                 )
             )
 
             if min_set_steps is not None:
-                if debug:
-                    print("min_set_steps_by_id:", min_set_steps_by_id)
-                    print("min_set_steps array:", min_set_steps)
-                    print("port_set_idx from set_ineq:", compute_port_set_indices(self.map, self.itinerary))
-                    print("map.set_adj shape:", self.map.set_adj.shape)
-                    print("map.set_ineq nb_sets:", self.map.set_ineq.shape[2])
+                log.debug("min_set_steps_by_id: %s", min_set_steps_by_id)
+                log.debug("min_set_steps array: %s", min_set_steps)
+                log.debug("port_set_idx from set_ineq: %s", compute_port_set_indices(self.map, self.itinerary))
+                log.debug("map.set_adj shape: %s", self.map.set_adj.shape)
+                log.debug("map.set_ineq nb_sets: %s", self.map.set_ineq.shape[2])
 
                 set_used = cp.Variable(self.map.nb_sets, boolean=True)
                 base_step_weights = _base_timestep_weights(
@@ -2169,9 +2332,8 @@ class JPCSE:
                     constraints += [node_occ_z <= (T_future + 1) * set_used[z]]
                     constraints += [interval_occ_z >= float(min_set_steps[z]) * set_used[z]]
 
-                if debug:
-                    print("Minimum crossing distance per set [km]:", min_dist_by_id)
-                    print("Minimum crossing timesteps per set:", min_set_steps_by_id)
+                log.debug("Minimum crossing distance per set [km]: %s", min_dist_by_id)
+                log.debug("Minimum crossing timesteps per set: %s", min_set_steps_by_id)
 
         # ========================================== RESTRICT TO BASE +/- R SETS =====================================
         if restrict_to_base:
@@ -2197,8 +2359,7 @@ class JPCSE:
                     if allowed_set_mask[t, z] < 0.5:
                         constraints += [set_selection[t, z] == 0]
 
-            if debug:
-                print(f"Restricted JPCSE sets to base +/- {base_set_radius}.")
+            log.debug("Restricted JPCSE sets to base +/- %s.", base_set_radius)
 
         # ================================================ EARTH-FIXED SPEED ==========================================
         ship_speed_x = cp.Variable(T_future)
@@ -2509,16 +2670,18 @@ class JPCSE:
 
         start_solve = time.time()
 
-        problem.solve(
+        solve_with_logging(
+            problem,
             solver=cp.MOSEK,
-            verbose=verbose,
+            echo_verbose=verbose,
         )
 
         solve_time = time.time() - start_solve
 
-        print("AFTER SOLVE: status =", problem.status, "value =", problem.value)
-        print(f"MICP solve time (wall clock): {solve_time:.2f} seconds")
-        print("MOSEK reported solve time:", problem.solver_stats.solve_time, "seconds")
+        log.debug("AFTER SOLVE: status = %s value = %s", problem.status, problem.value)
+        log.debug("MICP solve time (wall clock): %.2f seconds", solve_time)
+        if problem.solver_stats is not None:
+            log.debug("MOSEK reported solve time: %s seconds", problem.solver_stats.solve_time)
         self.solver_status = problem.status
         self.solve_time = solve_time
 
@@ -2598,39 +2761,48 @@ class JPCSE:
                 ),
                 solver_status=problem.status,
             )
-            if debug:
-                record_optimizer_debug(
-                    "JPCSE_transit_wind"
+            annotate_fit_range_warnings(
+                self.sol,
+                propulsion_model=self.propulsion_model,
+                wind_model=(
+                    self.wind_model_nd
                     if use_transition_wind_model
-                    else "JPCSE_departure_wind",
-                    self,
-                    {
-                        "mode": "JPCSE",
-                        "use_transition_wind_model": use_transition_wind_model,
-                        "set_selection": set_selection.value,
-                        "ship_speed_x": ship_speed_x.value,
-                        "ship_speed_y": ship_speed_y.value,
-                        "leg_distance": leg_distance.value,
-                        "water_leg_distance": water_leg_distance.value,
-                        "water_leg_distance_from_geometry": water_leg_distance_out,
-                        "speed_mag": speed_mag.value,
-                        "speed_rel_water_mag": speed_rel_water_mag.value,
-                        "wind_resistance": wind_resistance.value,
-                        "calm_water_resistance": calm_water_resistance.value,
-                        "total_resistance": total_resistance.value,
-                        "prop_power": prop_power.value,
-                        "generation_power": generation_power.value,
-                        "gen_costs": gen_costs.value,
-                        "gen_on": gen_on_out,
-                        "wind_model_future": wind_model_future,
-                        "wind_model_nd_future": wind_model_nd_future,
-                        "nc_sources": self.nc_sources,
-                    },
-                )
+                    else self.wind_model
+                ),
+                ship=self.ship,
+            )
+            record_optimizer_debug(
+                "JPCSE_transit_wind"
+                if use_transition_wind_model
+                else "JPCSE_departure_wind",
+                self,
+                {
+                    "mode": "JPCSE",
+                    "use_transition_wind_model": use_transition_wind_model,
+                    "set_selection": set_selection.value,
+                    "ship_speed_x": ship_speed_x.value,
+                    "ship_speed_y": ship_speed_y.value,
+                    "leg_distance": leg_distance.value,
+                    "water_leg_distance": water_leg_distance.value,
+                    "water_leg_distance_from_geometry": water_leg_distance_out,
+                    "speed_mag": speed_mag.value,
+                    "speed_rel_water_mag": speed_rel_water_mag.value,
+                    "wind_resistance": wind_resistance.value,
+                    "calm_water_resistance": calm_water_resistance.value,
+                    "total_resistance": total_resistance.value,
+                    "prop_power": prop_power.value,
+                    "generation_power": generation_power.value,
+                    "gen_costs": gen_costs.value,
+                    "gen_on": gen_on_out,
+                    "wind_model_future": wind_model_future,
+                    "wind_model_nd_future": wind_model_nd_future,
+                    "nc_sources": self.nc_sources,
+                },
+            )
             return 1
 
         else:
-            print(f"Optimization status: {problem.status}")
+            log.error("JPCSE optimization status: %s", problem.status)
             self.failure_reason = f"solver_status:{problem.status}"
             return 0
 
@@ -2669,7 +2841,6 @@ class FPJSE:
         segment_dirs: np.ndarray,
         timestep_dt_h: np.ndarray,
         T_future: int,
-        debug: bool = False,
     ):
         if self.nc_sources is None:
             raise ValueError("FPJSE requires nc_sources prepared from weather.toml.")
@@ -2706,16 +2877,14 @@ class FPJSE:
             diagnostic_wind_samples=weather_inputs["diagnostic_wind_samples"],
         )
 
-        if debug:
-            print("[FPJSE] fitted path-segment sampled wind models")
-            print("[FPJSE] sampled current_x first segment:", current_x_path[0, :5])
-            print("[FPJSE] sampled irradiance first segment:", irradiance_path[0, :5])
+        log.debug("[FPJSE] fitted path-segment sampled wind models")
+        log.debug("[FPJSE] sampled current_x first segment: %s", current_x_path[0, :5])
+        log.debug("[FPJSE] sampled irradiance first segment: %s", irradiance_path[0, :5])
 
     def optimize(
         self,
         unit_commitment=False,
         initial_gen_on=None,
-        debug=False,
         min_timestep=False,
         restrict_to_base=False,
         base_solution=None,
@@ -2723,6 +2892,7 @@ class FPJSE:
         verbose=False,
     ):
         constraints = []
+        _require_convex_ship_models(self, "FPJSE")
 
         if self.states.timesteps_completed >= self.itinerary.nb_timesteps:
             raise ValueError("No timesteps left to optimize; trip is finished.")
@@ -2773,7 +2943,6 @@ class FPJSE:
             segment_dirs=segment_dirs,
             timestep_dt_h=timestep_dt_h,
             T_future=T_future,
-            debug=debug,
         )
 
         # ================================= BASE RESTRICTION REF =================================
@@ -2884,8 +3053,7 @@ class FPJSE:
                 )
                 constraints += [interval_occ_s >= float(min_set_steps[s])]
 
-            if debug:
-                print("min_set_steps:", min_set_steps)
+            log.debug("min_set_steps: %s", min_set_steps)
 
         # ================================= RESTRICT TO BASE +/- R SEGMENTS =================================
         if restrict_to_base:
@@ -2900,8 +3068,7 @@ class FPJSE:
                     if allowed_set_mask[t, s] < 0.5:
                         constraints += [path_set_selection[t, s] == 0]
 
-            if debug:
-                print(f"Restricted FPJSE segments to base +/- {base_set_radius}.")
+            log.debug("Restricted FPJSE segments to base +/- %s.", base_set_radius)
 
         # ================================= SPEED =================================
         step_distance = cp.Variable(T_future, nonneg=True)
@@ -3222,21 +3389,23 @@ class FPJSE:
 
         start_solve = time.time()
 
-        problem.solve(
+        solve_with_logging(
+            problem,
             solver=cp.MOSEK,
-            verbose=verbose,
+            echo_verbose=verbose,
         )
 
         solve_time = time.time() - start_solve
 
-        print("AFTER SOLVE: status =", problem.status, "value =", problem.value)
-        print(f"Fixed path solve time (wall clock): {solve_time:.2f} seconds")
-        print("MOSEK reported solve time:", problem.solver_stats.solve_time, "seconds")
+        log.debug("AFTER SOLVE: status = %s value = %s", problem.status, problem.value)
+        log.debug("Fixed path solve time (wall clock): %.2f seconds", solve_time)
+        if problem.solver_stats is not None:
+            log.debug("MOSEK reported solve time: %s seconds", problem.solver_stats.solve_time)
         self.solver_status = problem.status
         self.solve_time = solve_time
 
         if not _solver_succeeded(problem, "FPJSE"):
-            print(f"Optimization status: {problem.status}")
+            log.error("FPJSE optimization status: %s", problem.status)
             self.failure_reason = f"solver_status:{problem.status}"
             return 0
 
@@ -3329,39 +3498,48 @@ class FPJSE:
             generator_unit_commitment=unit_commitment,
             solver_status=problem.status,
         )
-        if debug:
-            record_optimizer_debug(
-                "FPJSE",
-                self,
-                {
-                    "mode": "FPJSE",
-                    "path_set_selection": path_set_selection.value,
-                    "ship_speed_split_value": np.stack(
-                        [
-                            np.asarray(ship_speed_x_split.value),
-                            np.asarray(ship_speed_y_split.value),
-                        ],
-                        axis=2,
-                    ),
-                    "rel_speed_split_vec": np.stack(
-                        [
-                            np.asarray(ship_speed_x_split_rel_water.value),
-                            np.asarray(ship_speed_y_split_rel_water.value),
-                        ],
-                        axis=1,
-                    ),
-                    "speed_mag": speed_mag.value,
-                    "speed_rel_water_mag": speed_rel_water_mag.value,
-                    "wind_resistance": wind_resistance.value,
-                    "calm_water_resistance": calm_water_resistance.value,
-                    "total_resistance": total_resistance.value,
-                    "prop_power": prop_power.value,
-                    "generation_power": generation_power.value,
-                    "gen_costs": gen_costs.value,
-                    "gen_on": gen_on_out,
-                    "wind_model_future": wind_model_future,
-                },
-            )
+        annotate_fit_range_warnings(
+            self.sol,
+            propulsion_model=self.propulsion_model,
+            wind_model=(
+                self.wind_model_path
+                if self.wind_model_path is not None
+                else self.wind_model
+            ),
+            ship=self.ship,
+        )
+        record_optimizer_debug(
+            "FPJSE",
+            self,
+            {
+                "mode": "FPJSE",
+                "path_set_selection": path_set_selection.value,
+                "ship_speed_split_value": np.stack(
+                    [
+                        np.asarray(ship_speed_x_split.value),
+                        np.asarray(ship_speed_y_split.value),
+                    ],
+                    axis=2,
+                ),
+                "rel_speed_split_vec": np.stack(
+                    [
+                        np.asarray(ship_speed_x_split_rel_water.value),
+                        np.asarray(ship_speed_y_split_rel_water.value),
+                    ],
+                    axis=1,
+                ),
+                "speed_mag": speed_mag.value,
+                "speed_rel_water_mag": speed_rel_water_mag.value,
+                "wind_resistance": wind_resistance.value,
+                "calm_water_resistance": calm_water_resistance.value,
+                "total_resistance": total_resistance.value,
+                "prop_power": prop_power.value,
+                "generation_power": generation_power.value,
+                "gen_costs": gen_costs.value,
+                "gen_on": gen_on_out,
+                "wind_model_future": wind_model_future,
+            },
+        )
 
         return 1
 
@@ -3404,7 +3582,7 @@ class FR_O:
     solve_time: Optional[float] = field(default=None, init=False)
     failure_reason: Optional[str] = field(default=None, init=False)
 
-    def _precompute_timesampled_weather_models(self, debug=False):
+    def _precompute_timesampled_weather_models(self):
         T_future = self.itinerary.nb_timesteps - self.states.timesteps_completed
 
         ref = build_constant_speed_path_reference(
@@ -3483,30 +3661,29 @@ class FR_O:
             course_ts,
         )
 
-        if debug:
-            print("[TimeSampled] fitted one wind model per timestep")
-            print("[TimeSampled] current_x:", current_x_ts[:5])
-            print("[TimeSampled] irradiance:", irradiance_ts[:5])
+        log.debug("[TimeSampled] fitted one wind model per timestep")
+        log.debug("[TimeSampled] current_x: %s", current_x_ts[:5])
+        log.debug("[TimeSampled] irradiance: %s", irradiance_ts[:5])
 
     def optimize(
         self,
         unit_commitment=False,
         initial_gen_on=None,
-        debug=False,
         verbose=False,
     ):
         constraints = []
         self.failure_reason = None
+        _require_convex_ship_models(self, "FR_O")
 
         if unit_commitment:
-            print("[FR_O WARNING] unit_commitment=True ignored; FR_O is kept binary-free.")
+            log.warning("[FR_O WARNING] unit_commitment=True ignored; FR_O is kept binary-free.")
             unit_commitment = False
 
         if self.states.timesteps_completed >= self.itinerary.nb_timesteps:
             raise ValueError("No timesteps left to optimize; trip is finished.")
 
         T_future = self.itinerary.nb_timesteps - self.states.timesteps_completed
-        self._precompute_timesampled_weather_models(debug=debug)
+        self._precompute_timesampled_weather_models()
         timestep_dt_h = _future_dt_h(self.itinerary, self.states, T_future)
         auxiliary_power = _future_auxiliary_power(self.itinerary, self.states, T_future)
 
@@ -3822,20 +3999,22 @@ class FR_O:
         problem = cp.Problem(objective, constraints)
 
         start_solve = time.time()
-        problem.solve(
+        solve_with_logging(
+            problem,
             solver=cp.MOSEK,
-            verbose=verbose,
+            echo_verbose=verbose,
         )
         solve_time = time.time() - start_solve
 
-        print("AFTER SOLVE: status =", problem.status, "value =", problem.value)
-        print(f"Fixed path solve time (wall clock): {solve_time:.2f} seconds")
-        print("MOSEK reported solve time:", problem.solver_stats.solve_time, "seconds")
+        log.debug("AFTER SOLVE: status = %s value = %s", problem.status, problem.value)
+        log.debug("Fixed path solve time (wall clock): %.2f seconds", solve_time)
+        if problem.solver_stats is not None:
+            log.debug("MOSEK reported solve time: %s seconds", problem.solver_stats.solve_time)
         self.solver_status = problem.status
         self.solve_time = solve_time
 
         if not _solver_succeeded(problem, "FR_O"):
-            print(f"Optimization status: {problem.status}")
+            log.error("FR_O optimization status: %s", problem.status)
             self.failure_reason = f"solver_status:{problem.status}"
             return 0
 
@@ -3845,7 +4024,7 @@ class FR_O:
         bad_crossings = np.where(waypoint_crossings > 1)[0]
         if bad_crossings.size:
             first = int(bad_crossings[0])
-            print(
+            log.error(
                 "[FR_O ERROR] Timestep is too large for this fixed-path map: "
                 f"FR_O crossed {int(waypoint_crossings[first])} fixed-path "
                 f"waypoints during timestep {first}. "
@@ -3934,28 +4113,37 @@ class FR_O:
             generator_unit_commitment=unit_commitment,
             solver_status=problem.status,
         )
-        if debug:
-            record_optimizer_debug(
-                "FR_O",
-                self,
-                {
-                    "mode": "FR_O",
-                    "ship_speed_x": ship_speed_x.value,
-                    "ship_speed_y": ship_speed_y.value,
-                    "speed_rel_water_x": speed_rel_water_x.value,
-                    "speed_rel_water_y": speed_rel_water_y.value,
-                    "speed_mag": speed_mag.value,
-                    "speed_rel_water_mag": speed_rel_water_mag.value,
-                    "wind_resistance": wind_resistance.value,
-                    "calm_water_resistance": calm_water_resistance.value,
-                    "total_resistance": total_resistance.value,
-                    "prop_power": prop_power.value,
-                    "generation_power": generation_power.value,
-                    "gen_costs": gen_costs.value,
-                    "gen_on": gen_on_out,
-                    "wind_model_future": wind_model_future,
-                },
-            )
+        annotate_fit_range_warnings(
+            self.sol,
+            propulsion_model=self.propulsion_model,
+            wind_model=(
+                self.wind_model_ts
+                if self.wind_model_ts is not None
+                else self.wind_model
+            ),
+            ship=self.ship,
+        )
+        record_optimizer_debug(
+            "FR_O",
+            self,
+            {
+                "mode": "FR_O",
+                "ship_speed_x": ship_speed_x.value,
+                "ship_speed_y": ship_speed_y.value,
+                "speed_rel_water_x": speed_rel_water_x.value,
+                "speed_rel_water_y": speed_rel_water_y.value,
+                "speed_mag": speed_mag.value,
+                "speed_rel_water_mag": speed_rel_water_mag.value,
+                "wind_resistance": wind_resistance.value,
+                "calm_water_resistance": calm_water_resistance.value,
+                "total_resistance": total_resistance.value,
+                "prop_power": prop_power.value,
+                "generation_power": generation_power.value,
+                "gen_costs": gen_costs.value,
+                "gen_on": gen_on_out,
+                "wind_model_future": wind_model_future,
+            },
+        )
         return 1
 
 @dataclass
@@ -3975,7 +4163,7 @@ class NaiveController:
     generator_models: Optional[List["GeneratorModel"]] = field(default=None, init=False)
     calm_model: Optional["CalmWaterModel"] = field(default=None, init=False)
 
-    def compute(self, debug: bool = False):
+    def compute(self):
 
         if self.states.timesteps_completed >= self.itinerary.nb_timesteps:
             raise ValueError("No timesteps left to compute; trip is finished.")
@@ -4135,14 +4323,13 @@ class NaiveController:
             generator_unit_commitment=False,
         )
 
-        if debug:
-            print("NaiveController shortest-path distance [km]:", total_distance_km)
-            print("NaiveController constant speed [m/s]:", constant_speed_mps)
-            print("NaiveController constant discharge [MW]:", discharge_power)
-            print("NaiveController final SOC [MWh]:", SOC[-1])
-            print("NaiveController ship_speed shape:", ship_speed.shape)
-            print("NaiveController solar_power shape:", solar_power.shape)
-            print("NaiveController generation_power shape:", generation_power.shape)
+        log.debug("NaiveController shortest-path distance [km]: %s", total_distance_km)
+        log.debug("NaiveController constant speed [m/s]: %s", constant_speed_mps)
+        log.debug("NaiveController constant discharge [MW]: %s", discharge_power)
+        log.debug("NaiveController final SOC [MWh]: %s", SOC[-1])
+        log.debug("NaiveController ship_speed shape: %s", ship_speed.shape)
+        log.debug("NaiveController solar_power shape: %s", solar_power.shape)
+        log.debug("NaiveController generation_power shape: %s", generation_power.shape)
 
         return 1
 
@@ -4326,7 +4513,6 @@ class ShortestPath:
     def compute(
         self,
         end_pos,
-        debug: bool = False,
         solver: Optional[str] = None,
         verbose: bool = False,
         max_set_hops: Optional[int] = None,
@@ -4342,9 +4528,8 @@ class ShortestPath:
         init_sets = self._find_sets_containing_point(start)
         end_sets = self._find_sets_containing_point(end)
 
-        if debug:
-            print(f"start = {start}, init_sets = {init_sets}")
-            print(f"end   = {end}, end_sets  = {end_sets}")
+        log.debug("start = %s, init_sets = %s", start, init_sets)
+        log.debug("end = %s, end_sets = %s", end, end_sets)
 
         corner_xy, set_edges = self._load_set_geometry()
 
@@ -4391,12 +4576,10 @@ class ShortestPath:
                     set_edges=set_edges,
                     solver=solver,
                     verbose=verbose,
-                    debug=debug,
                 )
             except Exception as exc:
                 failures.append((seq, exc))
-                if debug:
-                    print(f"ShortestPath candidate failed: seq={seq}, error={exc}")
+                log.debug("ShortestPath candidate failed: seq=%s, error=%s", seq, exc)
                 continue
 
             if best is None or (
@@ -4417,10 +4600,9 @@ class ShortestPath:
                 + (f" First failures: {detail}" if detail else "")
             )
 
-        if debug:
-            print(f"candidate_sequences = {candidate_sequences}")
-            print(f"selected_set_sequence = {best.set_sequence}")
-            print(f"selected_total_distance = {best.total_distance}")
+        log.debug("candidate_sequences = %s", candidate_sequences)
+        log.debug("selected_set_sequence = %s", best.set_sequence)
+        log.debug("selected_total_distance = %s", best.total_distance)
 
         self.sol = best
         return self.sol
@@ -4452,7 +4634,6 @@ class ShortestPath:
         set_edges: Dict[int, set[frozenset[int]]],
         solver: Optional[str] = None,
         verbose: bool = False,
-        debug: bool = False,
     ) -> ShortestPathSolution:
         set_seq_idx = [int(z) for z in set_seq_idx]
 
@@ -4461,7 +4642,6 @@ class ShortestPath:
             self._validate_polyline_segments_inside_sets(
                 waypoints=waypoints,
                 set_sequence=set_seq_idx,
-                debug=debug,
             )
             return ShortestPathSolution(
                 waypoints=waypoints,
@@ -4476,7 +4656,6 @@ class ShortestPath:
             set_seq_idx,
             set_edges,
             corner_xy,
-            debug=debug,
         )
 
         n_portals = len(portals)
@@ -4520,9 +4699,8 @@ class ShortestPath:
         solve_kwargs = {}
         if solver is not None:
             solve_kwargs["solver"] = solver
-        solve_kwargs["verbose"] = verbose
 
-        problem.solve(**solve_kwargs)
+        solve_with_logging(problem, echo_verbose=verbose, **solve_kwargs)
 
         if not _solver_succeeded(problem, "ShortestPath"):
             raise RuntimeError(f"ShortestPath solve failed with status: {problem.status}")
@@ -4544,17 +4722,15 @@ class ShortestPath:
         self._validate_polyline_segments_inside_sets(
             waypoints=waypoints,
             set_sequence=set_seq_idx,
-            debug=debug,
         )
 
         total_distance = self._polyline_length(waypoints)
 
-        if debug:
-            print(f"set_seq_idx = {set_seq_idx}")
-            print(f"n_portals = {n_portals}")
-            print(f"lambda = {lam_val}")
-            print(f"transition_points =\n{transition_points}")
-            print(f"total_distance = {total_distance}")
+        log.debug("set_seq_idx = %s", set_seq_idx)
+        log.debug("n_portals = %s", n_portals)
+        log.debug("lambda = %s", lam_val)
+        log.debug("transition_points =\n%s", transition_points)
+        log.debug("total_distance = %s", total_distance)
 
         return ShortestPathSolution(
             waypoints=waypoints,
@@ -4629,7 +4805,6 @@ class ShortestPath:
         self,
         waypoints: np.ndarray,
         set_sequence: List[int],
-        debug: bool = False,
         n_samples_per_segment: int = 51,
         tol: float = 1e-6,
     ):
@@ -4660,8 +4835,7 @@ class ShortestPath:
                         f"point={p}, min_ineq={np.min(vals)}"
                     )
 
-            if debug:
-                print(f"validated segment {s} inside set {z}")
+            log.debug("validated segment %s inside set %s", s, z)
 
     def _build_set_sequence(self, init_set: int, end_set: int) -> List[int]:
         adj = np.asarray(self.map.set_adj, dtype=int)
@@ -4792,7 +4966,6 @@ class ShortestPath:
         set_seq: List[int],
         set_edges: Dict[int, set[frozenset[int]]],
         corner_xy: Dict[int, np.ndarray],
-        debug: bool = False,
     ) -> List[np.ndarray]:
 
         portals = []
@@ -4820,8 +4993,7 @@ class ShortestPath:
             portal = np.vstack([a, b])
             portals.append(portal)
 
-            if debug:
-                print(f"portal {z1}->{z2}: corner_ids={corner_ids}, a={a}, b={b}")
+            log.debug("portal %s->%s: corner_ids=%s, a=%s, b=%s", z1, z2, corner_ids, a, b)
 
         return portals
 
@@ -4829,3 +5001,385 @@ class ShortestPath:
     def _polyline_length(points: np.ndarray) -> float:
         points = np.asarray(points, dtype=float)
         return float(np.sum(np.linalg.norm(np.diff(points, axis=0), axis=1)))
+
+
+@dataclass
+class SavedPath(ShortestPath):
+    path_solution_json: Path
+    endpoint_tol_km: float = 1e-5
+
+    def compute(
+        self,
+        end_pos,
+        solver: Optional[str] = None,
+        verbose: bool = False,
+        max_set_hops: Optional[int] = None,
+        max_set_sequences: Optional[int] = None,
+    ) -> ShortestPathSolution:
+        del solver, verbose, max_set_hops, max_set_sequences
+
+        path = Path(self.path_solution_json)
+        with path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+
+        waypoints = np.asarray(payload.get("waypoints"), dtype=float)
+        set_sequence = [int(z) for z in payload.get("set_sequence", [])]
+        if waypoints.ndim != 2 or waypoints.shape[1] != 2:
+            raise ValueError(f"{path} must contain waypoints with shape (N, 2).")
+        if len(set_sequence) != waypoints.shape[0] - 1:
+            raise ValueError(
+                f"{path} set_sequence must contain one set id per route segment."
+            )
+
+        start = np.asarray(
+            [self.states.current_x_pos, self.states.current_y_pos],
+            dtype=float,
+        )
+        end = np.asarray(end_pos, dtype=float)
+        if np.linalg.norm(waypoints[0] - start) > float(self.endpoint_tol_km):
+            raise ValueError(
+                f"Saved path start {waypoints[0]} does not match current state {start}."
+            )
+        if np.linalg.norm(waypoints[-1] - end) > float(self.endpoint_tol_km):
+            raise ValueError(
+                f"Saved path end {waypoints[-1]} does not match requested end {end}."
+            )
+
+        self._validate_polyline_segments_inside_sets(
+            waypoints=waypoints,
+            set_sequence=set_sequence,
+            tol=map_set_tolerance_km(self.map),
+        )
+        total_distance = self._polyline_length(waypoints)
+        self.sol = ShortestPathSolution(
+            waypoints=waypoints,
+            transition_points=np.asarray(waypoints[1:-1], dtype=float),
+            set_sequence=set_sequence,
+            portal_endpoints=[],
+            total_distance=float(total_distance),
+            status=f"saved:{path.name}",
+        )
+        return self.sol
+
+
+@dataclass
+class WeatherRoutingToolPath(ShortestPath):
+    algorithm: str = "isofuel"
+    work_dir: Optional[Path] = None
+    weather_files: Optional[dict] = None
+    wrt_source_dir: Optional[Path] = None
+    python_executable: Optional[str] = None
+    route_geojson_path: Optional[Path] = None
+    config_overrides: Optional[dict] = None
+    boat_speed_mps: Optional[float] = None
+    timeout_s: float = 1800.0
+    route_bbox_margin_deg: float = 0.25
+    use_depth_constraint: bool = True
+    last_route_geojson_path: Optional[Path] = field(default=None, init=False)
+    last_route_source: Optional[str] = field(default=None, init=False)
+
+    def compute(
+        self,
+        end_pos,
+        solver: Optional[str] = None,
+        verbose: bool = False,
+        max_set_hops: Optional[int] = None,
+        max_set_sequences: Optional[int] = None,
+    ) -> ShortestPathSolution:
+        start = np.asarray(
+            [self.states.current_x_pos, self.states.current_y_pos],
+            dtype=float,
+        )
+        end = np.asarray(end_pos, dtype=float)
+
+        route_path = self._route_geojson_path(start, end, verbose=verbose)
+        raw_waypoints = parse_wrt_route_geojson(
+            route_path,
+            self.map,
+            start_xy=start,
+            end_xy=end,
+        )
+        waypoints, set_sequence = self._build_set_aligned_route_from_wrt_polyline(
+            raw_waypoints,
+            solver=solver,
+            verbose=verbose,
+            max_set_hops=max_set_hops,
+            max_set_sequences=max_set_sequences,
+        )
+
+        self._validate_polyline_segments_inside_sets(
+            waypoints=waypoints,
+            set_sequence=set_sequence,
+            tol=map_set_tolerance_km(self.map),
+        )
+
+        total_distance = self._polyline_length(waypoints)
+        if total_distance <= 0.0:
+            raise ValueError("WeatherRoutingToolPath produced zero route distance.")
+
+        self.sol = ShortestPathSolution(
+            waypoints=waypoints,
+            transition_points=np.asarray(waypoints[1:-1], dtype=float),
+            set_sequence=[int(z) for z in set_sequence],
+            portal_endpoints=[],
+            total_distance=float(total_distance),
+            status=f"wrt:{self.algorithm}:{route_path.name}",
+        )
+
+        log.debug("WeatherRoutingToolPath route_file = %s", route_path)
+        log.debug("WeatherRoutingToolPath selected_set_sequence = %s", self.sol.set_sequence)
+        log.debug("WeatherRoutingToolPath total_distance = %s", self.sol.total_distance)
+        return self.sol
+
+    def _build_set_aligned_route_from_wrt_polyline(
+        self,
+        raw_waypoints: np.ndarray,
+        *,
+        solver: Optional[str] = None,
+        verbose: bool = False,
+        max_set_hops: Optional[int] = None,
+        max_set_sequences: Optional[int] = None,
+    ) -> tuple[np.ndarray, list[int]]:
+        set_tol = map_set_tolerance_km(self.map)
+        waypoints, snap_metadata = snap_waypoints_to_map_sets(
+            self.map,
+            raw_waypoints,
+            set_tol_km=min(set_tol, 1e-8),
+        )
+        if snap_metadata["count"]:
+            log.warning(
+                "Snapped %d WRT route points into the CVXship convex-set map "
+                "(max %.3f km, mean %.3f km).",
+                snap_metadata["count"],
+                snap_metadata["max_distance_km"],
+                snap_metadata["mean_distance_km"],
+            )
+        waypoints = drop_duplicate_waypoints(waypoints)
+
+        corner_xy, set_edges = self._load_set_geometry()
+        aligned_points = [np.asarray(waypoints[0], dtype=float)]
+        set_sequence: list[int] = []
+
+        for segment_idx, next_point in enumerate(waypoints[1:]):
+            start = np.asarray(aligned_points[-1], dtype=float)
+            end = np.asarray(next_point, dtype=float)
+
+            start_sets = sets_containing_point(self.map, start, tol=set_tol)
+            end_sets = sets_containing_point(self.map, end, tol=set_tol)
+            if not start_sets or not end_sets:
+                raise ValueError(
+                    "WeatherRoutingTool route point could not be assigned to a "
+                    f"convex set after snapping. segment={segment_idx}, "
+                    f"start_sets={start_sets}, end_sets={end_sets}."
+                )
+
+            common_sets = sorted(set(start_sets) & set(end_sets))
+            if common_sets:
+                set_id = self._choose_wrt_segment_set(
+                    start,
+                    end,
+                    common_sets,
+                    set_tol,
+                )
+                self._append_wrt_route_segment(
+                    aligned_points,
+                    set_sequence,
+                    end,
+                    set_id,
+                )
+                continue
+
+            bridge = self._solve_wrt_bridge_segment(
+                start=start,
+                end=end,
+                start_sets=start_sets,
+                end_sets=end_sets,
+                corner_xy=corner_xy,
+                set_edges=set_edges,
+                solver=solver,
+                verbose=verbose,
+                max_set_hops=max_set_hops,
+                max_set_sequences=max_set_sequences,
+            )
+            log.debug(
+                "Bridged WRT route segment %s across convex sets %s.",
+                segment_idx,
+                bridge.set_sequence,
+            )
+            for point, set_id in zip(bridge.waypoints[1:], bridge.set_sequence):
+                self._append_wrt_route_segment(
+                    aligned_points,
+                    set_sequence,
+                    point,
+                    set_id,
+                )
+
+        aligned_waypoints = np.asarray(aligned_points, dtype=float)
+        if aligned_waypoints.shape[0] < 2:
+            raise ValueError("WeatherRoutingToolPath route collapsed to fewer than two points.")
+        if len(set_sequence) != aligned_waypoints.shape[0] - 1:
+            raise ValueError(
+                "Internal WeatherRoutingTool route alignment produced inconsistent set ids."
+            )
+        return aligned_waypoints, set_sequence
+
+    def _solve_wrt_bridge_segment(
+        self,
+        *,
+        start: np.ndarray,
+        end: np.ndarray,
+        start_sets: list[int],
+        end_sets: list[int],
+        corner_xy: Dict[int, np.ndarray],
+        set_edges: Dict[int, set[frozenset[int]]],
+        solver: Optional[str] = None,
+        verbose: bool = False,
+        max_set_hops: Optional[int] = None,
+        max_set_sequences: Optional[int] = None,
+    ) -> ShortestPathSolution:
+        candidate_sequences: list[list[int]] = []
+        seen_sequences = set()
+
+        for start_set in start_sets:
+            for end_set in end_sets:
+                if int(start_set) == int(end_set):
+                    sequences = [[int(start_set)]]
+                else:
+                    sequences = self._enumerate_set_sequences(
+                        int(start_set),
+                        int(end_set),
+                        max_hops=max_set_hops,
+                        max_paths=max_set_sequences,
+                    )
+                for seq in sequences:
+                    key = tuple(int(z) for z in seq)
+                    if key in seen_sequences:
+                        continue
+                    candidate_sequences.append([int(z) for z in seq])
+                    seen_sequences.add(key)
+
+        if not candidate_sequences:
+            raise ValueError(
+                "No convex-set bridge found for WeatherRoutingTool route segment "
+                f"from sets {start_sets} to sets {end_sets}."
+            )
+
+        best: Optional[ShortestPathSolution] = None
+        failures = []
+
+        for seq in candidate_sequences:
+            try:
+                candidate = self._solve_set_sequence(
+                    set_seq_idx=seq,
+                    start=start,
+                    end=end,
+                    corner_xy=corner_xy,
+                    set_edges=set_edges,
+                    solver=solver,
+                    verbose=verbose,
+                )
+            except Exception as exc:
+                failures.append((seq, exc))
+                log.debug("WRT bridge candidate failed: seq=%s, error=%s", seq, exc)
+                continue
+
+            if best is None or (
+                candidate.total_distance,
+                len(candidate.set_sequence),
+            ) < (
+                best.total_distance,
+                len(best.set_sequence),
+            ):
+                best = candidate
+
+        if best is None:
+            detail = "; ".join(
+                f"{seq}: {type(exc).__name__}: {exc}" for seq, exc in failures[:5]
+            )
+            raise RuntimeError(
+                "WeatherRoutingToolPath could not solve a convex-set bridge."
+                + (f" First failures: {detail}" if detail else "")
+            )
+
+        return best
+
+    def _choose_wrt_segment_set(
+        self,
+        start: np.ndarray,
+        end: np.ndarray,
+        candidate_sets: list[int],
+        set_tol: float,
+    ) -> int:
+        midpoint = 0.5 * (np.asarray(start, dtype=float) + np.asarray(end, dtype=float))
+        midpoint_sets = set(sets_containing_point(self.map, midpoint, tol=set_tol))
+        for set_id in candidate_sets:
+            if int(set_id) in midpoint_sets:
+                return int(set_id)
+        return max(candidate_sets, key=lambda z: self._set_margin(midpoint, int(z)))
+
+    def _set_margin(self, point: np.ndarray, set_id: int) -> float:
+        point = np.asarray(point, dtype=float)
+        vals = (
+            self.map.set_ineq[0, :, set_id] * point[1]
+            + self.map.set_ineq[1, :, set_id] * point[0]
+            + self.map.set_ineq[2, :, set_id]
+        )
+        return float(np.min(vals))
+
+    @staticmethod
+    def _append_wrt_route_segment(
+        points: list[np.ndarray],
+        set_sequence: list[int],
+        point: np.ndarray,
+        set_id: int,
+        tol: float = 1e-8,
+    ) -> None:
+        point = np.asarray(point, dtype=float)
+        if np.linalg.norm(point - points[-1]) <= tol:
+            return
+        points.append(point)
+        set_sequence.append(int(set_id))
+
+    def _route_geojson_path(self, start: np.ndarray, end: np.ndarray, verbose: bool = False) -> Path:
+        if self.route_geojson_path is not None:
+            path = Path(self.route_geojson_path)
+            if not path.exists():
+                raise FileNotFoundError(f"WeatherRoutingTool route file does not exist: {path}")
+            self.last_route_geojson_path = path.resolve()
+            self.last_route_source = "precomputed"
+            return path
+
+        if self.weather_files is None:
+            raise ValueError(
+                "WeatherRoutingToolPath requires weather_files when route_geojson_path is not provided."
+            )
+
+        work_dir = Path(self.work_dir) if self.work_dir is not None else Path("cache") / "wrt_path"
+        run_files = prepare_wrt_run_files(
+            map_obj=self.map,
+            itinerary=self.itinerary,
+            states=self.states,
+            ship=self.ship,
+            end_xy=end,
+            work_dir=work_dir,
+            weather_files=self.weather_files,
+            algorithm=self.algorithm,
+            boat_speed_mps=self.boat_speed_mps,
+            route_bbox_margin_deg=self.route_bbox_margin_deg,
+            use_depth_constraint=self.use_depth_constraint,
+            config_overrides=self.config_overrides,
+        )
+        run_weather_routing_tool(
+            run_files,
+            wrt_source_dir=self.wrt_source_dir,
+            python_executable=self.python_executable,
+            timeout_s=self.timeout_s,
+            verbose=verbose,
+        )
+        route_path = find_wrt_route_file(run_files.route_dir)
+        self.last_route_geojson_path = route_path.resolve()
+        self.last_route_source = "generated"
+        return route_path
+
+
+WRTPath = WeatherRoutingToolPath

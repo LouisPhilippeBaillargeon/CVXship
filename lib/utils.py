@@ -2,6 +2,7 @@ import math
 import numpy as np
 import pandas as pd
 from pyproj import Geod
+from lib import logging_utils as log
 GEOD = Geod(ellps="WGS84")
 
 SPEED_LIMIT_TOUCH_TOL_KM = 1e-5
@@ -993,10 +994,10 @@ def build_constant_speed_path_reference(
     nominal_speed_mps = nominal_speed_kmh * 1000.0 / 3600.0
 
     if ship is not None and nominal_speed_mps > ship.info.max_speed + 1e-9:
-        print(
-            "WARNING: required constant speed "
-            f"{nominal_speed_mps:.3f} m/s exceeds ship.info.max_speed "
-            f"{ship.info.max_speed:.3f} m/s."
+        log.warning(
+            "WARNING: required constant speed %.3f m/s exceeds ship.info.max_speed %.3f m/s.",
+            nominal_speed_mps,
+            ship.info.max_speed,
         )
 
     if ship is not None:

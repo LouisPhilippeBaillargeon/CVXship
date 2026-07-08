@@ -7,6 +7,7 @@ from pathlib import Path
 
 from lib.load_params import MapInfo, load_ship
 from lib.map_builder import MapBuilder
+from lib import logging_utils as log
 
 
 def _normalize_argv(argv: list[str]) -> list[str]:
@@ -80,6 +81,12 @@ def main():
     map_info = MapInfo(**data["params"])
     ship = load_ship(case_dir=case_dir)
     map_dir.mkdir(parents=True, exist_ok=True)
+    log.configure_run_logging(
+        debug_log_path=map_dir / "debug.log",
+        warnings_errors_log_path=map_dir / "warnings_errors.log",
+        console_log_path=map_dir / "console.log",
+        console_verbose=False,
+    )
 
     builder = MapBuilder(
         map_info=map_info,
@@ -87,12 +94,16 @@ def main():
         map_dir=map_dir,
     )
 
-    print(f"[MAP] case={case_dir}")
-    print(f"[MAP] artifacts={map_dir}")
+    log.progress("[MAP] Starting map build")
+    log.progress("[MAP] case=%s", case_dir)
+    log.progress("[MAP] artifacts=%s", map_dir)
 
-    builder.fetch_or_load_depth(force=args.force_depth)
-    builder.build_or_load_navigability(force=args.force_nav or builder.depth_rebuilt)
-    builder.launch_set_editor(import_existing=not args.no_import_existing)
+    try:
+        builder.fetch_or_load_depth(force=args.force_depth)
+        builder.build_or_load_navigability(force=args.force_nav or builder.depth_rebuilt)
+        builder.launch_set_editor(import_existing=not args.no_import_existing)
+    finally:
+        log.shutdown_run_logging()
 
 
 if __name__ == "__main__":

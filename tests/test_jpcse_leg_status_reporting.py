@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import numpy as np
 
 import lib.experiment as experiment
+from lib import logging_utils as log
 from lib.debug_diagnostics import OptimizerDebugReport, _record_cjpe
 from lib.optimizers import (
     _jpcse_leg_metrics,
@@ -109,7 +110,7 @@ def test_jpcse_debug_diagnostics_accept_leg_distance_context():
     assert "slack.rel_speed_mag_minus_water_leg_speed" in report.metrics
 
 
-def test_optimal_inaccurate_cost_and_status_are_reported(tmp_path, capsys):
+def test_optimal_inaccurate_cost_and_status_are_reported(tmp_path):
     sol = SimpleNamespace(
         estimated_cost=12.5,
         solve_time=1.25,
@@ -119,6 +120,7 @@ def test_optimal_inaccurate_cost_and_status_are_reported(tmp_path, capsys):
         is_valid=True,
         validation_errors={},
         validation_warnings={},
+        fit_range_warnings={"wind_speed_outside_fit_range": {"count": 1}},
         first_stage_optimizer="JPCSE",
         power_management_optimizer="EnergyOnlyOptimizer",
         solver_status="optimal_inaccurate",
@@ -137,6 +139,8 @@ def test_optimal_inaccurate_cost_and_status_are_reported(tmp_path, capsys):
     assert row["estimated_cost"] == 12.5
     assert row["solver_status"] == "optimal_inaccurate"
     assert row["power_management_solver_status"] == "optimal"
+    assert row["fit_range_warning_count"] == 1
+    assert row["fit_range_warning_keys"] == "wind_speed_outside_fit_range"
 
     csv_path = tmp_path / "summary.csv"
     experiment._write_summary_csv(csv_path, [row])
@@ -144,11 +148,23 @@ def test_optimal_inaccurate_cost_and_status_are_reported(tmp_path, capsys):
     assert "solver_status,power_management_solver_status" in csv_text
     assert "optimal_inaccurate,optimal" in csv_text
 
-    _print_cost_summary_vs_benchmark(
-        [sol, benchmark],
-        ["candidate", "benchmark"],
-        "benchmark",
+    debug_log = tmp_path / "debug.log"
+    warnings_errors_log = tmp_path / "warnings_errors.log"
+    log.configure_run_logging(
+        debug_log_path=debug_log,
+        warnings_errors_log_path=warnings_errors_log,
+        console_verbose=False,
     )
-    captured = capsys.readouterr().out
-    assert "optimal_inaccurate" in captured
-    assert "12.500000" in captured
+    try:
+        _print_cost_summary_vs_benchmark(
+            [sol, benchmark],
+            ["candidate", "benchmark"],
+            "benchmark",
+        )
+    finally:
+        log.shutdown_run_logging()
+
+    logged = debug_log.read_text(encoding="utf-8")
+    assert "optimal_inaccurate" in logged
+    assert "12.500000" in logged
+    assert "[FIT WARN]" in logged

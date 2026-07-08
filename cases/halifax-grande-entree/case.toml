@@ -5,7 +5,7 @@ description = "Halifax to Grande-Entree route case."
 dimensions = "both"
 new_ship = true
 new_weather = true
-solver_verbose = true
+solver_verbose = false
 unit_commitment = false
 ordered_sets = true
 

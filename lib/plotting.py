@@ -7,6 +7,7 @@ import pickle
 from lib.paths import PLOTS
 from lib.utils import _halfspace_polygon_4ineq
 from lib.experiment import solution_power_management_solver_status, solution_solver_status
+from lib import logging_utils as log
 
 # ====================== PLOTTING UTILITIES ======================
 
@@ -83,7 +84,7 @@ def _save_and_maybe_show(
     fig.subplots_adjust(left=0.18, bottom=0.18)
 
     fig.savefig(path, bbox_inches="tight", dpi=300)
-    print(f"[SAVED] {path}")
+    log.debug("[SAVED] %s", path)
 
     if show:
         plt.show()
@@ -103,6 +104,103 @@ def _get_solution_positions(sol, n_expected=None):
         pos = pos[:n_expected]
 
     return pos
+
+
+_PLOT_TIME_EPS = 1e-9
+
+
+def _plot_timestep_dt(sol, T):
+    timestep_dt = getattr(sol, "timestep_dt_h", None)
+    if timestep_dt is not None:
+        arr = np.asarray(timestep_dt, dtype=float).reshape(-1)
+        if arr.shape == (T,):
+            return arr
+
+    return np.ones(T, dtype=float)
+
+
+def _plot_timestep_boundaries(sol, T):
+    timestep_dt = _plot_timestep_dt(sol, T)
+    return np.concatenate(([0.0], np.cumsum(timestep_dt)))
+
+
+def _plot_timestep_midpoints(sol, T):
+    boundaries = _plot_timestep_boundaries(sol, T)
+    return 0.5 * (boundaries[:-1] + boundaries[1:])
+
+
+def _plot_segment_dt(sol, T, H):
+    segment_dt = getattr(sol, "segment_dt_h", None)
+    if segment_dt is not None:
+        arr = np.asarray(segment_dt, dtype=float)
+        if arr.shape == (T, H):
+            return arr
+        if H == 1 and arr.shape == (T,):
+            return arr[:, None]
+
+    timestep_dt = _plot_timestep_dt(sol, T)
+    if H == 1:
+        return timestep_dt[:, None]
+
+    return np.repeat((timestep_dt / H)[:, None], H, axis=1)
+
+
+def _plot_segment_midpoints_and_mask(sol, T, H):
+    segment_dt = _plot_segment_dt(sol, T, H)
+    starts = _plot_timestep_boundaries(sol, T)[:-1]
+    offsets = np.cumsum(segment_dt, axis=1) - 0.5 * segment_dt
+    x = starts[:, None] + offsets
+    mask = segment_dt > _PLOT_TIME_EPS
+
+    if not np.any(mask):
+        mask = np.ones_like(segment_dt, dtype=bool)
+
+    return x.reshape(-1), mask.reshape(-1)
+
+
+def _plot_series_xy(sol, value):
+    arr = np.asarray(value, dtype=float)
+
+    if arr.ndim == 1:
+        return _plot_timestep_midpoints(sol, arr.shape[0]), arr
+
+    if arr.ndim == 2:
+        T, H = arr.shape
+        x, mask = _plot_segment_midpoints_and_mask(sol, T, H)
+        return x[mask], arr.reshape(-1)[mask]
+
+    y = arr.reshape(-1)
+    return np.arange(len(y), dtype=float), y
+
+
+def _plot_generator_xy(sol, value):
+    arr = np.asarray(value, dtype=float)
+
+    if arr.ndim == 2:  # [nb_gen, T]
+        return _plot_timestep_midpoints(sol, arr.shape[1]), arr
+
+    if arr.ndim == 3:  # [nb_gen, T, H]
+        nb_gen, T, H = arr.shape
+        x, mask = _plot_segment_midpoints_and_mask(sol, T, H)
+        return x[mask], arr.reshape(nb_gen, -1)[:, mask]
+
+    raise ValueError(f"Generator array must be [nb_gen,T] or [nb_gen,T,H], got {arr.shape}")
+
+
+def _plot_soc_xy(sol, value):
+    y = np.asarray(value, dtype=float).reshape(-1)
+    if y.size <= 1:
+        return np.arange(len(y), dtype=float), y
+
+    return _plot_timestep_boundaries(sol, y.size - 1), y
+
+
+def _plot_set_index_xy(sol, set_idx):
+    y = np.asarray(set_idx, dtype=float).reshape(-1)
+    if y.size <= 1:
+        return np.arange(len(y), dtype=float), y
+
+    return _plot_timestep_boundaries(sol, y.size - 1), y
 
 
 def _set_polygons_from_ineq(set_ineq, eps_poly=1e-9):
@@ -126,11 +224,11 @@ def _set_polygons_from_ineq(set_ineq, eps_poly=1e-9):
 def _draw_feasibility_map(ax, map_obj, alpha=0.35):
     navigability_map = getattr(map_obj, "navigability_map_path", None)
     if navigability_map is None:
-        print("[WARN] map object has no navigability_map_path")
+        log.warning("[WARN] map object has no navigability_map_path")
         return False
 
     if not os.path.exists(navigability_map):
-        print(f"[WARN] navigability map not found: {navigability_map}")
+        log.warning("[WARN] navigability map not found: %s", navigability_map)
         return False
 
     nav = np.load(navigability_map)
@@ -208,7 +306,7 @@ def _plot_solution_map_overlay(
     positions = [_get_solution_positions(sol, T + 1) for sol in solutions]
 
     if not any(pos is not None and pos.shape[0] > 0 for pos in positions):
-        print("[WARN] No valid ship_pos found; skipping solution map overlay.")
+        log.warning("[WARN] No valid ship_pos found; skipping solution map overlay.")
         return
 
     fig, ax = plt.subplots(figsize=(7.2, 6.0), dpi=150)
@@ -277,10 +375,10 @@ def _plot_solution_map_overlay(
 
             Q = np.asarray(crossing_point, dtype=float)
 
-            print("\n[PLOT DEBUG]", label)
-            print("pos shape:", pos.shape)
-            print("crossing_point shape:", Q.shape)
-            print("fixed_path_waypoints is None:", fixed_path_xy is None)
+            log.debug("[PLOT DEBUG] %s", label)
+            log.debug("pos shape: %s", pos.shape)
+            log.debug("crossing_point shape: %s", Q.shape)
+            log.debug("fixed_path_waypoints is None: %s", fixed_path_xy is None)
 
             if (
                 Q.ndim == 2
@@ -451,71 +549,89 @@ def _print_cost_summary_vs_benchmark(solutions, labels, benchmark_label):
 
     costs = np.array([_cost_or_nan(sol) for sol in solutions], dtype=float)
 
-    print("\n" + "=" * 80)
-    print("COST SUMMARY VS BENCHMARK")
-    print("=" * 80)
+    log.verbose("=" * 80)
+    log.verbose("COST SUMMARY VS BENCHMARK")
+    log.verbose("=" * 80)
 
     # Find benchmark
     if benchmark_label not in labels:
-        raise ValueError(
-            f"Benchmark '{benchmark_label}' not found in labels: {labels}"
-        )
+        log.warning("[WARN] Benchmark '%s' not found in labels: %s", benchmark_label, labels)
+        benchmark_idx = None
+        benchmark_cost = np.nan
+    else:
+        benchmark_idx = labels.index(benchmark_label)
+        benchmark_cost = costs[benchmark_idx]
+        if not np.isfinite(benchmark_cost):
+            log.warning(
+                "[WARN] Benchmark '%s' does not have a finite cost; percentage differences are unavailable.",
+                benchmark_label,
+            )
 
-    benchmark_idx = labels.index(benchmark_label)
-    benchmark_cost = costs[benchmark_idx]
-    if not np.isfinite(benchmark_cost):
-        raise ValueError(
-            f"Benchmark '{benchmark_label}' does not have a finite cost."
-        )
-
-    print(f"Benchmark: {benchmark_label}")
-    print("-" * 80)
+    log.verbose("Benchmark: %s", benchmark_label)
+    log.verbose("-" * 80)
+    has_finite_benchmark = np.isfinite(benchmark_cost)
 
     for label, sol, cost in zip(labels, solutions, costs):
 
         solve_time = getattr(sol, "solve_time", np.nan)
         validity_label = "" if getattr(sol, "is_valid", True) else " [INVALID]"
+        fit_warning_label = (
+            " [FIT WARN]"
+            if getattr(sol, "fit_range_warnings", {}) or {}
+            else ""
+        )
+        quality_label = f"{validity_label}{fit_warning_label}"
         status_text = _status_label(sol)
 
         if not np.isfinite(cost):
             solve_text = f"{solve_time:>8.2f} s" if np.isfinite(solve_time) else f"{'N/A':>8s} s"
-            print(
+            log.verbose(
                 f"{label:<35s}: "
                 f"{'N/A':>12s} $          "
                 f"{solve_text}   "
                 f"{status_text:>10s}   "
-                f"{'N/A':>10s}"
+                f"{'N/A':>10s}{fit_warning_label}"
             )
             continue
 
-        if abs(benchmark_cost) < 1e-12:
+        if not has_finite_benchmark or abs(benchmark_cost) < 1e-12:
             percent_diff = np.nan
         else:
             percent_diff = (
                 (cost - benchmark_cost) / benchmark_cost
             ) * 100.0
 
-        delta = cost - benchmark_cost
+        delta = cost - benchmark_cost if has_finite_benchmark else np.nan
 
-        if label == benchmark_label:
-            print(
+        if label == benchmark_label and benchmark_idx is not None:
+            log.verbose(
                 f"{label:<35s}: "
-                f"{cost:>12,.6f} ${validity_label:<10s}"
+                f"{cost:>12,.6f} ${quality_label:<21s}"
                 f"{solve_time:>8.2f} s   "
                 f"{status_text:>24s}   "
                 f"(benchmark)"
             )
         else:
-            print(
+            percent_text = (
+                f"{percent_diff:>10.4f}%"
+                if np.isfinite(percent_diff)
+                else f"{'N/A':>10s}"
+            )
+            delta_text = (
+                f"(Delta = {delta:,.6f} $)"
+                if np.isfinite(delta)
+                else "(Delta = N/A $)"
+            )
+            log.verbose(
                 f"{label:<35s}: "
-                f"{cost:>12,.6f} ${validity_label:<10s}"
+                f"{cost:>12,.6f} ${quality_label:<21s}"
                 f"{solve_time:>8.2f} s   "
                 f"{status_text:>24s}   "
-                f"{percent_diff:>10.4f}%   "
-                f"(Delta = {delta:,.6f} $)"
+                f"{percent_text}   "
+                f"{delta_text}"
             )
 
-    print("=" * 80 + "\n")
+    log.verbose("=" * 80)
 
     def _segment_dt(sol, T, H):
         segment_dt = getattr(sol, "segment_dt_h", None)
@@ -566,9 +682,9 @@ def _print_cost_summary_vs_benchmark(solutions, labels, benchmark_label):
             return float(np.sum(arr * dt[None, :]))
         return _time_weighted_sum(sol, arr)
 
-    print("COMPONENT SUMMARY")
-    print("-" * 80)
-    print(
+    log.verbose("COMPONENT SUMMARY")
+    log.verbose("-" * 80)
+    log.verbose(
         f"{'Label':<35s} "
         f"{'dist km':>10s} "
         f"{'prop MWh':>10s} "
@@ -589,7 +705,7 @@ def _print_cost_summary_vs_benchmark(solutions, labels, benchmark_label):
         final_soc = float(np.asarray(sol.SOC, dtype=float).reshape(-1)[-1])
         total_distance = float(getattr(sol, "total_distance", np.nan))
         ems = str(getattr(sol, "power_management_optimizer", "") or "")
-        print(
+        log.verbose(
             f"{label:<35s} "
             f"{total_distance:>10.3f} "
             f"{prop_energy:>10.3f} "
@@ -599,7 +715,7 @@ def _print_cost_summary_vs_benchmark(solutions, labels, benchmark_label):
             f"{ems:>18s}"
         )
 
-    print("=" * 80 + "\n")
+    log.verbose("=" * 80)
 
 def plot_solutions(
     solutions,
@@ -643,43 +759,6 @@ def plot_solutions(
 
     T = max(int(sol.T_future) for sol in solutions)
 
-    def _uses_two_segments(sol):
-        arr = getattr(sol, "speed_mag", None)
-        if arr is None:
-            return False
-        arr = np.asarray(arr)
-        return arr.ndim == 2 and arr.shape[1] == 2
-
-    force_two_segments = any(_uses_two_segments(sol) for sol in solutions)
-
-    def _to_plot_series(arr):
-        arr = np.asarray(arr, dtype=float)
-
-        if arr.ndim == 1:
-            if force_two_segments:
-                arr = np.repeat(arr[:, None], 2, axis=1)
-            return arr.reshape(-1)
-
-        if arr.ndim == 2:
-            if force_two_segments and arr.shape[1] == 1:
-                arr = np.repeat(arr, 2, axis=1)
-            return arr.reshape(-1)
-
-        return arr.reshape(-1)
-
-    def _to_plot_gen(arr):
-        arr = np.asarray(arr, dtype=float)
-
-        if arr.ndim == 2:  # [nb_gen, T]
-            if force_two_segments:
-                arr = np.repeat(arr[:, :, None], 2, axis=2)
-            return arr.reshape(arr.shape[0], -1)
-
-        if arr.ndim == 3:  # [nb_gen, T, H]
-            return arr.reshape(arr.shape[0], -1)
-
-        raise ValueError(f"Generator array must be [nb_gen,T] or [nb_gen,T,H], got {arr.shape}")
-
     def _plot_attr(attr, title, ylabel, filename):
         fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=150)
 
@@ -687,9 +766,11 @@ def plot_solutions(
             if not hasattr(sol, attr) or getattr(sol, attr) is None:
                 continue
 
-            y = _to_plot_series(getattr(sol, attr))
+            x, y = _plot_series_xy(sol, getattr(sol, attr))
+            if len(y) == 0:
+                continue
             ax.plot(
-                np.arange(len(y)),
+                x,
                 y,
                 "--",
                 linewidth=1.2,
@@ -700,7 +781,7 @@ def plot_solutions(
         ax.legend(frameon=False)
         _finalize_axis(
             ax,
-            xlabel="time index",
+            xlabel="elapsed time [h]",
             ylabel=ylabel,
             title=title,
         )
@@ -751,9 +832,9 @@ def plot_solutions(
     fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=150)
 
     for sol, label in zip(solutions, labels):
-        y = np.asarray(sol.SOC, dtype=float)
+        x, y = _plot_soc_xy(sol, sol.SOC)
         ax.plot(
-            np.arange(len(y)),
+            x,
             y,
             "--",
             linewidth=1.2,
@@ -764,7 +845,7 @@ def plot_solutions(
     ax.legend(frameon=False)
     _finalize_axis(
         ax,
-        xlabel="timestep",
+        xlabel="elapsed time [h]",
         ylabel="SOC [MWh]",
         title="Battery state of charge",
     )
@@ -776,10 +857,12 @@ def plot_solutions(
     fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=150)
 
     for sol, label in zip(solutions, labels):
-        gen_power = _to_plot_gen(sol.generation_power)
+        x, gen_power = _plot_generator_xy(sol, sol.generation_power)
         y = np.sum(gen_power, axis=0)
+        if len(y) == 0:
+            continue
         ax.plot(
-            np.arange(len(y)),
+            x,
             y,
             "--",
             linewidth=1.2,
@@ -790,7 +873,7 @@ def plot_solutions(
     ax.legend(frameon=False)
     _finalize_axis(
         ax,
-        xlabel="time index",
+        xlabel="elapsed time [h]",
         ylabel="total generation power [MW]",
         title="Total generation power",
     )
@@ -802,10 +885,12 @@ def plot_solutions(
     fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=150)
 
     for sol, label in zip(solutions, labels):
-        gen_costs = _to_plot_gen(sol.gen_costs)
+        x, gen_costs = _plot_generator_xy(sol, sol.gen_costs)
         y = np.sum(gen_costs, axis=0)
+        if len(y) == 0:
+            continue
         ax.plot(
-            np.arange(len(y)),
+            x,
             y,
             "--",
             linewidth=1.2,
@@ -816,7 +901,7 @@ def plot_solutions(
     ax.legend(frameon=False)
     _finalize_axis(
         ax,
-        xlabel="time index",
+        xlabel="elapsed time [h]",
         ylabel="total generator cost [$ / h]",
         title="Total generator cost",
     )
@@ -830,34 +915,21 @@ def plot_solutions(
     for sol, label in zip(solutions, labels):
         set_selection = np.asarray(sol.set_selection, dtype=float)
         set_idx = np.argmax(set_selection, axis=1)
-
-        if force_two_segments:
-            set_idx_plot = np.repeat(set_idx[:-1], 2)
-            x = np.arange(len(set_idx_plot))
-            ax.step(
-                x,
-                set_idx_plot,
-                where="post",
-                linestyle="--",
-                linewidth=1.2,
-                alpha=0.8,
-                label=label
-            )
-        else:
-            ax.step(
-                np.arange(len(set_idx)),
-                set_idx,
-                where="post",
-                linestyle="--",
-                linewidth=1.2,
-                alpha=0.8,
-                label=label
-            )
+        x, y = _plot_set_index_xy(sol, set_idx)
+        ax.step(
+            x,
+            y,
+            where="post",
+            linestyle="--",
+            linewidth=1.2,
+            alpha=0.8,
+            label=label
+        )
 
     ax.legend(frameon=False)
     _finalize_axis(
         ax,
-        xlabel="time index",
+        xlabel="elapsed time [h]",
         ylabel="set index",
         title="Selected set",
     )
@@ -920,7 +992,7 @@ def load_solutions_from_pkl(
 
         solutions.append(sol)
 
-    print(f"Loaded {len(solutions)} solution(s) from: {base_dir}")
+    log.verbose("Loaded %d solution(s) from: %s", len(solutions), base_dir)
     return solutions
 
 def plot_weather_snapshot(map, weather, variable="current_x", t_index=0, show: bool = False, output_root=None):

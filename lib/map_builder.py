@@ -18,6 +18,7 @@ from matplotlib.widgets import Button
 from matplotlib.gridspec import GridSpec
 
 from lib.load_params import MapInfo, Ship
+from lib import logging_utils as log
 
 
 # ======================================================================
@@ -1047,7 +1048,7 @@ class MapBuilder:
             _, _, self.depth_grid = grid_from_depth_df(self.depth_df)
             return self.depth_df
         if out_path.exists() and not force:
-            print("[MAP] depth cache does not match map.toml; rebuilding depth_grid.csv")
+            log.progress("[MAP] Starting depth grid rebuild")
 
         ref_lat_sw = float(self.map_info.sw_lat)
         ref_lon_sw = float(self.map_info.sw_lon)
@@ -1146,9 +1147,9 @@ class MapBuilder:
         _, _, self.depth_grid = grid_from_depth_df(df)
         self.depth_rebuilt = True
 
-        print(f"Saved depth grid to {out_path}")
-        print(f"Grid shape: ny={ny}, nx={nx}, resolution={dx_km} km")
-        print(f"GMRT bbox: west={west:.4f}, south={south:.4f}, east={east:.4f}, north={north:.4f}")
+        log.debug("Saved depth grid to %s", out_path)
+        log.debug("Grid shape: ny=%s, nx=%s, resolution=%s km", ny, nx, dx_km)
+        log.debug("GMRT bbox: west=%.4f, south=%.4f, east=%.4f, north=%.4f", west, south, east, north)
 
         return df
 
@@ -1159,7 +1160,7 @@ class MapBuilder:
             self.navigability_map = np.load(out_path)
             return self.navigability_map
         if out_path.exists() and not force:
-            print("[MAP] navigability cache does not match map/ship settings; rebuilding navigability_map.npy")
+            log.progress("[MAP] Starting navigability map rebuild")
 
         if self.depth_df is None:
             self.fetch_or_load_depth(force=False)
@@ -1179,7 +1180,7 @@ class MapBuilder:
         self.depth_grid = Z
         self.navigability_map = nav
 
-        print(f"Saved navigability map to {out_path}")
+        log.debug("Saved navigability map to %s", out_path)
         return nav
 
     def build_set_artifacts(
@@ -1230,11 +1231,11 @@ class MapBuilder:
         self.transition_ineq_from = trans_from
         self.transition_ineq_to = trans_to
 
-        print(f"Saved corners: {self.corners_path}")
-        print(f"Saved sets: {self.sets_path}")
-        print(f"Saved set inequalities: {self.set_ineq_path}")
-        print(f"Saved adjacency: {self.adj_path}")
-        print(f"Saved transition inequalities: {self.transition_ineq_path}")
+        log.debug("Saved corners: %s", self.corners_path)
+        log.debug("Saved sets: %s", self.sets_path)
+        log.debug("Saved set inequalities: %s", self.set_ineq_path)
+        log.debug("Saved adjacency: %s", self.adj_path)
+        log.debug("Saved transition inequalities: %s", self.transition_ineq_path)
 
         return lambda_array, adj, trans_from, trans_to
 
@@ -1259,7 +1260,7 @@ class MapBuilder:
             try:
                 editor.import_from_csv(self.corners_path, self.sets_path)
             except Exception as e:
-                print(f"[WARN] Could not import existing set CSVs: {e}")
+                log.warning("[WARN] Could not import existing set CSVs: %s", e)
 
         plt.show()
         return editor

@@ -18,6 +18,7 @@ import numpy as np
 
 from lib.paths import CACHE, RESULTS, ROOT
 from lib.weather_interpolation import resolve_weather_files_from_toml
+from lib import logging_utils as log
 
 CACHE_FILENAMES = {
     "wind_model_1d": "WindModel1D.pkl",
@@ -52,6 +53,14 @@ class RunContext:
     @property
     def console_log_path(self) -> Path:
         return self.run_dir / "console.log"
+
+    @property
+    def debug_log_path(self) -> Path:
+        return self.run_dir / "debug.log"
+
+    @property
+    def warnings_errors_log_path(self) -> Path:
+        return self.run_dir / "warnings_errors.log"
 
     def cache_path(self, key: str) -> Path:
         return self.cache_dir / CACHE_FILENAMES[key]
@@ -217,6 +226,7 @@ def save_run_results(
         row = summarize_solution(key, label, sol)
         row["solution_file"] = str(Path("solutions") / filename) if save_solutions else ""
         rows.append(row)
+        _log_solution_quality(label, sol)
 
     _write_summary_csv(ctx.run_dir / "summary.csv", rows)
     _write_json(ctx.run_dir / "summary.json", rows)
@@ -235,6 +245,52 @@ def save_run_results(
     return rows
 
 
+def _log_solution_quality(label: str, sol: Any) -> None:
+    for key, rec in _reportable_validation_warnings(
+        getattr(sol, "validation_warnings", {}) or {}
+    ).items():
+        log.warning(
+            "[SOLUTION WARNING] %s: %s: %s count=%s, max_amount=%.6g",
+            label,
+            key,
+            rec.get("message", ""),
+            rec.get("count", 0),
+            float(rec.get("max_amount", 0.0)),
+        )
+
+    for key, rec in (getattr(sol, "fit_range_warnings", {}) or {}).items():
+        log.warning(
+            "[FIT WARNING] %s: %s: %s count=%s, max_amount=%.6g",
+            label,
+            key,
+            rec.get("message", ""),
+            rec.get("count", 0),
+            float(rec.get("max_amount", 0.0)),
+        )
+
+    for key, rec in (getattr(sol, "validation_errors", {}) or {}).items():
+        log.error(
+            "[SOLUTION ERROR] %s: %s: %s count=%s, max_amount=%.6g",
+            label,
+            key,
+            rec.get("message", ""),
+            rec.get("count", 0),
+            float(rec.get("max_amount", 0.0)),
+        )
+
+    failure_reason = getattr(sol, "failure_reason", "") or ""
+    if failure_reason:
+        log.error("[SOLUTION ERROR] %s: failure_reason=%s", label, failure_reason)
+
+
+def _reportable_validation_warnings(warnings: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: rec
+        for key, rec in (warnings or {}).items()
+        if log.validation_warning_is_reportable(key, rec)
+    }
+
+
 def summarize_solution(key: str, label: str, sol: Any) -> dict[str, Any]:
     soc = getattr(sol, "SOC", None)
     final_soc = None
@@ -244,17 +300,24 @@ def summarize_solution(key: str, label: str, sol: Any) -> dict[str, Any]:
             final_soc = float(arr[-1])
 
     validation_errors = getattr(sol, "validation_errors", {}) or {}
-    validation_warnings = getattr(sol, "validation_warnings", {}) or {}
+    validation_warnings = _reportable_validation_warnings(
+        getattr(sol, "validation_warnings", {}) or {}
+    )
     route_validation_errors = getattr(sol, "route_validation_errors", {}) or {}
-    route_validation_warnings = getattr(sol, "route_validation_warnings", {}) or {}
+    route_validation_warnings = _reportable_validation_warnings(
+        getattr(sol, "route_validation_warnings", {}) or {}
+    )
     ems_validation_errors = getattr(sol, "ems_validation_errors", {}) or {}
-    ems_validation_warnings = getattr(sol, "ems_validation_warnings", {}) or {}
+    ems_validation_warnings = _reportable_validation_warnings(
+        getattr(sol, "ems_validation_warnings", {}) or {}
+    )
     pre_redispatch_ems_validation_errors = (
         getattr(sol, "pre_redispatch_ems_validation_errors", {}) or {}
     )
-    pre_redispatch_ems_validation_warnings = (
+    pre_redispatch_ems_validation_warnings = _reportable_validation_warnings(
         getattr(sol, "pre_redispatch_ems_validation_warnings", {}) or {}
     )
+    fit_range_warnings = getattr(sol, "fit_range_warnings", {}) or {}
 
     return {
         "key": key,
@@ -279,6 +342,8 @@ def summarize_solution(key: str, label: str, sol: Any) -> dict[str, Any]:
         "pre_redispatch_ems_validation_warning_count": len(
             pre_redispatch_ems_validation_warnings
         ),
+        "fit_range_warning_count": len(fit_range_warnings),
+        "fit_range_warning_keys": ";".join(sorted(str(k) for k in fit_range_warnings)),
         "solver_status": solution_solver_status(sol),
         "power_management_solver_status": solution_power_management_solver_status(sol),
         "failure_reason": getattr(sol, "failure_reason", "") or "",
@@ -442,6 +507,8 @@ def _write_summary_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "ems_validation_warning_count",
         "pre_redispatch_ems_validation_error_count",
         "pre_redispatch_ems_validation_warning_count",
+        "fit_range_warning_count",
+        "fit_range_warning_keys",
         "solver_status",
         "power_management_solver_status",
         "failure_reason",

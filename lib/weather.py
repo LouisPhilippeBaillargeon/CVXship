@@ -2,6 +2,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from lib import logging_utils as log
 from lib.weather_interpolation import (
     WEATHER_VECTOR_KEYS,
     prepare_nc_interp_source,
@@ -34,7 +35,7 @@ def _resize_points(points: np.ndarray, n_points: int) -> np.ndarray:
 
 
 def _print_weather_average_diagnostics(label: str, std_avg: np.ndarray, worst_abs: np.ndarray):
-    print(f"\n[Weather average diagnostics: {label}]")
+    log.debug("[Weather average diagnostics: %s]", label)
     for i in range(std_avg.shape[0]):
         std_parts = ", ".join(
             f"{name}={std_avg[i, j]:.4g}"
@@ -44,7 +45,7 @@ def _print_weather_average_diagnostics(label: str, std_avg: np.ndarray, worst_ab
             f"{name}={worst_abs[i, j]:.4g}"
             for j, name in enumerate(WEATHER_VECTOR_KEYS)
         )
-        print(f"  {label} {i}: avg_std({std_parts}); worst_abs_diff({worst_parts})")
+        log.debug("  %s %s: avg_std(%s); worst_abs_diff(%s)", label, i, std_parts, worst_parts)
 
 
 def _build_set_weather_from_point_sampler(
@@ -125,7 +126,7 @@ def weather_from_nc_file(map, itinerary, weather_files):
     sources = prepare_nc_interp_source(map, itinerary, weather_files=weather_files)
 
     def print_time_range(name, times):
-        print(f"{name}: {times.min()}  ->  {times.max()}  (n={len(times)})")
+        log.verbose("%s: %s  ->  %s  (n=%d)", name, times.min(), times.max(), len(times))
 
     print_time_range("currents", pd.to_datetime(sources["currents"]["times"]))
     print_time_range("atmo", pd.to_datetime(sources["atmo"]["times"]))

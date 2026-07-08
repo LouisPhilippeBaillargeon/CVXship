@@ -19,6 +19,7 @@ from lib.weather_interpolation import (
     interpolated_weather_at,
     query_time_for_segment,
 )
+from lib import logging_utils as log
 
 
 def _copy_validation_map(store):
@@ -149,6 +150,8 @@ def apply_rule_based_power_balance_interval(
     errors = []
 
     def _event(key, message, amount):
+        if not log.validation_warning_amount_is_reportable(key, amount):
+            return
         events.append((key, message, float(abs(amount))))
 
     def _error(key, message, amount):
@@ -193,13 +196,32 @@ def apply_rule_based_power_balance_interval(
             P_sh - float(P_sh_cmd),
         )
 
+    def _dispatch_bounds_text():
+        gen_items = ", ".join(
+            f"{float(p):.6g}[{float(lo):.6g},{float(hi):.6g}]"
+            for p, lo, hi in zip(P_g, P_g_min_eff, P_g_max_eff)
+        )
+        return (
+            f"dispatch at battery change: gen_sum={float(np.sum(P_g)):.6g} MW, "
+            f"gen_sum_bounds=[{float(np.sum(P_g_min_eff)):.6g},"
+            f"{float(np.sum(P_g_max_eff)):.6g}] MW, "
+            f"gen_units=p[min,max] MW {{{gen_items}}}, "
+            f"shore={P_sh:.6g} MW, shore_bounds=[0,{P_sh_max:.6g}] MW"
+        )
+
+    def _power_balance_battery_event(key, message, amount):
+        if float(abs(amount)) <= log.BATTERY_COMMAND_WARNING_THRESHOLD_MW:
+            return
+        _event(key, f"{message} {_dispatch_bounds_text()}", amount)
+
     cmd_ch = max(0.0, float(P_bat_ch_cmd))
     cmd_dis = max(0.0, float(P_bat_dis_cmd))
-    if cmd_ch > eps and cmd_dis > eps:
+    simultaneous_battery_amount = min(cmd_ch, cmd_dis)
+    if simultaneous_battery_amount > log.BATTERY_SIMULTANEOUS_WARNING_THRESHOLD_MW:
         _event(
             "battery_simultaneous_command_netted",
             "Simultaneous battery charge and discharge commands were netted.",
-            min(cmd_ch, cmd_dis),
+            simultaneous_battery_amount,
         )
 
     if cmd_ch >= cmd_dis:
@@ -262,6 +284,11 @@ def apply_rule_based_power_balance_interval(
 
         if residual > eps:
             delta = min(residual, P_bat_dis)
+            _power_balance_battery_event(
+                "battery_discharge_command_reduced_for_power_balance",
+                "Battery discharge command was reduced during surplus power-balance redispatch.",
+                delta,
+            )
             P_bat_dis -= delta
             residual -= delta
 
@@ -278,6 +305,11 @@ def apply_rule_based_power_balance_interval(
             )
             extra_charge_room = max(0.0, min(charge_power_headroom, charge_soc_headroom))
             delta = min(residual, extra_charge_room)
+            _power_balance_battery_event(
+                "battery_charge_command_increased_for_power_balance",
+                "Battery charge command was increased during surplus power-balance redispatch.",
+                delta,
+            )
             P_bat_ch += delta
             residual -= delta
 
@@ -322,6 +354,11 @@ def apply_rule_based_power_balance_interval(
 
         if missing > eps:
             delta = min(missing, P_bat_ch)
+            _power_balance_battery_event(
+                "battery_charge_command_reduced_for_power_balance",
+                "Battery charge command was reduced during deficit power-balance redispatch.",
+                delta,
+            )
             P_bat_ch -= delta
             missing -= delta
 
@@ -341,6 +378,11 @@ def apply_rule_based_power_balance_interval(
                 min(discharge_power_headroom, discharge_soc_headroom),
             )
             delta = min(missing, extra_discharge_room)
+            _power_balance_battery_event(
+                "battery_discharge_command_increased_for_power_balance",
+                "Battery discharge command was increased during deficit power-balance redispatch.",
+                delta,
+            )
             P_bat_dis += delta
             missing -= delta
 
@@ -398,7 +440,6 @@ def apply_rule_based_power_balance_interval(
 def compute_non_convex_cost_all_timesteps_nc_interpolated(
     runner,
     eps=1e-9,
-    debug=False,
     verbose=False,
     nc_sources=None,
     redispatch_energy=False,
@@ -577,6 +618,34 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
             "speed_limit_mps": float(speed_limit_mps),
         })
 
+    def _add_zero_motion_segments(out, t, pos, label):
+        if uses_two_setpoints:
+            half_dt = 0.5 * float(dt_vec[t])
+            for h_cmd, mid_off in ((0, 0.25 * dt_vec[t]), (1, 0.75 * dt_vec[t])):
+                _add_segment(
+                    out,
+                    t,
+                    half_dt,
+                    0.0,
+                    np.zeros(2),
+                    h_cmd,
+                    pos,
+                    mid_off,
+                    label,
+                )
+        else:
+            _add_segment(
+                out,
+                t,
+                dt_vec[t],
+                0.0,
+                np.zeros(2),
+                0,
+                pos,
+                0.5 * dt_vec[t],
+                label,
+            )
+
     segments_by_t = [[] for _ in range(T)]
 
     if getattr(sol, "path_distance", None) is not None:
@@ -603,7 +672,12 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
             )
 
             if (not mask_sail[t]) or total_d <= eps:
-                _add_segment(segments_by_t, t, dt_vec[t], 0.0, np.zeros(2), 0, P[t, :], 0.5 * dt_vec[t], "port")
+                _add_zero_motion_segments(
+                    segments_by_t,
+                    t,
+                    P[t, :],
+                    "port" if not mask_sail[t] else "zero",
+                )
                 continue
 
             if uses_two_setpoints:
@@ -675,14 +749,14 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
 
         for t in range(T):
             if not mask_sail[t]:
-                _add_segment(segments_by_t, t, dt_vec[t], 0.0, np.zeros(2), 0, P[t, :], 0.5 * dt_vec[t], "port")
+                _add_zero_motion_segments(segments_by_t, t, P[t, :], "port")
                 continue
 
             pieces_geom = [(P[t, :], Q[t, :]), (Q[t, :], P[t + 1, :])]
             dists = [float(np.linalg.norm(b - a)) for a, b in pieces_geom]
             total_d = dists[0] + dists[1]
             if total_d <= eps:
-                _add_segment(segments_by_t, t, dt_vec[t], 0.0, np.zeros(2), 0, P[t, :], 0.5 * dt_vec[t], "zero")
+                _add_zero_motion_segments(segments_by_t, t, P[t, :], "zero")
                 continue
 
             if uses_two_setpoints:
@@ -729,13 +803,13 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
     else:
         for t in range(T):
             if not mask_sail[t]:
-                _add_segment(segments_by_t, t, dt_vec[t], 0.0, np.zeros(2), 0, P[t, :], 0.5 * dt_vec[t], "port")
+                _add_zero_motion_segments(segments_by_t, t, P[t, :], "port")
                 continue
 
             vec = P[t + 1, :] - P[t, :]
             direction, total_d = safe_unit(vec, eps=eps)
             if total_d <= eps:
-                _add_segment(segments_by_t, t, dt_vec[t], 0.0, np.zeros(2), 0, P[t, :], 0.5 * dt_vec[t], "zero")
+                _add_zero_motion_segments(segments_by_t, t, P[t, :], "zero")
                 continue
 
             if uses_two_setpoints:
@@ -824,8 +898,11 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
             key,
             {"message": message, "count": 0, "max_amount": 0.0},
         )
+        amount = float(abs(amount))
         rec["count"] += 1
-        rec["max_amount"] = max(rec["max_amount"], float(abs(amount)))
+        if amount > rec["max_amount"]:
+            rec["message"] = message
+            rec["max_amount"] = amount
 
     def _shore_command_limit(t):
         if mask_sail[t]:
@@ -894,34 +971,56 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
 
                 ua = (1.0 - ship.propulsion.wake_fraction) * speed_rel_water_mag[t, h]
                 res_per_prop = total_resistance[t, h] / ship.propulsion.nb_propellers
-                p_per_prop, n, _feasible, best_pitch[t, h] = propulsion_model.compute_power_from_ua_res(
+                p_per_prop, n, prop_feasible, pitch = propulsion_model.compute_power_from_ua_res(
                     ua,
                     res_per_prop,
                     eval_infeasible=True,
-                    debug=debug,
                 )
+                if (
+                    not prop_feasible
+                    or not np.isfinite(p_per_prop)
+                    or not np.isfinite(n)
+                ):
+                    _record_message(
+                        route_validation_errors,
+                        "propulsion_infeasible",
+                        "Exact propulsion model could not provide finite feasible power for evaluated speed/resistance.",
+                        res_per_prop,
+                    )
+                    p_per_prop = np.nan
+                    n = np.nan
+                    pitch = np.nan
+                best_pitch[t, h] = pitch
                 prop_power[t, h] = ship.propulsion.nb_propellers * p_per_prop
                 n_all[t, h] = float(n)
 
-                if debug and t < 5:
-                    print(
-                        "nc-eval t", t,
-                        "h", h,
-                        "label", segment_record.get("label", ""),
-                        "dt_h", dt_h,
-                        "dist_km", segment_record["distance_km"],
-                        "speed_mag", speed_mag[t, h],
-                        "mid_pos", segment_record["mid_pos"],
-                        "qtime", qtime,
-                        "latlon", (w["lat"], w["lon"]),
-                        "current", current,
-                        "wind", wind_vec,
-                        "prop", prop_power[t, h],
+                if t < 5:
+                    log.debug(
+                        "nc-eval t=%s h=%s label=%s dt_h=%s dist_km=%s "
+                        "speed_mag=%s mid_pos=%s qtime=%s latlon=%s "
+                        "current=%s wind=%s prop=%s",
+                        t,
+                        h,
+                        segment_record.get("label", ""),
+                        dt_h,
+                        segment_record["distance_km"],
+                        speed_mag[t, h],
+                        segment_record["mid_pos"],
+                        qtime,
+                        (w["lat"], w["lon"]),
+                        current,
+                        wind_vec,
+                        prop_power[t, h],
                     )
 
             shore_limit, shore_unit_cost = _shore_command_limit(t)
+            prop_power_for_balance = (
+                float(prop_power[t, h])
+                if np.isfinite(prop_power[t, h])
+                else 0.0
+            )
             balance = apply_rule_based_power_balance_interval(
-                P_prop=prop_power[t, h],
+                P_prop=prop_power_for_balance,
                 P_aux=auxiliary_power[t],
                 P_pv_available=solar_power_available[t, h],
                 P_g_cmd=gen_sched,
@@ -1145,9 +1244,18 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         route_validation_errors,
         ems_validation_errors,
     )
+    propulsion_infeasible = "propulsion_infeasible" in route_validation_errors
+    evaluated_cost = (
+        None
+        if propulsion_infeasible
+        else float(np.sum(total_cost_all) + generator_transition_cost)
+    )
+    failure_reason = getattr(sol, "failure_reason", None)
+    if propulsion_infeasible and not failure_reason:
+        failure_reason = "propulsion_infeasible"
 
     non_conv_sol = Solution(
-        estimated_cost=float(np.sum(total_cost_all) + generator_transition_cost),
+        estimated_cost=evaluated_cost,
         solve_time=sol.solve_time,
         T_future=sol.T_future,
         instant_sail=sol.instant_sail,
@@ -1191,7 +1299,7 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         generator_transition_cost=generator_transition_cost,
         generator_unit_commitment=source_generator_unit_commitment,
         solver_status=getattr(sol, "solver_status", None),
-        failure_reason=getattr(sol, "failure_reason", None),
+        failure_reason=failure_reason,
         is_valid=len(active_validation_errors) == 0,
         validation_warnings=active_validation_warnings,
         validation_errors=active_validation_errors,
@@ -1201,19 +1309,52 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         ems_validation_errors=_copy_validation_map(ems_validation_errors),
         pre_redispatch_ems_validation_warnings={},
         pre_redispatch_ems_validation_errors={},
+        fit_range_warnings=getattr(sol, "fit_range_warnings", {}) or {},
     )
+
+    def _log_propulsion_infeasible_error(source_label, rec):
+        fit_warnings = getattr(non_conv_sol, "fit_range_warnings", {}) or {}
+        propulsion_fit_warning_keys = sorted(
+            str(k)
+            for k in fit_warnings
+            if str(k).startswith("propulsion_")
+        )
+        fit_context = (
+            f" Source optimizer propulsion fit warnings: {', '.join(propulsion_fit_warning_keys)}."
+            if propulsion_fit_warning_keys
+            else ""
+        )
+        log.error(
+            "[PROPULSION ERROR] %s: %s count=%s, max_amount=%.6g.%s",
+            source_label,
+            rec["message"],
+            rec["count"],
+            rec["max_amount"],
+            fit_context,
+        )
 
     if not redispatch_energy:
         source_label = first_stage_optimizer or type(runner).__name__
-        for rec in active_validation_warnings.values():
-            print(
-                f"[EMS WARNING] {source_label}: {rec['message']} "
-                f"count={rec['count']}, max_delta={rec['max_amount']:.6g} MW"
+        for key, rec in active_validation_warnings.items():
+            if not log.validation_warning_is_reportable(key, rec):
+                continue
+            log.warning(
+                "[EMS WARNING] %s: %s count=%s, max_delta=%.6g MW",
+                source_label,
+                rec["message"],
+                rec["count"],
+                rec["max_amount"],
             )
-        for rec in active_validation_errors.values():
-            print(
-                f"[EMS ERROR] {source_label}: {rec['message']} "
-                f"count={rec['count']}, max_shortfall={rec['max_amount']:.6g} MW"
+        for key, rec in active_validation_errors.items():
+            if key == "propulsion_infeasible":
+                _log_propulsion_infeasible_error(source_label, rec)
+                continue
+            log.error(
+                "[EMS ERROR] %s: %s count=%s, max_shortfall=%.6g MW",
+                source_label,
+                rec["message"],
+                rec["count"],
+                rec["max_amount"],
             )
 
     if redispatch_energy:
@@ -1229,6 +1370,63 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         pre_redispatch_ems_validation_errors = _copy_validation_map(
             getattr(non_conv_sol, "ems_validation_errors", {}) or {}
         )
+
+        def _finalize_energy_failure(
+            status,
+            failure_reason,
+            *,
+            ems_validation_errors=None,
+            solve_time=None,
+        ):
+            non_conv_sol.power_management_optimizer = "EnergyOnlyOptimizer"
+            non_conv_sol.power_management_solver_status = str(status or "failed")
+            non_conv_sol.energy_solve_time = solve_time
+            non_conv_sol.estimated_cost = None
+            non_conv_sol.failure_reason = failure_reason
+            non_conv_sol.route_validation_warnings = route_validation_warnings
+            non_conv_sol.route_validation_errors = route_validation_errors
+            non_conv_sol.ems_validation_warnings = {}
+            non_conv_sol.ems_validation_errors = _copy_validation_map(
+                ems_validation_errors or {}
+            )
+            non_conv_sol.pre_redispatch_ems_validation_warnings = (
+                pre_redispatch_ems_validation_warnings
+            )
+            non_conv_sol.pre_redispatch_ems_validation_errors = (
+                pre_redispatch_ems_validation_errors
+            )
+            non_conv_sol.validation_warnings = _copy_validation_map(route_validation_warnings)
+            non_conv_sol.validation_errors = _merge_validation_maps(
+                route_validation_errors,
+                non_conv_sol.ems_validation_errors,
+            )
+            non_conv_sol.is_valid = False
+            return non_conv_sol
+
+        prop_power_values = np.asarray(non_conv_sol.prop_power, dtype=float)
+        route_propulsion_infeasible = (
+            "propulsion_infeasible" in route_validation_errors
+            or not np.all(np.isfinite(prop_power_values))
+        )
+        if route_propulsion_infeasible:
+            route_validation_errors.setdefault(
+                "propulsion_infeasible",
+                {
+                    "message": "Exact propulsion model could not provide finite feasible power for evaluated speed/resistance.",
+                    "count": 1,
+                    "max_amount": 0.0,
+                },
+            )
+            _log_propulsion_infeasible_error(
+                first_stage_optimizer or type(runner).__name__,
+                route_validation_errors["propulsion_infeasible"],
+            )
+            non_conv_sol = _finalize_energy_failure(
+                "not_run_route_infeasible",
+                "energy_redispatch_skipped:propulsion_infeasible",
+            )
+            return n_all, non_conv_sol, segment_dt_h, best_pitch
+
         energy_optimizer = EnergyOnlyOptimizer(
             generator_models=generator_models,
             itinerary=itinerary,
@@ -1239,18 +1437,42 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         solve_kwargs = {
             "evaluated_solution": non_conv_sol,
             "solar_power_available": solar_power_available,
-            "debug": debug,
             "verbose": verbose,
         }
         if energy_solver is not None:
             solve_kwargs["solver"] = energy_solver
 
-        ok = energy_optimizer.optimize(**solve_kwargs)
-        if not ok:
-            raise RuntimeError(
-                "Energy-only redispatch failed for "
-                f"{first_stage_optimizer}; see solver status above."
+        try:
+            ok = energy_optimizer.optimize(**solve_kwargs)
+        except Exception as exc:
+            status = f"exception:{type(exc).__name__}"
+            energy_optimizer.power_management_solver_status = status
+            ok = 0
+            log.error(
+                "Energy-only redispatch raised %s: %s",
+                type(exc).__name__,
+                exc,
             )
+        if not ok:
+            status = (
+                getattr(energy_optimizer, "power_management_solver_status", None)
+                or "failed"
+            )
+            redispatch_errors = {
+                "energy_redispatch_failed": {
+                    "message": "Energy-only redispatch failed; route evaluation was retained as invalid.",
+                    "count": 1,
+                    "max_amount": 0.0,
+                }
+            }
+            non_conv_sol = _finalize_energy_failure(
+                status,
+                f"energy_redispatch_failed:{status}",
+                ems_validation_errors=redispatch_errors,
+                solve_time=getattr(energy_optimizer, "energy_solve_time", None),
+            )
+            return n_all, non_conv_sol, segment_dt_h, best_pitch
+
         non_conv_sol = energy_optimizer.sol
         non_conv_sol.route_validation_warnings = route_validation_warnings
         non_conv_sol.route_validation_errors = route_validation_errors

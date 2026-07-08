@@ -7,6 +7,7 @@ import xarray as xr
 from pyproj import Geod
 from pathlib import Path
 
+from lib import logging_utils as log
 from lib.utils import _halfspace_polygon_4ineq, _ordered_set_corner_ids, _set_edges_from_corner_ids, safe_unit
 
 
@@ -458,7 +459,7 @@ def timestep_mid_times(itinerary, start_index: int = 0, count: int | None = None
 
 
 def _print_average_diagnostics(label: str, entity_ids, avg_std: np.ndarray, worst_abs: np.ndarray):
-    print(f"\n[Weather average diagnostics: {label}]")
+    log.debug("[Weather average diagnostics: %s]", label)
     for row, entity_id in enumerate(entity_ids):
         std_parts = ", ".join(
             f"{name}={avg_std[row, j]:.4g}"
@@ -468,7 +469,13 @@ def _print_average_diagnostics(label: str, entity_ids, avg_std: np.ndarray, wors
             f"{name}={worst_abs[row, j]:.4g}"
             for j, name in enumerate(WEATHER_VECTOR_KEYS)
         )
-        print(f"  {label} {entity_id}: avg_std({std_parts}); worst_abs_diff({worst_parts})")
+        log.debug(
+            "  %s %s: avg_std(%s); worst_abs_diff(%s)",
+            label,
+            entity_id,
+            std_parts,
+            worst_parts,
+        )
 
 
 def _diagnose_weather_averages(label, entity_ids, mean_values, diagnostic_values, print_diagnostics=True):
