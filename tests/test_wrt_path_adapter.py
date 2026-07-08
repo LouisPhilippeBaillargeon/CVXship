@@ -6,7 +6,7 @@ import pytest
 
 from lib.load_params import load_itinerary, load_map, load_states
 from lib.optimizers import SavedPath, ShortestPath, WeatherRoutingToolPath
-from lib.wrt_adapter import parse_wrt_route_geojson, split_polyline_by_map_sets
+from lib.wrt_adapter import _latlon_route_bounds, parse_wrt_route_geojson, split_polyline_by_map_sets
 from lib.weather_interpolation import xy_km_to_latlon
 from lib.utils import dx_dy_km
 
@@ -114,6 +114,29 @@ def test_split_wrt_polyline_allows_small_boundary_projection_drift():
 
     np.testing.assert_allclose(refined, waypoints)
     assert set_sequence == [0]
+
+
+def test_wrt_default_map_uses_full_cvx_map_extent():
+    map_obj = load_map(Path("cases/halifax-grande-entree"))
+    itinerary = load_itinerary(map_obj, Path("cases/halifax-grande-entree"))
+    states = load_states(map_obj, itinerary)
+    end_x, end_y, _ = dx_dy_km(
+        map_obj,
+        itinerary.transits[-1].lat,
+        itinerary.transits[-1].lon,
+    )
+
+    bounds = _latlon_route_bounds(
+        map_obj,
+        np.array([states.current_x_pos, states.current_y_pos], dtype=float),
+        np.array([end_x, end_y], dtype=float),
+        margin_deg=0.0,
+    )
+
+    assert bounds[0] < 43.6
+    assert bounds[1] <= -64.0
+    assert bounds[2] > 47.7
+    assert bounds[3] > -58.0
 
 
 def test_weather_routing_tool_path_accepts_precomputed_geojson(tmp_path):

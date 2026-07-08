@@ -93,6 +93,34 @@ def _latlon_route_bounds(map_obj, start_xy, end_xy, margin_deg: float) -> list[f
     end_latlon = xy_km_to_latlon(map_obj, end_xy[0], end_xy[1])
     lats = [start_latlon[0], end_latlon[0]]
     lons = [start_latlon[1], end_latlon[1]]
+
+    info = getattr(map_obj, "info", None)
+    if all(
+        hasattr(info, name)
+        for name in ("sw_lat", "sw_lon", "span_km_east", "span_km_north")
+    ):
+        lower_lats = [float(getattr(info, "sw_lat")), start_latlon[0], end_latlon[0]]
+        lower_lons = [float(getattr(info, "sw_lon")), start_latlon[1], end_latlon[1]]
+        upper_lats = list(lower_lats)
+        upper_lons = list(lower_lons)
+        span_east = float(getattr(info, "span_km_east"))
+        span_north = float(getattr(info, "span_km_north"))
+        for x, y in (
+            (span_east, 0.0),
+            (0.0, span_north),
+            (span_east, span_north),
+        ):
+            lat, lon = xy_km_to_latlon(map_obj, x, y)
+            upper_lats.append(lat)
+            upper_lons.append(lon)
+
+        return [
+            float(min(lower_lats)),
+            float(min(lower_lons)),
+            float(max(upper_lats)),
+            float(max(upper_lons)),
+        ]
+
     return [
         float(min(lats) - margin_deg),
         float(min(lons) - margin_deg),
