@@ -1,0 +1,19 @@
+name = "halifax-grande-entree"
+description = "Halifax to Grande-Entree route case."
+
+[run]
+dimensions = "both"
+new_ship = true
+new_weather = true
+solver_verbose = false
+unit_commitment = false
+ordered_sets = true
+
+[cache]
+scope = "case"
+
+[outputs]
+save_plots = true
+show_plots = false
+save_solutions = true
+save_console_log = true

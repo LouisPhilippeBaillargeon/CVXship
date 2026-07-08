@@ -7,7 +7,7 @@ from pathlib import Path
 
 from lib.load_params import MapInfo, load_ship
 from lib.map_builder import MapBuilder
-from lib.paths import CONFIG
+from lib import logging_utils as log
 
 
 def _normalize_argv(argv: list[str]) -> list[str]:
@@ -35,7 +35,7 @@ def _parse_args(argv: list[str] | None = None):
         "--cases",
         dest="case",
         type=Path,
-        help="Case directory containing map.toml and ship.toml. Defaults to cases/baseline.",
+        help="Case directory containing map.toml and ship.toml.",
     )
     parser.add_argument(
         "--force-depth",
@@ -50,12 +50,14 @@ def _parse_args(argv: list[str] | None = None):
     parser.add_argument(
         "--no-import-existing",
         action="store_true",
-        help="Open the zone editor without importing existing corners.csv/zones.csv.",
+        help="Open the set editor without importing existing corners.csv/sets.csv.",
     )
     args = parser.parse_args(_normalize_argv(sys.argv[1:] if argv is None else argv))
     if args.case is not None and args.case_path is not None:
         parser.error("provide the case directory either positionally or with --case, not both")
-    args.case = args.case or args.case_path or CONFIG
+    if args.case is None and args.case_path is None:
+        parser.error("provide a case directory with --case or as a positional argument")
+    args.case = args.case or args.case_path
     del args.case_path
     return args
 
@@ -79,6 +81,12 @@ def main():
     map_info = MapInfo(**data["params"])
     ship = load_ship(case_dir=case_dir)
     map_dir.mkdir(parents=True, exist_ok=True)
+    log.configure_run_logging(
+        debug_log_path=map_dir / "debug.log",
+        warnings_errors_log_path=map_dir / "warnings_errors.log",
+        console_log_path=map_dir / "console.log",
+        console_verbose=False,
+    )
 
     builder = MapBuilder(
         map_info=map_info,
@@ -86,12 +94,16 @@ def main():
         map_dir=map_dir,
     )
 
-    print(f"[MAP] case={case_dir}")
-    print(f"[MAP] artifacts={map_dir}")
+    log.progress("[MAP] Starting map build")
+    log.progress("[MAP] case=%s", case_dir)
+    log.progress("[MAP] artifacts=%s", map_dir)
 
-    builder.fetch_or_load_depth(force=args.force_depth)
-    builder.build_or_load_navigability(force=args.force_nav or builder.depth_rebuilt)
-    builder.launch_zone_editor(import_existing=not args.no_import_existing)
+    try:
+        builder.fetch_or_load_depth(force=args.force_depth)
+        builder.build_or_load_navigability(force=args.force_nav or builder.depth_rebuilt)
+        builder.launch_set_editor(import_existing=not args.no_import_existing)
+    finally:
+        log.shutdown_run_logging()
 
 
 if __name__ == "__main__":

@@ -6,9 +6,9 @@ import tomllib
 import math
 from pathlib import Path
 
-from lib.utils import build_variable_timestep_grid, dx_dy_km, point_in_zones
-from lib.paths import SHIP, MAP_TOML, ITINERARY, ZONE_INEQ, TRANSITION_INEQ, ADJ, NAVIGABILITY_MAP, CORNERS, ZONES
+from lib.utils import build_variable_timestep_grid, dx_dy_km, point_in_sets
 from lib.weather import weather_from_nc_file
+from lib.weather_interpolation import resolve_weather_files_from_toml
 
 #===================================================SHIP======================================================================================
 @dataclass
@@ -27,42 +27,20 @@ class Propulsion:
 @dataclass
 class Hull:
     B: float               # Beam length (m)
-    L: float               # Total ship length (m)
-    LPP: float             # Length between perpendiculars (m)
     LWL: float             # Length at waterline (m)
 
     CB: float              # Block coefficient (-)
-    CM: float              # Midship section coefficient (-)
-    CWP: float             # Waterplane area coefficient (-)
-
-    kyy: float             # Non-dimensional radius of gyration in pitch, fraction of LPP (-)
 
     T: float               # Draught at midship (m)
-    TF: float              # Draught at forward perpendicular (m)
-    TA: float              # Draught at aft perpendicular (m)
-
-    E1: float              # Waterline entrance angle (rad)
-    E2: float              # Additional hull angle parameter (rad)
 
     AL_air: float          # Side projected area above water (m^2)
     AF_air: float          # Front projected area above water (m^2)
-    AF_water: float        # Front projected area below water (m^2)
-    AL_water: float        # Side projected area below water (m^2)
     total_wet_area: float  # Wetted hull area (m^2)
-
-    sL: float              # xb coordinate of centroid of AL_water in body frame (m)
-    sH: float              # yb coordinate of centroid of AL_water in body frame (m)
 
     CDt: float             # Blendermann wind coefficient
     CDlAF_bow: float       # Blendermann wind coefficient
     CDlAF_stern: float     # Blendermann wind coefficient
     delta: float           # Blendermann wind coefficient
-    kappa: float           # Blendermann wind coefficient
-
-    AT: float              # Immersed transom area at rest (m^2), Holtrop
-    ABT: float             # Transverse bulb area at still-water plane (m^2), Holtrop
-    h_B: float             # Vertical position of bulb-area center above keel (m), Holtrop
-    LCB_percent: float     # LCB forward of 0.5*LWL, as % of LWL, Holtrop
 
 @dataclass
 class Generator:
@@ -85,20 +63,15 @@ class Battery:
     leak            : float
 
 @dataclass
-class SolarPannels:
+class SolarPanels:
     area            : float
     efficiency      : float
-    alpha_t        : float
-    NOCT            : float
 
 @dataclass
 class ShipInfo:
     max_speed       : float
-    weight          : float
     rho_water       : float
-    displacement	: float
     rho_air         : float
-    g               : float
     min_depth       : float
 
 @dataclass
@@ -108,22 +81,24 @@ class Ship:
     info            : ShipInfo
     generators      : List[Generator]
     battery         : Battery
-    solarPannels    : SolarPannels
+    solarPanels     : SolarPanels
 
-def _case_file(case_dir, filename, default_path):
+def _case_dir(case_dir):
     if case_dir is None:
-        return Path(default_path)
-    return Path(case_dir).resolve() / filename
+        raise ValueError("case_dir is required. Pass a named case directory with --case.")
+    return Path(case_dir).resolve()
 
 
-def _case_map_file(case_dir, filename, default_path):
-    if case_dir is None:
-        return Path(default_path)
-    return Path(case_dir).resolve() / "map" / filename
+def _case_file(case_dir, filename):
+    return _case_dir(case_dir) / filename
+
+
+def _case_map_file(case_dir, filename):
+    return _case_dir(case_dir) / "map" / filename
 
 
 def load_ship(case_dir=None) -> Ship:
-    with open(_case_file(case_dir, "ship.toml", SHIP), "rb") as f:
+    with open(_case_file(case_dir, "ship.toml"), "rb") as f:
         data = tomllib.load(f)
 
     propulsion = Propulsion(**data["propulsion"])
@@ -131,7 +106,7 @@ def load_ship(case_dir=None) -> Ship:
     info = ShipInfo(**data["info"])
 
     battery = Battery(**data["battery"])
-    solarPannels = SolarPannels(**data["solarPannels"])
+    solarPanels = SolarPanels(**data["solarPanels"])
 
     generators: List[Generator] = []
     for g in data.get("generators", []):
@@ -191,7 +166,7 @@ def load_ship(case_dir=None) -> Ship:
         propulsion=propulsion,
         info=info,
         battery = battery,
-        solarPannels = solarPannels,
+        solarPanels = solarPanels,
         generators=generators,
     )
 
@@ -208,25 +183,25 @@ class MapInfo:
 @dataclass
 class Map:
     info            : MapInfo
-    zone_ineq       : np.ndarray
+    set_ineq       : np.ndarray
     trans_ineq_from : np.ndarray
     trans_ineq_to   : np.ndarray
-    zone_adj        : np.ndarray
-    nb_zones        : float
+    set_adj        : np.ndarray
+    nb_sets        : float
     speed_limit_bands: List[dict] = field(default_factory=list)
     navigability_map_path: Path | None = None
     corners_path: Path | None = None
-    zone_corners_path: Path | None = None
-    zone_centroids  : np.ndarray = field(init=False)
+    set_corners_path: Path | None = None
+    set_centroids  : np.ndarray = field(init=False)
 
-def _compute_zone_centroids(info: MapInfo, zone_ineq: np.ndarray) -> np.ndarray:
+def _compute_set_centroids(info: MapInfo, set_ineq: np.ndarray) -> np.ndarray:
     """
-    Compute a simple centroid (in km) for each convex zone defined by zone_ineq.
+    Compute a simple centroid (in km) for each convex set defined by set_ineq.
 
-    We sample a regular grid over the map in km, assign grid points to zones
-    using the inequalities, and take the mean (x, y) of the points in each zone.
+    We sample a regular grid over the map in km, assign grid points to sets
+    using the inequalities, and take the mean (x, y) of the points in each set.
     """
-    nb_zones = zone_ineq.shape[2]
+    nb_sets = set_ineq.shape[2]
 
     dx = info.resolution_km
     dy = info.resolution_km
@@ -237,17 +212,17 @@ def _compute_zone_centroids(info: MapInfo, zone_ineq: np.ndarray) -> np.ndarray:
 
     X, Y = np.meshgrid(xs, ys)  # shapes (Ny, Nx)
 
-    # zone_ineq: shape (3, 4, nb_zones)
-    #   zone_ineq[0, j, z] = coeff on y
-    #   zone_ineq[1, j, z] = coeff on x
-    #   zone_ineq[2, j, z] = constant term
-    A_y = zone_ineq[0, :, :]  # (4, nb_zones)
-    A_x = zone_ineq[1, :, :]
-    A_c = zone_ineq[2, :, :]
+    # set_ineq: shape (3, 4, nb_sets)
+    #   set_ineq[0, j, z] = coeff on y
+    #   set_ineq[1, j, z] = coeff on x
+    #   set_ineq[2, j, z] = constant term
+    A_y = set_ineq[0, :, :]  # (4, nb_sets)
+    A_x = set_ineq[1, :, :]
+    A_c = set_ineq[2, :, :]
 
-    centroids = np.zeros((nb_zones, 2), dtype=float)
+    centroids = np.zeros((nb_sets, 2), dtype=float)
 
-    for z in range(nb_zones):
+    for z in range(nb_sets):
         # Broadcast inequalities over the grid
         vals = (
             A_y[:, z][:, None, None] * Y +
@@ -261,7 +236,7 @@ def _compute_zone_centroids(info: MapInfo, zone_ineq: np.ndarray) -> np.ndarray:
             x_mean = X[inside].mean()
             y_mean = Y[inside].mean()
         else:
-            # Fallback: map center (very rare if zones are well aligned)
+            # Fallback: map center (very rare if sets are well aligned)
             x_mean = info.span_km_east / 2.0
             y_mean = info.span_km_north / 2.0
 
@@ -278,18 +253,18 @@ def _single_value(raw, keys):
     return None
 
 
-def _load_speed_limit_bands(data, nb_zones: int) -> List[dict]:
+def _load_speed_limit_bands(data, nb_sets: int) -> List[dict]:
     """
-    Parse optional zone speed limits from map.toml.
+    Parse optional set speed limits from map.toml.
 
     Supported format:
       [[speed_limit]]
-      zone = 3
+      set = 3
       speed = 10.0
       until = "2024-03-21T18:00"
 
       [[speed_limit]]
-      zones = [3, 4]
+      sets = [3, 4]
       speed = 5.0
       from = "2024-03-21T18:00"
       until = "2024-03-22T18:00"
@@ -300,23 +275,23 @@ def _load_speed_limit_bands(data, nb_zones: int) -> List[dict]:
         if speed is None:
             raise ValueError(f"speed_limit[{i}] must define speed in m/s.")
 
-        zone_value = _single_value(
+        set_value = _single_value(
             raw,
-            ("zone", "zone_index", "set", "set_index", "zones", "sets", "indices"),
+            ("set", "set_index", "sets", "indices"),
         )
-        if zone_value is None:
-            raise ValueError(f"speed_limit[{i}] must define a zone/set index.")
+        if set_value is None:
+            raise ValueError(f"speed_limit[{i}] must define a set index.")
 
-        if isinstance(zone_value, list):
-            zones = [int(z) for z in zone_value]
+        if isinstance(set_value, list):
+            sets = [int(z) for z in set_value]
         else:
-            zones = [int(zone_value)]
+            sets = [int(set_value)]
 
-        for z in zones:
-            if z < 0 or z >= nb_zones:
+        for z in sets:
+            if z < 0 or z >= nb_sets:
                 raise ValueError(
-                    f"speed_limit[{i}] references zone {z}, "
-                    f"but valid zone indices are 0..{nb_zones - 1}."
+                    f"speed_limit[{i}] references set {z}, "
+                    f"but valid set indices are 0..{nb_sets - 1}."
                 )
 
         start_raw = _single_value(raw, ("from", "start", "start_datetime"))
@@ -331,7 +306,7 @@ def _load_speed_limit_bands(data, nb_zones: int) -> List[dict]:
             raise ValueError(f"speed_limit[{i}] speed must be > 0 m/s.")
 
         bands.append({
-            "zones": zones,
+            "sets": sets,
             "start": start,
             "end": end,
             "speed": speed,
@@ -341,35 +316,35 @@ def _load_speed_limit_bands(data, nb_zones: int) -> List[dict]:
 
 
 def load_map(case_dir=None) -> Map:
-    with open(_case_file(case_dir, "map.toml", MAP_TOML), "rb") as f:
+    with open(_case_file(case_dir, "map.toml"), "rb") as f:
         toml_data = tomllib.load(f)
 
     info = MapInfo(**toml_data["params"])
 
-    zone_data = np.load(_case_map_file(case_dir, "zones_ineq.npz", ZONE_INEQ))
-    zone_ineq = zone_data["lambda_array"]
-    nb_zones = zone_ineq.shape[2]
+    set_data = np.load(_case_map_file(case_dir, "sets_ineq.npz"))
+    set_ineq = set_data["lambda_array"]
+    nb_sets = set_ineq.shape[2]
 
-    zone_adj = np.load(_case_map_file(case_dir, "zones_adj.npy", ADJ))
+    set_adj = np.load(_case_map_file(case_dir, "sets_adj.npy"))
 
-    trans_data = np.load(_case_map_file(case_dir, "transition_ineq.npz", TRANSITION_INEQ))
+    trans_data = np.load(_case_map_file(case_dir, "transition_ineq.npz"))
     trans_from = np.nan_to_num(trans_data["transition_ineqs_from"], nan=0.0)
     trans_to = np.nan_to_num(trans_data["transition_ineqs_to"], nan=0.0)
-    speed_limit_bands = _load_speed_limit_bands(toml_data, nb_zones)
+    speed_limit_bands = _load_speed_limit_bands(toml_data, nb_sets)
 
     m = Map(
         info=info,
-        zone_ineq=zone_ineq,
+        set_ineq=set_ineq,
         trans_ineq_from=trans_from,
         trans_ineq_to=trans_to,
-        zone_adj=zone_adj,
-        nb_zones=nb_zones,
+        set_adj=set_adj,
+        nb_sets=nb_sets,
         speed_limit_bands=speed_limit_bands,
-        navigability_map_path=_case_map_file(case_dir, "navigability_map.npy", NAVIGABILITY_MAP),
-        corners_path=_case_map_file(case_dir, "corners.csv", CORNERS),
-        zone_corners_path=_case_map_file(case_dir, "zones.csv", ZONES),
+        navigability_map_path=_case_map_file(case_dir, "navigability_map.npy"),
+        corners_path=_case_map_file(case_dir, "corners.csv"),
+        set_corners_path=_case_map_file(case_dir, "sets.csv"),
     )
-    m.zone_centroids = _compute_zone_centroids(m.info, m.zone_ineq)
+    m.set_centroids = _compute_set_centroids(m.info, m.set_ineq)
     return m
 
 #===================================================ITINERARY======================================================================================
@@ -429,7 +404,7 @@ def _load_auxiliary_load_bands(data, itinerary_start, itinerary_end):
     previous_end = pd.to_datetime(itinerary_start)
     horizon_end = pd.to_datetime(itinerary_end)
 
-    raw_bands = data.get("auxiliary_load", data.get("auxilary_load", []))
+    raw_bands = data.get("auxiliary_load", [])
 
     for i, raw in enumerate(raw_bands):
         if "power" not in raw:
@@ -475,7 +450,7 @@ def _compute_auxiliary_power_profile(itinerary):
 
 
 def load_itinerary(map, case_dir=None) -> Itinerary:
-    with open(_case_file(case_dir, "itinerary.toml", ITINERARY), "rb") as f:
+    with open(_case_file(case_dir, "itinerary.toml"), "rb") as f:
         data = tomllib.load(f)
     params = data.get("params", {})
     soc_i=params["soc_i"]
@@ -547,20 +522,20 @@ class States:
     current_y_pos      : float
     current_speed      : float
     soc                : float
-    zone               : float
+    set_selection      : float
     current_heading    : float
     current_d          : float = 0
 
 def load_states(map, itinerary) -> States:
     current_x_pos, current_y_pos, _ = dx_dy_km(map, itinerary.transits[0].lat, itinerary.transits[0].lon)
-    zone = point_in_zones(np.array([current_x_pos,current_y_pos]), map.zone_ineq)
+    set_selection = point_in_sets(np.array([current_x_pos,current_y_pos]), map.set_ineq)
     return States(
         timesteps_completed = 0,
         current_x_pos = current_x_pos,
         current_y_pos = current_y_pos,
         current_speed = itinerary.init_speed,
         soc = itinerary.soc_i,
-        zone = zone,
+        set_selection = set_selection,
         current_heading = 0,
     )
 
@@ -570,5 +545,7 @@ def load_config(case_dir=None, weather_files=None):
     itinerary = load_itinerary(map, case_dir=case_dir)
     states = load_states(map, itinerary)
     ship = load_ship(case_dir=case_dir)
+    if weather_files is None:
+        weather_files = resolve_weather_files_from_toml(case_dir)
     weather = weather_from_nc_file(map, itinerary, weather_files=weather_files)
     return map, itinerary, states, ship, weather

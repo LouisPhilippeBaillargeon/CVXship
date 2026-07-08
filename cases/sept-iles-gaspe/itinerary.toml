@@ -19,23 +19,19 @@ init_speed          = 0
 # until              : Optional end datetime. Omit on the last band to use it for the rest of the trip.
 # from/start_datetime: Optional explicit start datetime. If omitted, bands are contiguous in file order.
 # ============================
-# [[auxiliary_load]]
-# power              = 1.0
-# until              = "2024-03-21T18:00"
-#
-# [[auxiliary_load]]
-# power              = 0.8
-# until              = "2024-03-22T18:00"
-#
-# [[auxiliary_load]]
-# power              = 1.1
+[[auxiliary_load]]
+power = 0.1
+until = "2025-06-01T10:00"
+
+[[auxiliary_load]]
+power = 0.11
 
 # ============================
 # List of transit cities considered in the problem
 #city                : Name
 #arrival_datetime    : "YYYY-MM-DDTHH:MM" in the UTC timezone
 #departure_datetime  : "YYYY-MM-DDTHH:MM" in the UTC timezone
-#lat                 : lattitude
+#lat                 : latitude
 #lon                 : longitude
 #power_cost          : ($/MWh)
 # ============================
@@ -57,13 +53,4 @@ lon                 = -64.148466
 power_cost          = 36.81
 max_charge_power    = 5
 # ============================
-[[auxiliary_load]]
-power = 0.1
-until = "2024-03-21T18:00"
 
-[[auxiliary_load]]
-power = 0.08
-until = "2024-03-22T18:00"
-
-[[auxiliary_load]]
-power = 0.11

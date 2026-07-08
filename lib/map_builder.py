@@ -18,15 +18,7 @@ from matplotlib.widgets import Button
 from matplotlib.gridspec import GridSpec
 
 from lib.load_params import MapInfo, Ship
-from lib.paths import (
-    DEPTH_GRID,
-    NAVIGABILITY_MAP,
-    CORNERS,
-    ZONES,
-    ZONE_INEQ,
-    TRANSITION_INEQ,
-    ADJ,
-)
+from lib import logging_utils as log
 
 
 # ======================================================================
@@ -82,72 +74,72 @@ def order_polygon_points(pts):
 
 
 # ======================================================================
-# Zone artifact builders
+# Set artifact builders
 # ======================================================================
 
-def validate_zero_based_zone_tables(corners_df: pd.DataFrame, zones_df: pd.DataFrame):
+def validate_zero_based_set_tables(corners_df: pd.DataFrame, sets_df: pd.DataFrame):
     required_c = {"corner_id", "x", "y"}
-    required_z = {"zone_id", "order", "corner_id"}
+    required_z = {"set_id", "order", "corner_id"}
 
     if not required_c.issubset(corners_df.columns):
         raise ValueError(f"corners_df missing columns: {required_c - set(corners_df.columns)}")
-    if not required_z.issubset(zones_df.columns):
-        raise ValueError(f"zones_df missing columns: {required_z - set(zones_df.columns)}")
+    if not required_z.issubset(sets_df.columns):
+        raise ValueError(f"sets_df missing columns: {required_z - set(sets_df.columns)}")
 
     corners_df["corner_id"] = corners_df["corner_id"].astype(int)
-    zones_df[["zone_id", "order", "corner_id"]] = zones_df[
-        ["zone_id", "order", "corner_id"]
+    sets_df[["set_id", "order", "corner_id"]] = sets_df[
+        ["set_id", "order", "corner_id"]
     ].astype(int)
 
-    zone_ids = sorted(zones_df["zone_id"].unique())
-    if zone_ids != list(range(len(zone_ids))):
-        raise ValueError(f"zone_id must be contiguous zero-based IDs. Got {zone_ids}")
+    set_ids = sorted(sets_df["set_id"].unique())
+    if set_ids != list(range(len(set_ids))):
+        raise ValueError(f"set_id must be contiguous zero-based IDs. Got {set_ids}")
 
     corner_ids = sorted(corners_df["corner_id"].unique())
     if corner_ids != list(range(len(corner_ids))):
         raise ValueError(f"corner_id must be contiguous zero-based IDs. Got {corner_ids}")
 
-    for zid, group in zones_df.groupby("zone_id"):
+    for zid, group in sets_df.groupby("set_id"):
         orders = sorted(group["order"].astype(int).tolist())
         if orders != [0, 1, 2, 3]:
-            raise ValueError(f"Zone {zid} must have orders [0,1,2,3]. Got {orders}")
+            raise ValueError(f"Set {zid} must have orders [0,1,2,3]. Got {orders}")
 
 
-def normalize_zero_based_zone_tables(
+def normalize_zero_based_set_tables(
     corners_df: pd.DataFrame,
-    zones_df: pd.DataFrame,
+    sets_df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     required_c = {"corner_id", "x", "y"}
-    required_z = {"zone_id", "order", "corner_id"}
+    required_z = {"set_id", "order", "corner_id"}
 
     if not required_c.issubset(corners_df.columns):
         raise ValueError(f"corners_df missing columns: {required_c - set(corners_df.columns)}")
-    if not required_z.issubset(zones_df.columns):
-        raise ValueError(f"zones_df missing columns: {required_z - set(zones_df.columns)}")
+    if not required_z.issubset(sets_df.columns):
+        raise ValueError(f"sets_df missing columns: {required_z - set(sets_df.columns)}")
 
     df_corners = corners_df.copy()
-    df_zones = zones_df.copy()
+    df_sets = sets_df.copy()
 
     df_corners["corner_id"] = df_corners["corner_id"].astype(int)
-    df_zones[["zone_id", "order", "corner_id"]] = df_zones[
-        ["zone_id", "order", "corner_id"]
+    df_sets[["set_id", "order", "corner_id"]] = df_sets[
+        ["set_id", "order", "corner_id"]
     ].astype(int)
 
-    if df_zones.empty:
+    if df_sets.empty:
         return (
             df_corners.iloc[0:0][["corner_id", "x", "y"]].copy(),
-            df_zones[["zone_id", "order", "corner_id"]].copy(),
+            df_sets[["set_id", "order", "corner_id"]].copy(),
         )
 
     corners_by_id = df_corners.drop_duplicates("corner_id", keep="first").set_index("corner_id")
-    referenced_corner_ids = sorted(df_zones["corner_id"].unique())
+    referenced_corner_ids = sorted(df_sets["corner_id"].unique())
     missing = [cid for cid in referenced_corner_ids if cid not in corners_by_id.index]
     if missing:
-        raise ValueError(f"zones_df references missing corner_id values: {missing}")
+        raise ValueError(f"sets_df references missing corner_id values: {missing}")
 
-    zone_id_map = {
+    set_id_map = {
         old_id: new_id
-        for new_id, old_id in enumerate(sorted(df_zones["zone_id"].unique()))
+        for new_id, old_id in enumerate(sorted(df_sets["set_id"].unique()))
     }
     corner_id_map = {
         old_id: new_id
@@ -157,20 +149,20 @@ def normalize_zero_based_zone_tables(
     normalized_corners = corners_by_id.loc[referenced_corner_ids, ["x", "y"]].reset_index(drop=True)
     normalized_corners.insert(0, "corner_id", range(len(normalized_corners)))
 
-    normalized_zones = df_zones[["zone_id", "order", "corner_id"]].copy()
-    normalized_zones["zone_id"] = normalized_zones["zone_id"].map(zone_id_map).astype(int)
-    normalized_zones["corner_id"] = normalized_zones["corner_id"].map(corner_id_map).astype(int)
-    normalized_zones = normalized_zones.sort_values(["zone_id", "order"], ignore_index=True)
+    normalized_sets = df_sets[["set_id", "order", "corner_id"]].copy()
+    normalized_sets["set_id"] = normalized_sets["set_id"].map(set_id_map).astype(int)
+    normalized_sets["corner_id"] = normalized_sets["corner_id"].map(corner_id_map).astype(int)
+    normalized_sets = normalized_sets.sort_values(["set_id", "order"], ignore_index=True)
 
-    return normalized_corners, normalized_zones
+    return normalized_corners, normalized_sets
 
 
-def get_zone_ccw_corner_ids(zid: int, zones_df: pd.DataFrame, corners_df: pd.DataFrame):
-    sub = zones_df[zones_df["zone_id"] == zid].copy()
+def get_set_ccw_corner_ids(zid: int, sets_df: pd.DataFrame, corners_df: pd.DataFrame):
+    sub = sets_df[sets_df["set_id"] == zid].copy()
     sub = sub.set_index("order").sort_index()
 
     if set(sub.index.tolist()) != {0, 1, 2, 3}:
-        raise ValueError(f"Zone {zid} must have orders 0..3 exactly.")
+        raise ValueError(f"Set {zid} must have orders 0..3 exactly.")
 
     cids = [int(sub.loc[o, "corner_id"]) for o in [0, 1, 2, 3]]
 
@@ -185,19 +177,19 @@ def get_zone_ccw_corner_ids(zid: int, zones_df: pd.DataFrame, corners_df: pd.Dat
 
 def compute_lambda_array_zero_based(
     corners_df: pd.DataFrame,
-    zones_df: pd.DataFrame,
+    sets_df: pd.DataFrame,
     normalize: bool = True,
 ) -> np.ndarray:
-    validate_zero_based_zone_tables(corners_df, zones_df)
+    validate_zero_based_set_tables(corners_df, sets_df)
 
     corner_map = corners_df.set_index("corner_id")[["x", "y"]].to_dict(orient="index")
-    zone_ids = sorted(zones_df["zone_id"].unique())
-    Z = len(zone_ids)
+    set_ids = sorted(sets_df["set_id"].unique())
+    Z = len(set_ids)
 
     lambda_array = np.zeros((3, 4, Z), dtype=float)
 
-    for z in zone_ids:
-        cids = get_zone_ccw_corner_ids(z, zones_df, corners_df)
+    for z in set_ids:
+        cids = get_set_ccw_corner_ids(z, sets_df, corners_df)
         pts = np.array(
             [(float(corner_map[cid]["x"]), float(corner_map[cid]["y"])) for cid in cids],
             dtype=float,
@@ -233,32 +225,32 @@ def compute_lambda_array_zero_based(
     return lambda_array
 
 
-def build_adjacency_zero_based(zones_df: pd.DataFrame) -> np.ndarray:
-    zone_ids = sorted(zones_df["zone_id"].unique())
-    if zone_ids != list(range(len(zone_ids))):
-        raise ValueError(f"zone_id must be contiguous zero-based IDs. Got {zone_ids}")
+def build_adjacency_zero_based(sets_df: pd.DataFrame) -> np.ndarray:
+    set_ids = sorted(sets_df["set_id"].unique())
+    if set_ids != list(range(len(set_ids))):
+        raise ValueError(f"set_id must be contiguous zero-based IDs. Got {set_ids}")
 
-    Z = len(zone_ids)
+    Z = len(set_ids)
     adj = np.zeros((Z, Z), dtype=int)
     np.fill_diagonal(adj, 1)
 
-    corners_per_zone = {
+    corners_per_set = {
         int(zid): set(group["corner_id"].astype(int).tolist())
-        for zid, group in zones_df.groupby("zone_id")
+        for zid, group in sets_df.groupby("set_id")
     }
 
     for i in range(Z):
         for j in range(i + 1, Z):
-            if len(corners_per_zone[i] & corners_per_zone[j]) >= 2:
+            if len(corners_per_set[i] & corners_per_set[j]) >= 2:
                 adj[i, j] = 1
                 adj[j, i] = 1
 
     return adj
 
 
-def shared_edge_corner_pair(zid_i: int, zid_j: int, zones_df: pd.DataFrame):
-    ci = set(zones_df[zones_df["zone_id"] == zid_i]["corner_id"].astype(int).tolist())
-    cj = set(zones_df[zones_df["zone_id"] == zid_j]["corner_id"].astype(int).tolist())
+def shared_edge_corner_pair(zid_i: int, zid_j: int, sets_df: pd.DataFrame):
+    ci = set(sets_df[sets_df["set_id"] == zid_i]["corner_id"].astype(int).tolist())
+    cj = set(sets_df[sets_df["set_id"] == zid_j]["corner_id"].astype(int).tolist())
     shared = sorted(ci & cj)
 
     if len(shared) != 2:
@@ -286,19 +278,19 @@ def edge_indices_adjacent_to_shared(ccw_corners, shared_pair):
 
 def build_transition_arrays_zero_based(
     lambda_array: np.ndarray,
-    zones_df: pd.DataFrame,
+    sets_df: pd.DataFrame,
     corners_df: pd.DataFrame,
 ):
-    validate_zero_based_zone_tables(corners_df, zones_df)
+    validate_zero_based_set_tables(corners_df, sets_df)
 
-    adj = build_adjacency_zero_based(zones_df)
+    adj = build_adjacency_zero_based(sets_df)
     Z = adj.shape[0]
 
     if lambda_array.shape != (3, 4, Z):
         raise ValueError(f"lambda_array must have shape (3,4,{Z}). Got {lambda_array.shape}")
 
-    ccw_by_zone = {
-        z: get_zone_ccw_corner_ids(z, zones_df, corners_df)
+    ccw_by_set = {
+        z: get_set_ccw_corner_ids(z, sets_df, corners_df)
         for z in range(Z)
     }
 
@@ -310,12 +302,12 @@ def build_transition_arrays_zero_based(
             if i == j or adj[i, j] != 1:
                 continue
 
-            shared = shared_edge_corner_pair(i, j, zones_df)
+            shared = shared_edge_corner_pair(i, j, sets_df)
             if shared is None:
                 continue
 
-            edges_i = edge_indices_adjacent_to_shared(ccw_by_zone[i], shared)
-            edges_j = edge_indices_adjacent_to_shared(ccw_by_zone[j], shared)
+            edges_i = edge_indices_adjacent_to_shared(ccw_by_set[i], shared)
+            edges_j = edge_indices_adjacent_to_shared(ccw_by_set[j], shared)
 
             if edges_i is None or edges_j is None:
                 continue
@@ -355,7 +347,7 @@ class Corner:
             "o", ms=8, mfc=color, mec="k", picker=6, zorder=5
         )[0]
         self.highlighted = False
-        self.zones = set()
+        self.sets = set()
 
     def set_xy(self, x, y):
         self.x = float(x)
@@ -377,21 +369,21 @@ class Corner:
         return np.array([self.x, self.y], dtype=float)
 
 
-class Zone:
+class Set:
     _next_id = 0
 
     def __init__(self, corners, ax, facecolor="tab:orange", alpha=0.3, id_override=None):
         if id_override is None:
-            self.id = Zone._next_id
-            Zone._next_id += 1
+            self.id = Set._next_id
+            Set._next_id += 1
         else:
             self.id = int(id_override)
-            Zone._next_id = max(Zone._next_id, self.id + 1)
+            Set._next_id = max(Set._next_id, self.id + 1)
 
         self.corners = list(corners)
 
         for c in self.corners:
-            c.zones.add(self.id)
+            c.sets.add(self.id)
 
         xy = np.array([c.get_xy() for c in self.corners])
         self.patch = PatchPolygon(
@@ -420,8 +412,8 @@ class Zone:
         return out
 
 
-def edge_exists_in_any_zone(c1, c2, zones):
-    for z in zones:
+def edge_exists_in_any_set(c1, c2, sets):
+    for z in sets:
         for a, b in z.edges_as_corner_pairs():
             if (a is c1 and b is c2) or (a is c2 and b is c1):
                 return True
@@ -433,28 +425,31 @@ def status(ax, text):
 
 
 # ======================================================================
-# Zone editor
+# Set editor
 # ======================================================================
 
-class ZoneEditor:
+class SetEditor:
     def __init__(
         self,
         nav,
         artifact_callback,
         pixel_extent=None,
-        corners_path=CORNERS,
-        zones_path=ZONES,
+        corners_path=None,
+        sets_path=None,
         cmap="Greys",
         origin="lower",
     ):
+        if corners_path is None or sets_path is None:
+            raise ValueError("corners_path and sets_path are required.")
+
         self.nav = nav
         self.pixel_extent = pixel_extent
         self.artifact_callback = artifact_callback
         self.corners_path = Path(corners_path)
-        self.zones_path = Path(zones_path)
+        self.sets_path = Path(sets_path)
 
         self.corners = []
-        self.zones = []
+        self.sets = []
 
         self.mode = "idle"
         self.temp_new_corners = []
@@ -475,7 +470,7 @@ class ZoneEditor:
         self.ax.set_aspect("equal", adjustable="box")
         self.ax.set_xlabel("X (km)")
         self.ax.set_ylabel("Y (km)")
-        status(self.ax, "Click 'New Zone'. Drag corners. 'Save All' exports CSVs and artifacts.")
+        status(self.ax, "Click 'New Set'. Drag corners. 'Save All' exports CSVs and artifacts.")
 
         controls = self.fig.add_subplot(gs[1])
         controls.axis("off")
@@ -490,20 +485,20 @@ class ZoneEditor:
         ax_import = self.fig.add_subplot(sub[0, 6])
         ax_done = self.fig.add_subplot(sub[0, 7])
 
-        self.btn_new = Button(ax_new, "New Zone")
+        self.btn_new = Button(ax_new, "New Set")
         self.btn_next = Button(ax_next, "Next Step")
-        self.btn_finish = Button(ax_finish, "Finish Zone")
+        self.btn_finish = Button(ax_finish, "Finish Set")
         self.btn_cancel = Button(ax_cancel, "Cancel")
-        self.btn_delete = Button(ax_delete, "Delete Zone")
+        self.btn_delete = Button(ax_delete, "Delete Set")
         self.btn_save = Button(ax_save, "Save All")
         self.btn_import = Button(ax_import, "Import CSV")
         self.btn_done = Button(ax_done, "Done")
 
-        self.btn_new.on_clicked(self.on_new_zone)
+        self.btn_new.on_clicked(self.on_new_set)
         self.btn_next.on_clicked(self.on_next_step)
-        self.btn_finish.on_clicked(self.on_finish_zone)
+        self.btn_finish.on_clicked(self.on_finish_set)
         self.btn_cancel.on_clicked(self.on_cancel)
-        self.btn_delete.on_clicked(self.on_delete_zone)
+        self.btn_delete.on_clicked(self.on_delete_set)
         self.btn_save.on_clicked(self.on_save)
         self.btn_import.on_clicked(self.on_import)
         self.btn_done.on_clicked(self.on_done)
@@ -514,12 +509,12 @@ class ZoneEditor:
         self.fig.canvas.mpl_connect("motion_notify_event", self.on_motion)
 
     def _clear_all(self):
-        for z in list(self.zones):
+        for z in list(self.sets):
             try:
                 z.patch.remove()
             except Exception:
                 pass
-        self.zones.clear()
+        self.sets.clear()
 
         for c in list(self.corners):
             try:
@@ -534,27 +529,27 @@ class ZoneEditor:
         self.mode = "idle"
 
         Corner._next_id = 0
-        Zone._next_id = 0
+        Set._next_id = 0
 
         self.fig.canvas.draw_idle()
 
     def on_import(self, event):
         try:
-            self.import_from_csv(self.corners_path, self.zones_path)
-            status(self.ax, f"Imported {self.corners_path.name} and {self.zones_path.name}.")
+            self.import_from_csv(self.corners_path, self.sets_path)
+            status(self.ax, f"Imported {self.corners_path.name} and {self.sets_path.name}.")
         except Exception as e:
             status(self.ax, f"Import failed: {e}")
         self.fig.canvas.draw_idle()
 
-    def import_from_csv(self, corners_path, zones_path):
+    def import_from_csv(self, corners_path, sets_path):
         corners_path = Path(corners_path)
-        zones_path = Path(zones_path)
+        sets_path = Path(sets_path)
 
         df_corners = pd.read_csv(corners_path)
-        df_zones = pd.read_csv(zones_path)
+        df_sets = pd.read_csv(sets_path)
 
-        df_corners, df_zones = normalize_zero_based_zone_tables(df_corners, df_zones)
-        validate_zero_based_zone_tables(df_corners, df_zones)
+        df_corners, df_sets = normalize_zero_based_set_tables(df_corners, df_sets)
+        validate_zero_based_set_tables(df_corners, df_sets)
 
         self._clear_all()
 
@@ -565,17 +560,17 @@ class ZoneEditor:
             id_to_corner[cid] = c
             self.corners.append(c)
 
-        for zid, group in df_zones.sort_values(["zone_id", "order"]).groupby("zone_id"):
+        for zid, group in df_sets.sort_values(["set_id", "order"]).groupby("set_id"):
             corner_ids = group.sort_values("order")["corner_id"].astype(int).tolist()
             corners = [id_to_corner[cid] for cid in corner_ids]
-            z = Zone(corners, self.ax, id_override=int(zid))
+            z = Set(corners, self.ax, id_override=int(zid))
             z.update_patch()
-            self.zones.append(z)
+            self.sets.append(z)
 
         if self.corners:
             Corner._next_id = max(c.id for c in self.corners) + 1
-        if self.zones:
-            Zone._next_id = max(z.id for z in self.zones) + 1
+        if self.sets:
+            Set._next_id = max(z.id for z in self.sets) + 1
 
     def clear_temp_state(self):
         self.temp_new_corners.clear()
@@ -602,9 +597,9 @@ class ZoneEditor:
 
         return best
 
-    def on_new_zone(self, event):
+    def on_new_set(self, event):
         if self.mode in ("placing_first", "select_shared", "placing_remaining"):
-            status(self.ax, "Already adding a zone. Finish/Next/Cancel first.")
+            status(self.ax, "Already adding a set. Finish/Next/Cancel first.")
             self.fig.canvas.draw_idle()
             return
 
@@ -613,9 +608,9 @@ class ZoneEditor:
             c.set_highlight(False)
         self.selected_shared.clear()
 
-        if len(self.zones) == 0:
+        if len(self.sets) == 0:
             self.mode = "placing_first"
-            status(self.ax, "First zone: click 4 corners, then Finish Zone.")
+            status(self.ax, "First set: click 4 corners, then Finish Set.")
         else:
             self.mode = "select_shared"
             status(self.ax, "Select 2-4 shared corners, then Next Step.")
@@ -624,7 +619,7 @@ class ZoneEditor:
 
     def on_next_step(self, event):
         if self.mode != "select_shared":
-            status(self.ax, "Use New Zone first.")
+            status(self.ax, "Use New Set first.")
             self.fig.canvas.draw_idle()
             return
 
@@ -635,13 +630,13 @@ class ZoneEditor:
 
         if len(self.selected_shared) == 2:
             c1, c2 = self.selected_shared
-            if not edge_exists_in_any_zone(c1, c2, self.zones):
+            if not edge_exists_in_any_set(c1, c2, self.sets):
                 status(self.ax, "The selected 2 corners are not an existing edge.")
                 self.fig.canvas.draw_idle()
                 return
 
         if len(self.selected_shared) == 4:
-            status(self.ax, "All 4 corners selected. You can Finish Zone.")
+            status(self.ax, "All 4 corners selected. You can Finish Set.")
         else:
             self.mode = "placing_remaining"
             need = 4 - len(self.selected_shared)
@@ -649,7 +644,7 @@ class ZoneEditor:
 
         self.fig.canvas.draw_idle()
 
-    def on_finish_zone(self, event):
+    def on_finish_set(self, event):
         if self.mode not in ("placing_first", "placing_remaining", "select_shared"):
             status(self.ax, "Nothing to finish.")
             self.fig.canvas.draw_idle()
@@ -673,8 +668,8 @@ class ZoneEditor:
         order = order_polygon_points(pts)
         ordered_corners = [unique[i] for i in order]
 
-        z = Zone(ordered_corners, self.ax)
-        self.zones.append(z)
+        z = Set(ordered_corners, self.ax)
+        self.sets.append(z)
         z.update_patch()
 
         for c in self.selected_shared:
@@ -684,12 +679,12 @@ class ZoneEditor:
         self.selected_shared.clear()
         self.mode = "idle"
 
-        status(self.ax, f"Zone {z.id} created.")
+        status(self.ax, f"Set {z.id} created.")
         self.fig.canvas.draw_idle()
 
     def on_cancel(self, event):
         for c in list(self.temp_new_corners):
-            if len(c.zones) == 0:
+            if len(c.sets) == 0:
                 try:
                     c.artist.remove()
                 except Exception:
@@ -707,9 +702,9 @@ class ZoneEditor:
         status(self.ax, "Cancelled.")
         self.fig.canvas.draw_idle()
 
-    def on_delete_zone(self, event):
-        self.mode = "delete_zone"
-        status(self.ax, "Delete mode: click a zone.")
+    def on_delete_set(self, event):
+        self.mode = "delete_set"
+        status(self.ax, "Delete mode: click a set.")
         self.fig.canvas.draw_idle()
 
     def _to_dataframes(self):
@@ -720,30 +715,30 @@ class ZoneEditor:
         }).sort_values("corner_id")
 
         rows = []
-        for z in self.zones:
+        for z in self.sets:
             for order_idx, c in enumerate(z.corners):
                 rows.append({
-                    "zone_id": int(z.id),
+                    "set_id": int(z.id),
                     "order": int(order_idx),
                     "corner_id": int(c.id),
                 })
 
-        df_zones = pd.DataFrame(rows).sort_values(["zone_id", "order"])
+        df_sets = pd.DataFrame(rows).sort_values(["set_id", "order"])
 
-        return df_corners, df_zones
+        return df_corners, df_sets
 
     def _compact_ids(self):
-        zone_id_map = {
+        set_id_map = {
             z.id: new_id
-            for new_id, z in enumerate(sorted(self.zones, key=lambda zone: zone.id))
+            for new_id, z in enumerate(sorted(self.sets, key=lambda convex_set: convex_set.id))
         }
 
-        for z in self.zones:
-            z.id = zone_id_map[z.id]
+        for z in self.sets:
+            z.id = set_id_map[z.id]
 
         used_corners = []
         seen = set()
-        for z in sorted(self.zones, key=lambda zone: zone.id):
+        for z in sorted(self.sets, key=lambda convex_set: convex_set.id):
             for c in sorted(z.corners, key=lambda corner: corner.id):
                 if id(c) not in seen:
                     used_corners.append(c)
@@ -764,32 +759,32 @@ class ZoneEditor:
 
         for c in used_corners:
             c.id = corner_id_map[c.id]
-            c.zones.clear()
+            c.sets.clear()
 
-        for z in self.zones:
+        for z in self.sets:
             for c in z.corners:
-                c.zones.add(z.id)
+                c.sets.add(z.id)
 
         self.corners = sorted(used_corners, key=lambda corner: corner.id)
-        Zone._next_id = len(self.zones)
+        Set._next_id = len(self.sets)
         Corner._next_id = len(self.corners)
 
     def on_save(self, event):
         try:
             self._compact_ids()
-            df_corners, df_zones = self._to_dataframes()
-            df_corners, df_zones = normalize_zero_based_zone_tables(df_corners, df_zones)
-            validate_zero_based_zone_tables(df_corners, df_zones)
+            df_corners, df_sets = self._to_dataframes()
+            df_corners, df_sets = normalize_zero_based_set_tables(df_corners, df_sets)
+            validate_zero_based_set_tables(df_corners, df_sets)
 
             self.corners_path.parent.mkdir(parents=True, exist_ok=True)
-            self.zones_path.parent.mkdir(parents=True, exist_ok=True)
+            self.sets_path.parent.mkdir(parents=True, exist_ok=True)
 
             df_corners.to_csv(self.corners_path, index=False)
-            df_zones.to_csv(self.zones_path, index=False)
+            df_sets.to_csv(self.sets_path, index=False)
 
-            self.artifact_callback(df_corners=df_corners, df_zones=df_zones)
+            self.artifact_callback(df_corners=df_corners, df_sets=df_sets)
 
-            status(self.ax, "Saved CSVs and rebuilt all zone artifacts.")
+            status(self.ax, "Saved CSVs and rebuilt all set artifacts.")
         except Exception as e:
             status(self.ax, f"Save failed: {e}")
 
@@ -831,13 +826,13 @@ class ZoneEditor:
                     self.dragging_corner = c
                 return
 
-        for z in self.zones:
+        for z in self.sets:
             if z.patch is artist:
-                if self.mode == "delete_zone":
-                    self._delete_zone(z)
-                    status(self.ax, f"Zone {z.id} deleted.")
+                if self.mode == "delete_set":
+                    self._delete_set(z)
+                    status(self.ax, f"Set {z.id} deleted.")
                 else:
-                    status(self.ax, f"Zone {z.id} selected.")
+                    status(self.ax, f"Set {z.id} selected.")
                 self.fig.canvas.draw_idle()
                 return
 
@@ -862,7 +857,7 @@ class ZoneEditor:
 
         elif self.mode == "placing_remaining":
             if self.total_current_corners() >= 4:
-                status(self.ax, "Already have 4 corners. Finish Zone.")
+                status(self.ax, "Already have 4 corners. Finish Set.")
                 self.fig.canvas.draw_idle()
                 return
 
@@ -887,25 +882,25 @@ class ZoneEditor:
 
         self.dragging_corner.set_xy(event.xdata, event.ydata)
 
-        for z in self.zones:
+        for z in self.sets:
             if self.dragging_corner in z.corners:
                 z.update_patch()
 
         self.fig.canvas.draw_idle()
 
-    def _delete_zone(self, z):
+    def _delete_set(self, z):
         for c in z.corners:
-            c.zones.discard(z.id)
+            c.sets.discard(z.id)
 
         try:
             z.patch.remove()
         except Exception:
             pass
 
-        if z in self.zones:
-            self.zones.remove(z)
+        if z in self.sets:
+            self.sets.remove(z)
 
-        unused = [c for c in self.corners if len(c.zones) == 0]
+        unused = [c for c in self.corners if len(c.sets) == 0]
         for c in unused:
             try:
                 c.artist.remove()
@@ -930,9 +925,9 @@ class MapBuilder:
     navigability_map: Optional[np.ndarray] = None
 
     corners_df: Optional[pd.DataFrame] = None
-    zones_df: Optional[pd.DataFrame] = None
-    zone_ineq: Optional[np.ndarray] = None
-    zone_adj: Optional[np.ndarray] = None
+    sets_df: Optional[pd.DataFrame] = None
+    set_ineq: Optional[np.ndarray] = None
+    set_adj: Optional[np.ndarray] = None
     transition_ineq_from: Optional[np.ndarray] = None
     transition_ineq_to: Optional[np.ndarray] = None
 
@@ -942,25 +937,15 @@ class MapBuilder:
     navigability_metadata_path: Path = field(init=False)
     map_params_path: Path = field(init=False)
     corners_path: Path = field(init=False)
-    zones_path: Path = field(init=False)
-    zone_ineq_path: Path = field(init=False)
+    sets_path: Path = field(init=False)
+    set_ineq_path: Path = field(init=False)
     transition_ineq_path: Path = field(init=False)
     adj_path: Path = field(init=False)
     depth_rebuilt: bool = field(default=False, init=False)
 
     def __post_init__(self):
         if self.map_dir is None:
-            self.depth_grid_path = Path(DEPTH_GRID)
-            self.depth_metadata_path = self.depth_grid_path.with_suffix(".meta.json")
-            self.navigability_map_path = Path(NAVIGABILITY_MAP)
-            self.navigability_metadata_path = self.navigability_map_path.with_suffix(".meta.json")
-            self.map_params_path = self.depth_grid_path.parent / "map_params.csv"
-            self.corners_path = Path(CORNERS)
-            self.zones_path = Path(ZONES)
-            self.zone_ineq_path = Path(ZONE_INEQ)
-            self.transition_ineq_path = Path(TRANSITION_INEQ)
-            self.adj_path = Path(ADJ)
-            return
+            raise ValueError("map_dir is required; pass the selected case's map directory.")
 
         map_dir = Path(self.map_dir).resolve()
         self.map_dir = map_dir
@@ -970,10 +955,10 @@ class MapBuilder:
         self.navigability_metadata_path = map_dir / "navigability_map.meta.json"
         self.map_params_path = map_dir / "map_params.csv"
         self.corners_path = map_dir / "corners.csv"
-        self.zones_path = map_dir / "zones.csv"
-        self.zone_ineq_path = map_dir / "zones_ineq.npz"
+        self.sets_path = map_dir / "sets.csv"
+        self.set_ineq_path = map_dir / "sets_ineq.npz"
         self.transition_ineq_path = map_dir / "transition_ineq.npz"
-        self.adj_path = map_dir / "zones_adj.npy"
+        self.adj_path = map_dir / "sets_adj.npy"
 
     def _map_params_metadata(self) -> dict:
         return {
@@ -1063,7 +1048,7 @@ class MapBuilder:
             _, _, self.depth_grid = grid_from_depth_df(self.depth_df)
             return self.depth_df
         if out_path.exists() and not force:
-            print("[MAP] depth cache does not match map.toml; rebuilding depth_grid.csv")
+            log.progress("[MAP] Starting depth grid rebuild")
 
         ref_lat_sw = float(self.map_info.sw_lat)
         ref_lon_sw = float(self.map_info.sw_lon)
@@ -1162,9 +1147,9 @@ class MapBuilder:
         _, _, self.depth_grid = grid_from_depth_df(df)
         self.depth_rebuilt = True
 
-        print(f"Saved depth grid to {out_path}")
-        print(f"Grid shape: ny={ny}, nx={nx}, resolution={dx_km} km")
-        print(f"GMRT bbox: west={west:.4f}, south={south:.4f}, east={east:.4f}, north={north:.4f}")
+        log.debug("Saved depth grid to %s", out_path)
+        log.debug("Grid shape: ny=%s, nx=%s, resolution=%s km", ny, nx, dx_km)
+        log.debug("GMRT bbox: west=%.4f, south=%.4f, east=%.4f, north=%.4f", west, south, east, north)
 
         return df
 
@@ -1175,7 +1160,7 @@ class MapBuilder:
             self.navigability_map = np.load(out_path)
             return self.navigability_map
         if out_path.exists() and not force:
-            print("[MAP] navigability cache does not match map/ship settings; rebuilding navigability_map.npy")
+            log.progress("[MAP] Starting navigability map rebuild")
 
         if self.depth_df is None:
             self.fetch_or_load_depth(force=False)
@@ -1195,31 +1180,31 @@ class MapBuilder:
         self.depth_grid = Z
         self.navigability_map = nav
 
-        print(f"Saved navigability map to {out_path}")
+        log.debug("Saved navigability map to %s", out_path)
         return nav
 
-    def build_zone_artifacts(
+    def build_set_artifacts(
         self,
         df_corners: Optional[pd.DataFrame] = None,
-        df_zones: Optional[pd.DataFrame] = None,
+        df_sets: Optional[pd.DataFrame] = None,
         normalize: bool = True,
     ):
         if df_corners is None:
             df_corners = pd.read_csv(self.corners_path)
-        if df_zones is None:
-            df_zones = pd.read_csv(self.zones_path)
+        if df_sets is None:
+            df_sets = pd.read_csv(self.sets_path)
 
         df_corners = df_corners.copy()
-        df_zones = df_zones.copy()
+        df_sets = df_sets.copy()
 
-        df_corners, df_zones = normalize_zero_based_zone_tables(df_corners, df_zones)
-        validate_zero_based_zone_tables(df_corners, df_zones)
+        df_corners, df_sets = normalize_zero_based_set_tables(df_corners, df_sets)
+        validate_zero_based_set_tables(df_corners, df_sets)
 
-        lambda_array = compute_lambda_array_zero_based(df_corners, df_zones, normalize=normalize)
-        adj = build_adjacency_zero_based(df_zones)
+        lambda_array = compute_lambda_array_zero_based(df_corners, df_sets, normalize=normalize)
+        adj = build_adjacency_zero_based(df_sets)
         trans_from, trans_to, adj_from_trans = build_transition_arrays_zero_based(
             lambda_array,
-            df_zones,
+            df_sets,
             df_corners,
         )
 
@@ -1229,8 +1214,8 @@ class MapBuilder:
         self.corners_path.parent.mkdir(parents=True, exist_ok=True)
 
         df_corners.to_csv(self.corners_path, index=False)
-        df_zones.to_csv(self.zones_path, index=False)
-        np.savez(self.zone_ineq_path, lambda_array=lambda_array)
+        df_sets.to_csv(self.sets_path, index=False)
+        np.savez(self.set_ineq_path, lambda_array=lambda_array)
         np.save(self.adj_path, adj)
         np.savez(
             self.transition_ineq_path,
@@ -1240,21 +1225,21 @@ class MapBuilder:
         )
 
         self.corners_df = df_corners
-        self.zones_df = df_zones
-        self.zone_ineq = lambda_array
-        self.zone_adj = adj
+        self.sets_df = df_sets
+        self.set_ineq = lambda_array
+        self.set_adj = adj
         self.transition_ineq_from = trans_from
         self.transition_ineq_to = trans_to
 
-        print(f"Saved corners: {self.corners_path}")
-        print(f"Saved zones: {self.zones_path}")
-        print(f"Saved zone inequalities: {self.zone_ineq_path}")
-        print(f"Saved adjacency: {self.adj_path}")
-        print(f"Saved transition inequalities: {self.transition_ineq_path}")
+        log.debug("Saved corners: %s", self.corners_path)
+        log.debug("Saved sets: %s", self.sets_path)
+        log.debug("Saved set inequalities: %s", self.set_ineq_path)
+        log.debug("Saved adjacency: %s", self.adj_path)
+        log.debug("Saved transition inequalities: %s", self.transition_ineq_path)
 
         return lambda_array, adj, trans_from, trans_to
 
-    def launch_zone_editor(self, force_nav: bool = False, import_existing: bool = True):
+    def launch_set_editor(self, force_nav: bool = False, import_existing: bool = True):
         nav = self.build_or_load_navigability(force=force_nav)
 
         x_extent = float(self.map_info.span_km_east)
@@ -1262,20 +1247,20 @@ class MapBuilder:
 
         extent = [0.0, x_extent, 0.0, y_extent]
 
-        editor = ZoneEditor(
+        editor = SetEditor(
             nav=nav,
             pixel_extent=extent,
             corners_path=self.corners_path,
-            zones_path=self.zones_path,
-            artifact_callback=self.build_zone_artifacts,
+            sets_path=self.sets_path,
+            artifact_callback=self.build_set_artifacts,
             origin="lower",
         )
 
-        if import_existing and self.corners_path.exists() and self.zones_path.exists():
+        if import_existing and self.corners_path.exists() and self.sets_path.exists():
             try:
-                editor.import_from_csv(self.corners_path, self.zones_path)
+                editor.import_from_csv(self.corners_path, self.sets_path)
             except Exception as e:
-                print(f"[WARN] Could not import existing zone CSVs: {e}")
+                log.warning("[WARN] Could not import existing set CSVs: %s", e)
 
         plt.show()
         return editor

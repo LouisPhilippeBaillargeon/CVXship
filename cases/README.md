@@ -12,18 +12,64 @@ Each test case is a self-contained folder with the editable inputs for one run:
 Run a case with:
 
 ```powershell
-python optimize.py --case cases/baseline
+python optimize.py --case cases/sept-iles-gaspe
 ```
+
+Use the 52North WeatherRoutingTool path generator instead of the local
+shortest path with:
+
+```powershell
+python optimize.py --case cases/sept-iles-gaspe --path-generator wrt --wrt-source-dir C:\path\to\WeatherRoutingTool
+```
+
+The same can be set in `case.toml` under `[run]`:
+
+```toml
+path_generator = "wrt"      # default: "shortest"
+wrt_algorithm = "isofuel"   # or "genetic"
+wrt_source_dir = "C:/path/to/WeatherRoutingTool"
+```
+
+If WeatherRoutingTool is already importable in Python, `wrt_source_dir` is not
+needed. You can also set `WRT_SOURCE_DIR` in the environment, or pass
+`--wrt-route-geojson <file>` to reuse a route already written by WRT. The
+returned object still exposes `path.sol.waypoints` and `path.sol.set_sequence`
+like the local shortest path.
+
+Every run saves the generated route before any optimizer is called:
+
+- `results/runs/<run_id>/routes/path_solution.json`: CVXship-ready projected
+  waypoints, set sequence, and distance.
+- `results/runs/<run_id>/routes/path_waypoints.csv`: the same waypoints in a
+  spreadsheet-friendly format.
+- `results/runs/<run_id>/routes/wrt_route_raw.json`: the raw WRT GeoJSON route
+  when WRT generated or supplied the route.
+
+The fastest reuse path is:
+
+```powershell
+python optimize.py --case cases/sept-iles-gaspe --path-solution-json results/runs/<run_id>/routes/path_solution.json
+```
+
+For WRT runs, the WRT water-depth constraint is enabled by default and uses
+`ship.toml` `[info].min_depth` as the required water depth. Disable that WRT
+pre-check with `--no-wrt-depth-constraint` if you only want CVXship's local
+convex-set validation to police navigability.
 
 Build or edit a case map with:
 
 ```powershell
-python build_map.py --case cases/baseline
+python build_map.py --case cases/sept-iles-gaspe
 ```
 
 Each run writes to `results/runs/<timestamp>_<name>/` with input snapshots,
 plots, solution pickles, `summary.csv`, `summary.json`, `manifest.json`, and
 `console.log`.
 
-To create another test case, copy `cases/baseline/`, edit the TOMLs, and run the
-new folder.
+To create another test case, copy an existing named case folder, edit the TOMLs,
+and run the new folder with `--case`.
+
+Speed limits in `map.toml` are applied conservatively to whole itinerary
+intervals. A `from`/`until` window activates every timestep interval it overlaps;
+boundary-only spatial contact with a speed-limited path segment is ignored using
+a `1e-5 km` tolerance.

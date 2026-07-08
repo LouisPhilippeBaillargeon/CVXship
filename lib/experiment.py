@@ -16,21 +16,16 @@ from typing import Any, Iterable
 
 import numpy as np
 
-from lib.paths import ATMO, CACHE, CONFIG, CURRENTS, RESULTS, ROOT, SUN
-
-
-WEATHER_DEFAULTS = {
-    "currents": CURRENTS,
-    "atmo": ATMO,
-    "sun": SUN,
-}
+from lib.paths import CACHE, RESULTS, ROOT
+from lib.weather_interpolation import resolve_weather_files_from_toml
+from lib import logging_utils as log
 
 CACHE_FILENAMES = {
     "wind_model_1d": "WindModel1D.pkl",
+    "wind_model_transition_1d": "WindModelTransition1D.pkl",
     "wind_model_2d": "WindModel2D.pkl",
     "wind_model_path_aligned_2d": "WindModelPathAligned2D.pkl",
     "propulsion_model": "PropulsionModel.pkl",
-    "generator_model": "GeneratorModel.pkl",
     "calm_model": "CalmModel.pkl",
 }
 
@@ -58,6 +53,14 @@ class RunContext:
     @property
     def console_log_path(self) -> Path:
         return self.run_dir / "console.log"
+
+    @property
+    def debug_log_path(self) -> Path:
+        return self.run_dir / "debug.log"
+
+    @property
+    def warnings_errors_log_path(self) -> Path:
+        return self.run_dir / "warnings_errors.log"
 
     def cache_path(self, key: str) -> Path:
         return self.cache_dir / CACHE_FILENAMES[key]
@@ -106,27 +109,7 @@ def load_case_cache_options(case_dir: Path | str | None) -> dict[str, Any]:
 
 
 def resolve_weather_files(case_dir: Path | str | None) -> dict[str, Path]:
-    weather_files = {key: Path(path).resolve() for key, path in WEATHER_DEFAULTS.items()}
-
-    if case_dir is None:
-        return weather_files
-
-    case_dir = Path(case_dir).resolve()
-    weather_toml = case_dir / "weather.toml"
-    if not weather_toml.exists():
-        return weather_files
-
-    data = read_toml(weather_toml)
-    files = data.get("files", {})
-    for key in WEATHER_DEFAULTS:
-        if key not in files:
-            continue
-        path = Path(files[key])
-        if not path.is_absolute():
-            path = weather_toml.parent / path
-        weather_files[key] = path.resolve()
-
-    return weather_files
+    return resolve_weather_files_from_toml(case_dir)
 
 
 def create_run_context(
@@ -136,9 +119,12 @@ def create_run_context(
     options: dict[str, Any],
     cache_scope: str = "case",
 ) -> RunContext:
-    case_path = Path(case_dir).resolve() if case_dir is not None else None
+    if case_dir is None:
+        raise ValueError("case_dir is required. Pass a named case directory with --case.")
+
+    case_path = Path(case_dir).resolve()
     settings = load_case_settings(case_path)
-    case_name = _slug(str(settings.get("name") or (case_path.name if case_path else "default")))
+    case_name = _slug(str(case_path.name))
     clean_run_name = _slug(run_name or case_name)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_id = _unique_run_id(timestamp, clean_run_name)
@@ -184,7 +170,7 @@ def create_run_context(
 
 
 def copy_input_snapshot(ctx: RunContext) -> None:
-    source_dir = ctx.case_dir if ctx.case_dir is not None else CONFIG
+    source_dir = ctx.case_dir
 
     for name in ("case.toml", "ship.toml", "map.toml", "itinerary.toml", "weather.toml"):
         source = source_dir / name
@@ -197,7 +183,7 @@ def copy_input_snapshot(ctx: RunContext) -> None:
 
 
 def write_initial_manifest(ctx: RunContext, *, options: dict[str, Any], cache_scope: str) -> None:
-    source_dir = ctx.case_dir if ctx.case_dir is not None else CONFIG
+    source_dir = ctx.case_dir
     manifest = {
         "status": "running",
         "run_id": ctx.run_id,
@@ -240,6 +226,7 @@ def save_run_results(
         row = summarize_solution(key, label, sol)
         row["solution_file"] = str(Path("solutions") / filename) if save_solutions else ""
         rows.append(row)
+        _log_solution_quality(label, sol)
 
     _write_summary_csv(ctx.run_dir / "summary.csv", rows)
     _write_json(ctx.run_dir / "summary.json", rows)
@@ -258,6 +245,52 @@ def save_run_results(
     return rows
 
 
+def _log_solution_quality(label: str, sol: Any) -> None:
+    for key, rec in _reportable_validation_warnings(
+        getattr(sol, "validation_warnings", {}) or {}
+    ).items():
+        log.warning(
+            "[SOLUTION WARNING] %s: %s: %s count=%s, max_amount=%.6g",
+            label,
+            key,
+            rec.get("message", ""),
+            rec.get("count", 0),
+            float(rec.get("max_amount", 0.0)),
+        )
+
+    for key, rec in (getattr(sol, "fit_range_warnings", {}) or {}).items():
+        log.warning(
+            "[FIT WARNING] %s: %s: %s count=%s, max_amount=%.6g",
+            label,
+            key,
+            rec.get("message", ""),
+            rec.get("count", 0),
+            float(rec.get("max_amount", 0.0)),
+        )
+
+    for key, rec in (getattr(sol, "validation_errors", {}) or {}).items():
+        log.error(
+            "[SOLUTION ERROR] %s: %s: %s count=%s, max_amount=%.6g",
+            label,
+            key,
+            rec.get("message", ""),
+            rec.get("count", 0),
+            float(rec.get("max_amount", 0.0)),
+        )
+
+    failure_reason = getattr(sol, "failure_reason", "") or ""
+    if failure_reason:
+        log.error("[SOLUTION ERROR] %s: failure_reason=%s", label, failure_reason)
+
+
+def _reportable_validation_warnings(warnings: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: rec
+        for key, rec in (warnings or {}).items()
+        if log.validation_warning_is_reportable(key, rec)
+    }
+
+
 def summarize_solution(key: str, label: str, sol: Any) -> dict[str, Any]:
     soc = getattr(sol, "SOC", None)
     final_soc = None
@@ -267,7 +300,24 @@ def summarize_solution(key: str, label: str, sol: Any) -> dict[str, Any]:
             final_soc = float(arr[-1])
 
     validation_errors = getattr(sol, "validation_errors", {}) or {}
-    validation_warnings = getattr(sol, "validation_warnings", {}) or {}
+    validation_warnings = _reportable_validation_warnings(
+        getattr(sol, "validation_warnings", {}) or {}
+    )
+    route_validation_errors = getattr(sol, "route_validation_errors", {}) or {}
+    route_validation_warnings = _reportable_validation_warnings(
+        getattr(sol, "route_validation_warnings", {}) or {}
+    )
+    ems_validation_errors = getattr(sol, "ems_validation_errors", {}) or {}
+    ems_validation_warnings = _reportable_validation_warnings(
+        getattr(sol, "ems_validation_warnings", {}) or {}
+    )
+    pre_redispatch_ems_validation_errors = (
+        getattr(sol, "pre_redispatch_ems_validation_errors", {}) or {}
+    )
+    pre_redispatch_ems_validation_warnings = _reportable_validation_warnings(
+        getattr(sol, "pre_redispatch_ems_validation_warnings", {}) or {}
+    )
+    fit_range_warnings = getattr(sol, "fit_range_warnings", {}) or {}
 
     return {
         "key": key,
@@ -282,7 +332,41 @@ def summarize_solution(key: str, label: str, sol: Any) -> dict[str, Any]:
         "is_valid": bool(getattr(sol, "is_valid", True)),
         "validation_error_count": len(validation_errors),
         "validation_warning_count": len(validation_warnings),
+        "route_validation_error_count": len(route_validation_errors),
+        "route_validation_warning_count": len(route_validation_warnings),
+        "ems_validation_error_count": len(ems_validation_errors),
+        "ems_validation_warning_count": len(ems_validation_warnings),
+        "pre_redispatch_ems_validation_error_count": len(
+            pre_redispatch_ems_validation_errors
+        ),
+        "pre_redispatch_ems_validation_warning_count": len(
+            pre_redispatch_ems_validation_warnings
+        ),
+        "fit_range_warning_count": len(fit_range_warnings),
+        "fit_range_warning_keys": ";".join(sorted(str(k) for k in fit_range_warnings)),
+        "solver_status": solution_solver_status(sol),
+        "power_management_solver_status": solution_power_management_solver_status(sol),
+        "failure_reason": getattr(sol, "failure_reason", "") or "",
     }
+
+
+def solution_solver_status(sol: Any) -> str:
+    status = getattr(sol, "solver_status", None)
+    if status:
+        return str(status)
+
+    reason = getattr(sol, "failure_reason", None)
+    if isinstance(reason, str) and reason.startswith("solver_status:"):
+        return reason.split(":", 1)[1]
+
+    return ""
+
+
+def solution_power_management_solver_status(sol: Any) -> str:
+    status = getattr(sol, "power_management_solver_status", None)
+    if status:
+        return str(status)
+    return ""
 
 
 def update_manifest(ctx: RunContext, updates: dict[str, Any]) -> None:
@@ -417,6 +501,17 @@ def _write_summary_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "is_valid",
         "validation_error_count",
         "validation_warning_count",
+        "route_validation_error_count",
+        "route_validation_warning_count",
+        "ems_validation_error_count",
+        "ems_validation_warning_count",
+        "pre_redispatch_ems_validation_error_count",
+        "pre_redispatch_ems_validation_warning_count",
+        "fit_range_warning_count",
+        "fit_range_warning_keys",
+        "solver_status",
+        "power_management_solver_status",
+        "failure_reason",
         "solution_file",
     ]
     with open(path, "w", newline="", encoding="utf-8") as f:

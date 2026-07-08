@@ -6,8 +6,10 @@ import numpy as np
 import pandas as pd
 import cvxpy as cp
 import matplotlib.pyplot as plt
+import json
 import pickle
 import os
+from pathlib import Path
 from lib.load_params import Ship, Generator
 from lib.paths import B_SERIES_CQ, B_SERIES_CT, PLOTS
 from lib.utils import bisection
@@ -16,9 +18,21 @@ from lib.plotting import (
     _finalize_axis,
     _save_and_maybe_show,
 )
+from lib import logging_utils as log
+from lib.logging_utils import solve_with_logging
 
 eps = 1e-6
 RESISTANCE_BIG_M_SAFETY = 0.5
+
+
+def _require_cvxpy_success(problem, label: str):
+    if problem.status == cp.OPTIMAL_INACCURATE:
+        log.warning(
+            f"[WARN] {label} solve status is optimal_inaccurate; "
+            "using the fit, but it is not an exact optimal solve."
+        )
+    if problem.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
+        raise RuntimeError(f"{label} problem not solved optimally: {problem.status}")
 
 
 def _finalize_resistance_big_m(model):
@@ -63,61 +77,172 @@ class FitRange:
         upper_prop_factor: float = 1.2,
         eps: float = 1e-9,
     ) -> "FitRange":
-        seg_dt_h = np.asarray(sol.segment_dt_h, dtype=float)
-        mask = seg_dt_h > eps
+        seg_dt_source = getattr(sol, "segment_dt_h", None)
+        if seg_dt_source is None:
+            timestep_dt = np.asarray(getattr(sol, "timestep_dt_h", []), dtype=float)
+            if timestep_dt.size == 0:
+                raise ValueError("Cannot build FitRange: solution has no segment durations.")
+            seg_dt_h = timestep_dt.reshape(-1, 1)
+        else:
+            seg_dt_h = np.asarray(seg_dt_source, dtype=float)
+            if seg_dt_h.ndim == 1:
+                seg_dt_h = seg_dt_h[:, None]
 
-        speed_rel = np.asarray(sol.speed_rel_water_mag, dtype=float)
-        speed_ship = np.asarray(sol.speed_mag, dtype=float)
-        resistance = np.asarray(sol.total_resistance, dtype=float)
-        prop_power = np.asarray(sol.prop_power, dtype=float)
+        if seg_dt_h.ndim != 2:
+            raise ValueError(f"sol.segment_dt_h must be 1D or 2D, got shape {seg_dt_h.shape}.")
 
-        valid_speed_rel = speed_rel[mask]
-        valid_speed_ship = speed_ship[mask]
-        valid_resistance = resistance[mask]
-        valid_prop_power = prop_power[mask]
+        T, H = seg_dt_h.shape
 
-        if valid_speed_rel.size == 0:
+        def _match_segment_shape(value, name):
+            arr = np.asarray(value, dtype=float)
+            if arr.shape == (T, H):
+                return arr
+            if arr.shape == (T,):
+                return np.repeat(arr[:, None], H, axis=1)
+            if arr.shape == (T, 1):
+                return np.repeat(arr, H, axis=1)
+            raise ValueError(f"sol.{name} must have shape {(T,)}, {(T, 1)}, or {(T, H)}, got {arr.shape}.")
+
+        speed_rel = _match_segment_shape(sol.speed_rel_water_mag, "speed_rel_water_mag")
+        speed_ship = _match_segment_shape(sol.speed_mag, "speed_mag")
+        resistance = _match_segment_shape(sol.total_resistance, "total_resistance")
+        prop_power = _match_segment_shape(sol.prop_power, "prop_power")
+
+        sail_fraction = np.asarray(
+            getattr(sol, "interval_sail_fraction", np.ones(T)),
+            dtype=float,
+        ).reshape(-1)
+        if sail_fraction.shape != (T,):
+            raise ValueError(
+                f"sol.interval_sail_fraction must have shape {(T,)}, got {sail_fraction.shape}."
+            )
+        sail_mask = sail_fraction[:, None] > eps
+        duration_mask = seg_dt_h > eps
+        mask = duration_mask & sail_mask
+
+        def _finite_values(arr, *, positive=False):
+            value_mask = mask & np.isfinite(arr)
+            if positive:
+                value_mask &= arr > eps
+            return arr[value_mask]
+
+        valid_speed_rel = _finite_values(speed_rel, positive=True)
+        valid_speed_ship = _finite_values(speed_ship, positive=True)
+        valid_resistance = _finite_values(resistance)
+        valid_resistance_positive = _finite_values(resistance, positive=True)
+        valid_prop_power = _finite_values(prop_power)
+        valid_prop_power_positive = _finite_values(prop_power, positive=True)
+
+        if valid_speed_rel.size == 0 and valid_speed_ship.size == 0:
             raise ValueError("Cannot build FitRange: no sailing segment found in evaluated solution.")
 
-        speed_max_source = max(
-            np.nanmax(valid_speed_rel),
-            np.nanmax(valid_speed_ship),
-        )
+        speed_min_candidates = []
+        speed_max_candidates = []
+        if valid_speed_rel.size:
+            speed_min_candidates.append(float(np.nanmin(valid_speed_rel)))
+            speed_max_candidates.append(float(np.nanmax(valid_speed_rel)))
+        if valid_speed_ship.size:
+            speed_min_candidates.append(float(np.nanmin(valid_speed_ship)))
+            speed_max_candidates.append(float(np.nanmax(valid_speed_ship)))
+
+        speed_min_source = min(speed_min_candidates)
+        speed_max_source = max(speed_max_candidates)
 
         max_prop_pow_physical = ship.propulsion.max_pow * ship.propulsion.nb_propellers
         min_prop_pow_physical = ship.propulsion.min_pow * ship.propulsion.nb_propellers
+        resistance_min_source = (
+            float(np.nanmin(valid_resistance_positive))
+            if valid_resistance_positive.size
+            else 0.0
+        )
+        resistance_max_source = (
+            float(np.nanmax(valid_resistance))
+            if valid_resistance.size
+            else 0.0
+        )
+        prop_min_source = (
+            float(np.nanmin(valid_prop_power_positive))
+            if valid_prop_power_positive.size
+            else 0.0
+        )
+        prop_max_source = (
+            float(np.nanmax(valid_prop_power))
+            if valid_prop_power.size
+            else 0.0
+        )
+
+        ship_max_speed = float(ship.info.max_speed)
+        min_speed = max(eps, lower_speed_factor * float(speed_min_source))
+        max_speed = min(
+            ship_max_speed,
+            upper_speed_factor * float(speed_max_source),
+        )
+        if max_speed <= min_speed:
+            if ship_max_speed <= eps:
+                raise ValueError("ship.info.max_speed must be positive to build FitRange.")
+            max_speed = ship_max_speed
+            min_speed = min(min_speed, max(eps, 0.99 * max_speed))
+
+        min_resistance = max(
+            eps,
+            lower_res_factor * resistance_min_source,
+        )
+        max_resistance = max(
+            min_resistance + eps,
+            upper_res_factor * resistance_max_source,
+        )
+
+        min_prop_power = max(
+            0.0,
+            lower_prop_factor * prop_min_source,
+            float(min_prop_pow_physical),
+        )
+        max_prop_power = min(
+            float(max_prop_pow_physical),
+            max(
+                min_prop_power + eps,
+                upper_prop_factor * prop_max_source,
+            ),
+        )
+        if max_prop_power < min_prop_power:
+            max_prop_power = min_prop_power
 
         return cls(
-            min_speed=max(1.0, lower_speed_factor * float(np.nanmax(valid_speed_rel))),
-            max_speed=min(
-                float(ship.info.max_speed),
-                upper_speed_factor * float(speed_max_source),
-            ),
-            min_resistance=max(
-                eps,
-                lower_res_factor * float(np.nanmax(valid_resistance)),
-            ),
-            max_resistance=max(
-                eps,
-                upper_res_factor * float(np.nanmax(valid_resistance)),
-            ),
-            min_prop_power=max(
-                0.0,
-                lower_prop_factor * float(np.nanmax(valid_prop_power)),
-                float(min_prop_pow_physical),
-            ),
-            max_prop_power=min(
-                float(max_prop_pow_physical),
-                upper_prop_factor * float(np.nanmax(valid_prop_power)),
-            ),
+            min_speed=min_speed,
+            max_speed=max_speed,
+            min_resistance=min_resistance,
+            max_resistance=max_resistance,
+            min_prop_power=min_prop_power,
+            max_prop_power=max_prop_power,
         )
 
 
-def save_obj(path, obj):
+def _cache_metadata_path(path) -> Path:
+    path = Path(path)
+    return path.with_name(path.name + ".meta.json")
+
+
+def save_obj(path, obj, metadata=None):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "wb") as f:
         pickle.dump(obj, f)
+    if metadata is not None:
+        with open(_cache_metadata_path(path), "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "metadata": metadata}, f, indent=2, sort_keys=True)
+            f.write("\n")
 
-def load_obj(path):
+
+def load_obj(path, expected_metadata=None):
+    path = Path(path)
+    if expected_metadata is not None:
+        meta_path = _cache_metadata_path(path)
+        if not meta_path.exists():
+            raise ValueError(f"Cache metadata missing for {path}. Rebuild this cache.")
+        with open(meta_path, "r", encoding="utf-8") as f:
+            actual = json.load(f).get("metadata")
+        if actual != expected_metadata:
+            raise ValueError(f"Cache metadata mismatch for {path}. Rebuild this cache.")
     with open(path, "rb") as f:
         return pickle.load(f)
 
@@ -147,6 +272,10 @@ class CalmWaterModel:
     fit_range : Optional[FitRange] = field(default=None) #A good fit is often possible over 1 m/s to max speed, so its often preferable to not give a fit range and fit over all possible speed values above 1m/s
     fitted_Cx : Optional[float] = field(default=None, init=False)
     res_coeffs: Optional[np.ndarray] = field(default=None, init=False)
+
+    def require_convex_fit(self, context: str = "This operation") -> None:
+        if self.res_coeffs is None:
+            raise ValueError(f"{context} requires CalmWaterModel.fit_convex_model() first.")
 
     def compute_C(self, speed):
         #speed = relative speed through water in m/s
@@ -225,7 +354,7 @@ class CalmWaterModel:
         self.fitted_Cx = float(np.dot(phi, y) / denom)
 
         return self.fitted_Cx
-    def fit_convex_model(self, nb_points=100, debug=False):
+    def fit_convex_model(self, nb_points=100, verbose=False):
         if self.fit_range != None:
             speeds = np.linspace(self.fit_range.min_speed, self.fit_range.max_speed, nb_points)
         else:
@@ -255,11 +384,9 @@ class CalmWaterModel:
 
         objective = cp.Minimize(cp.sum_squares(R_fit-Resistance))
         problem = cp.Problem(objective, constraints)
-        problem.solve(solver="MOSEK", verbose=debug)
+        solve_with_logging(problem, solver="MOSEK", echo_verbose=verbose)
 
-        # Check solve status
-        if problem.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-            raise RuntimeError(f"Power fit problem not solved optimally: {problem.status}")
+        _require_cvxpy_success(problem, "Power fit")
 
         abs_err = np.abs(R_fit.value - Resistance)
 
@@ -428,8 +555,11 @@ class BaseWindModel:
     fit_range : FitRange
     thrust_coeffs: Optional[np.ndarray] = field(default=None, init=False)
     relative_errors: Optional[np.ndarray] = field(default=None, init=False)
+    mean_abs_errors: Optional[np.ndarray] = field(default=None, init=False)
     max_convex_resistance: Optional[np.ndarray] = field(default=None, init=False)
     min_convex_resistance: Optional[np.ndarray] = field(default=None, init=False)
+    combined_mean_abs_errors: Optional[np.ndarray] = field(default=None, init=False)
+    combined_max_abs_errors: Optional[np.ndarray] = field(default=None, init=False)
     big_m_resistance: Optional[float] = field(default=None, init=False)
 
     def compute_resistance(self,
@@ -450,6 +580,47 @@ class BaseWindModel:
         return -tauX/1000000
 
 
+def _eval_wind_poly_1d(coeffs, speed, ship_max_speed):
+    coeffs = np.asarray(coeffs, dtype=float)
+    s = np.asarray(speed, dtype=float) / float(ship_max_speed)
+    return (
+        coeffs[0]
+        + coeffs[1] * s
+        + coeffs[2] * s**2
+        + coeffs[3] * s**3
+        + coeffs[4] * s**4
+    )
+
+
+def _eval_wind_poly_2d(coeffs, vx, vy, ship_max_speed):
+    coeffs = np.asarray(coeffs, dtype=float)
+    vx_n = np.asarray(vx, dtype=float) / float(ship_max_speed)
+    vy_n = np.asarray(vy, dtype=float) / float(ship_max_speed)
+    vs_n = np.sqrt(vx_n * vx_n + vy_n * vy_n)
+    return (
+        coeffs[0]
+        + coeffs[1] * vs_n
+        + coeffs[2] * vs_n**2
+        + coeffs[3] * vs_n**3
+        + coeffs[4] * vs_n**4
+        + coeffs[5] * vx_n
+        + coeffs[6] * vx_n**2
+        + coeffs[7] * vx_n**4
+        + coeffs[8] * vy_n
+        + coeffs[9] * vy_n**2
+        + coeffs[10] * vy_n**4
+    )
+
+
+def _print_wind_fit_summary(name, fit_err, combined_err=None):
+    log.debug("[%s diagnostics]", name)
+    log.debug("  fit mean abs error: %.6g MN", np.nanmean(fit_err))
+    log.debug("  fit worst abs error: %.6g MN", np.nanmax(fit_err))
+    if combined_err is not None:
+        log.debug("  combined mean abs error: %.6g MN", np.nanmean(combined_err))
+        log.debug("  combined worst abs error: %.6g MN", np.nanmax(combined_err))
+
+
 @dataclass
 class WindModel2D(BaseWindModel):
 
@@ -459,7 +630,8 @@ class WindModel2D(BaseWindModel):
         wind_speed_x, #eastward wind speed m/s [vx, vy]
         wind_speed_y, #northward wind speed m/s [vx, vy]
         nb_steps : float = 40,
-        debug: bool = False
+        verbose: bool = False,
+        show_fit_plot: bool = False,
     ):
         vx_vals = np.arange(-self.ship.info.max_speed, self.ship.info.max_speed + 1e-12, 2*(self.ship.info.max_speed)/nb_steps)
         vy_vals = np.arange(-self.ship.info.max_speed, self.ship.info.max_speed + 1e-12, 2*(self.ship.info.max_speed)/nb_steps)
@@ -520,13 +692,12 @@ class WindModel2D(BaseWindModel):
 
         objective = cp.Minimize(cp.sum_squares(cp.multiply(R_fit-Resistance,mask)))
         problem = cp.Problem(objective, constraints)
-        problem.solve(solver="MOSEK", verbose=debug)
+        solve_with_logging(problem, solver="MOSEK", echo_verbose=verbose)
 
         # Check solve status
-        if problem.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-            raise RuntimeError(f"Power fit problem not solved optimally: {problem.status}")
+        _require_cvxpy_success(problem, "Power fit")
 
-        if debug:
+        if show_fit_plot:
             # Prepare masked data for wireframe
             VX_m   = VX.copy()
             VY_m   = VY.copy()
@@ -595,26 +766,72 @@ class WindModel2D(BaseWindModel):
             param_vy_2.value,
             param_vy_4.value,
         ])
-        return np.nanmax(abs_err),coeffs, min(R_fit.value[mask]), max(R_fit.value[mask])
+        return (
+            float(np.nanmax(abs_err)),
+            float(np.nanmean(abs_err)),
+            coeffs,
+            float(np.nanmin(R_fit.value[mask])),
+            float(np.nanmax(R_fit.value[mask])),
+            VX,
+            VY,
+            mask,
+        )
 
     def fit_convex_models(
-        #fit convex wind models for every zone and timestep combination based on weather
+        #fit convex wind models for every set and timestep combination based on weather
         self,
-        wind_speed_x, #wind speed m/s [nb_zones, nb_timestep]
-        wind_speed_y, #wind speed m/s [nb_zones, nb_timestep]
+        wind_speed_x, #wind speed m/s [nb_sets, nb_timestep]
+        wind_speed_y, #wind speed m/s [nb_sets, nb_timestep]
         nb_steps : float = 40,
+        diagnostic_wind_samples=None,
     ):
-        nb_zones                = wind_speed_x.shape[0]
+        nb_sets                = wind_speed_x.shape[0]
         nb_timesteps            = wind_speed_x.shape[1]
-        self.thrust_coeffs      = np.zeros((nb_zones,nb_timesteps,11))
-        self.relative_errors    = np.zeros((nb_zones,nb_timesteps))
-        self.max_convex_resistance    = np.zeros((nb_zones,nb_timesteps))
-        self.min_convex_resistance    = np.zeros((nb_zones,nb_timesteps))
+        self.thrust_coeffs      = np.zeros((nb_sets,nb_timesteps,11))
+        self.relative_errors    = np.zeros((nb_sets,nb_timesteps))
+        self.mean_abs_errors    = np.zeros((nb_sets,nb_timesteps))
+        self.max_convex_resistance    = np.zeros((nb_sets,nb_timesteps))
+        self.min_convex_resistance    = np.zeros((nb_sets,nb_timesteps))
+        if diagnostic_wind_samples is not None:
+            self.combined_mean_abs_errors = np.zeros((nb_sets, nb_timesteps))
+            self.combined_max_abs_errors = np.zeros((nb_sets, nb_timesteps))
 
-        for iz in range(nb_zones):
+        for iz in range(nb_sets):
             for it in range(nb_timesteps):
-                self.relative_errors[iz,it], self.thrust_coeffs[iz,it,:], self.min_convex_resistance[iz,it], self.max_convex_resistance[iz,it] = self.fit_convex_model(wind_speed_x[iz,it],wind_speed_y[iz,it],debug=False)
-            print("zone", iz, "fitted")
+                (
+                    self.relative_errors[iz,it],
+                    self.mean_abs_errors[iz,it],
+                    self.thrust_coeffs[iz,it,:],
+                    self.min_convex_resistance[iz,it],
+                    self.max_convex_resistance[iz,it],
+                    VX,
+                    VY,
+                    mask,
+                ) = self.fit_convex_model(wind_speed_x[iz,it],wind_speed_y[iz,it])
+                if diagnostic_wind_samples is not None:
+                    fit_vals = _eval_wind_poly_2d(
+                        self.thrust_coeffs[iz, it, :],
+                        VX[mask],
+                        VY[mask],
+                        self.ship.info.max_speed,
+                    )
+                    diag = np.asarray(diagnostic_wind_samples[iz, it], dtype=float)
+                    errs = []
+                    for w in diag:
+                        true_vals = np.array([
+                            self.compute_resistance(w, np.array([vx, vy], dtype=float))
+                            for vx, vy in zip(VX[mask], VY[mask])
+                        ])
+                        errs.append(np.abs(fit_vals - true_vals))
+                    errs = np.asarray(errs, dtype=float)
+                    self.combined_mean_abs_errors[iz, it] = float(np.nanmean(errs))
+                    self.combined_max_abs_errors[iz, it] = float(np.nanmax(errs))
+            log.debug("set %s fitted", iz)
+        _print_wind_fit_summary(
+            "WindModel2D",
+            self.mean_abs_errors,
+            self.combined_mean_abs_errors if diagnostic_wind_samples is not None else None,
+        )
         _finalize_resistance_big_m(self)
 
 @dataclass
@@ -627,7 +844,7 @@ class WindModel1D(BaseWindModel):
         wind_speed_y, #northward wind speed m/s
         course_angle, #angle of the ship
         nb_steps : float = 40,
-        debug: bool = False
+        verbose: bool = False,
     ):
         vs_vals = np.arange(self.fit_range.min_speed, self.fit_range.max_speed + 1e-12, (self.fit_range.max_speed-self.fit_range.min_speed)/nb_steps)
 
@@ -661,11 +878,9 @@ class WindModel1D(BaseWindModel):
 
         objective = cp.Minimize(cp.sum_squares(R_fit-Resistance))
         problem = cp.Problem(objective, constraints)
-        problem.solve(solver="MOSEK", verbose=debug)
+        solve_with_logging(problem, solver="MOSEK", echo_verbose=verbose)
 
-        # Check solve status
-        if problem.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-            raise RuntimeError(f"Power fit problem not solved optimally: {problem.status}")
+        _require_cvxpy_success(problem, "Power fit")
 
         abs_err = np.abs(R_fit.value - Resistance)
 
@@ -676,29 +891,164 @@ class WindModel1D(BaseWindModel):
             param_vs_3.value,
             param_vs_4.value,
         ])
-        return np.nanmax(abs_err),coeffs, min(R_fit.value), max(R_fit.value)
+        return (
+            float(np.nanmax(abs_err)),
+            float(np.nanmean(abs_err)),
+            coeffs,
+            float(np.nanmin(R_fit.value)),
+            float(np.nanmax(R_fit.value)),
+            vs_vals,
+            Resistance,
+            R_fit.value,
+        )
 
     def fit_convex_models(
-        #fit convex wind models for every zone and timestep combination based on weather
+        #fit convex wind models for every set and timestep combination based on weather
         self,
-        wind_speed_x, #wind speed m/s [nb_zones, nb_timestep]
-        wind_speed_y, #wind speed m/s [nb_zones, nb_timestep]
-        course_angles, #angle of the ship [nb_zones, nb_timestep]
+        wind_speed_x, #wind speed m/s [nb_sets, nb_timestep]
+        wind_speed_y, #wind speed m/s [nb_sets, nb_timestep]
+        course_angles, #angle of the ship [nb_sets, nb_timestep]
         nb_steps : float = 40,
-        debug = False,
+        diagnostic_wind_samples=None,
     ):
-        nb_zones                = wind_speed_x.shape[0]
+        nb_sets                = wind_speed_x.shape[0]
         nb_timesteps            = wind_speed_x.shape[1]
-        self.thrust_coeffs      = np.zeros((nb_zones,nb_timesteps,5))
-        self.relative_errors    = np.zeros((nb_zones,nb_timesteps))
-        self.max_convex_resistance    = np.zeros((nb_zones,nb_timesteps))
-        self.min_convex_resistance    = np.zeros((nb_zones,nb_timesteps))
+        self.thrust_coeffs      = np.zeros((nb_sets,nb_timesteps,5))
+        self.relative_errors    = np.zeros((nb_sets,nb_timesteps))
+        self.mean_abs_errors    = np.zeros((nb_sets,nb_timesteps))
+        self.max_convex_resistance    = np.zeros((nb_sets,nb_timesteps))
+        self.min_convex_resistance    = np.zeros((nb_sets,nb_timesteps))
+        if diagnostic_wind_samples is not None:
+            self.combined_mean_abs_errors = np.zeros((nb_sets, nb_timesteps))
+            self.combined_max_abs_errors = np.zeros((nb_sets, nb_timesteps))
 
-        for iz in range(nb_zones):
+        for iz in range(nb_sets):
             for it in range(nb_timesteps):
-                self.relative_errors[iz,it], self.thrust_coeffs[iz,it,:], self.min_convex_resistance[iz,it], self.max_convex_resistance[iz,it] = self.fit_convex_model(wind_speed_x[iz,it],wind_speed_y[iz,it], course_angles[iz,it], nb_steps=nb_steps, debug=debug)
-            print("zone", iz, "fitted")
+                (
+                    self.relative_errors[iz,it],
+                    self.mean_abs_errors[iz,it],
+                    self.thrust_coeffs[iz,it,:],
+                    self.min_convex_resistance[iz,it],
+                    self.max_convex_resistance[iz,it],
+                    vs_vals,
+                    _Resistance,
+                    _R_fit,
+                ) = self.fit_convex_model(wind_speed_x[iz,it],wind_speed_y[iz,it], course_angles[iz,it], nb_steps=nb_steps)
+                if diagnostic_wind_samples is not None:
+                    coeffs = self.thrust_coeffs[iz, it, :]
+                    fit_vals = _eval_wind_poly_1d(coeffs, vs_vals, self.ship.info.max_speed)
+                    course = float(course_angles[iz, it])
+                    ship_vecs = np.stack(
+                        [vs_vals * np.cos(course), vs_vals * np.sin(course)],
+                        axis=1,
+                    )
+                    diag = np.asarray(diagnostic_wind_samples[iz, it], dtype=float)
+                    errs = []
+                    for w in diag:
+                        true_vals = np.array([
+                            self.compute_resistance(w, ship_vec)
+                            for ship_vec in ship_vecs
+                        ])
+                        errs.append(np.abs(fit_vals - true_vals))
+                    errs = np.asarray(errs, dtype=float)
+                    self.combined_mean_abs_errors[iz, it] = float(np.nanmean(errs))
+                    self.combined_max_abs_errors[iz, it] = float(np.nanmax(errs))
+            log.debug("set %s fitted", iz)
+        _print_wind_fit_summary(
+            "WindModel1D",
+            self.mean_abs_errors,
+            self.combined_mean_abs_errors if diagnostic_wind_samples is not None else None,
+        )
         _finalize_resistance_big_m(self)
+
+
+@dataclass
+class WindModelTransition1D(WindModel1D):
+    valid_pairs: Optional[np.ndarray] = field(default=None, init=False)
+
+    def fit_convex_models(
+        self,
+        wind_speed_x,
+        wind_speed_y,
+        course_angles,
+        valid_pairs,
+        nb_steps: float = 40,
+        diagnostic_wind_samples=None,
+    ):
+        wind_speed_x = np.asarray(wind_speed_x, dtype=float)
+        wind_speed_y = np.asarray(wind_speed_y, dtype=float)
+        course_angles = np.asarray(course_angles, dtype=float)
+        valid_pairs = np.asarray(valid_pairs, dtype=bool)
+
+        nb_sets = wind_speed_x.shape[0]
+        nb_timesteps = wind_speed_x.shape[2]
+        if wind_speed_x.shape != (nb_sets, nb_sets, nb_timesteps):
+            raise ValueError("wind_speed_x must have shape (nb_sets, nb_sets, nb_timesteps).")
+        if wind_speed_y.shape != wind_speed_x.shape:
+            raise ValueError("wind_speed_y must match wind_speed_x shape.")
+        if course_angles.shape != wind_speed_x.shape:
+            raise ValueError("course_angles must match wind_speed_x shape.")
+        if valid_pairs.shape != (nb_sets, nb_sets):
+            raise ValueError("valid_pairs must have shape (nb_sets, nb_sets).")
+
+        self.valid_pairs = valid_pairs
+        self.thrust_coeffs = np.full((nb_sets, nb_sets, nb_timesteps, 5), np.nan, dtype=float)
+        self.relative_errors = np.full((nb_sets, nb_sets, nb_timesteps), np.nan, dtype=float)
+        self.mean_abs_errors = np.full((nb_sets, nb_sets, nb_timesteps), np.nan, dtype=float)
+        self.max_convex_resistance = np.full((nb_sets, nb_sets, nb_timesteps), np.nan, dtype=float)
+        self.min_convex_resistance = np.full((nb_sets, nb_sets, nb_timesteps), np.nan, dtype=float)
+        if diagnostic_wind_samples is not None:
+            self.combined_mean_abs_errors = np.full((nb_sets, nb_sets, nb_timesteps), np.nan, dtype=float)
+            self.combined_max_abs_errors = np.full((nb_sets, nb_sets, nb_timesteps), np.nan, dtype=float)
+
+        for z0 in range(nb_sets):
+            for z1 in range(nb_sets):
+                if not valid_pairs[z0, z1]:
+                    continue
+                for t in range(nb_timesteps):
+                    (
+                        self.relative_errors[z0, z1, t],
+                        self.mean_abs_errors[z0, z1, t],
+                        self.thrust_coeffs[z0, z1, t, :],
+                        self.min_convex_resistance[z0, z1, t],
+                        self.max_convex_resistance[z0, z1, t],
+                        vs_vals,
+                        _Resistance,
+                        _R_fit,
+                    ) = self.fit_convex_model(
+                        wind_speed_x[z0, z1, t],
+                        wind_speed_y[z0, z1, t],
+                        course_angles[z0, z1, t],
+                        nb_steps=nb_steps,
+                    )
+                    if diagnostic_wind_samples is not None:
+                        coeffs = self.thrust_coeffs[z0, z1, t, :]
+                        fit_vals = _eval_wind_poly_1d(coeffs, vs_vals, self.ship.info.max_speed)
+                        course = float(course_angles[z0, z1, t])
+                        ship_vecs = np.stack(
+                            [vs_vals * np.cos(course), vs_vals * np.sin(course)],
+                            axis=1,
+                        )
+                        diag = np.asarray(diagnostic_wind_samples[z0, z1, t], dtype=float)
+                        errs = []
+                        for w in diag:
+                            true_vals = np.array([
+                                self.compute_resistance(w, ship_vec)
+                                for ship_vec in ship_vecs
+                            ])
+                            errs.append(np.abs(fit_vals - true_vals))
+                        errs = np.asarray(errs, dtype=float)
+                        self.combined_mean_abs_errors[z0, z1, t] = float(np.nanmean(errs))
+                        self.combined_max_abs_errors[z0, z1, t] = float(np.nanmax(errs))
+                log.debug("transition pair %s->%s wind fitted", z0, z1)
+
+        _print_wind_fit_summary(
+            "WindModelTransition1D",
+            self.mean_abs_errors,
+            self.combined_mean_abs_errors if diagnostic_wind_samples is not None else None,
+        )
+        _finalize_resistance_big_m(self)
+
 
 @dataclass
 class WindModelPathAligned2D(BaseWindModel):
@@ -734,7 +1084,7 @@ class WindModelPathAligned2D(BaseWindModel):
         course_angle,
         nb_speed_steps: int = 40,
         nb_angle_steps: int = 21,
-        debug: bool = False,
+        verbose: bool = False,
         conservative: bool = False,
     ):
         theta_max = np.deg2rad(self.heading_half_angle_deg)
@@ -818,10 +1168,9 @@ class WindModelPathAligned2D(BaseWindModel):
 
         objective = cp.Minimize(cp.sum_squares(R_fit - Resistance))
         problem = cp.Problem(objective, constraints)
-        problem.solve(solver="MOSEK", verbose=debug)
+        solve_with_logging(problem, solver="MOSEK", echo_verbose=verbose)
 
-        if problem.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-            raise RuntimeError(f"Wind fit problem not solved optimally: {problem.status}")
+        _require_cvxpy_success(problem, "Wind fit")
 
         abs_err = np.abs(R_fit.value - Resistance)
 
@@ -843,6 +1192,7 @@ class WindModelPathAligned2D(BaseWindModel):
 
         return (
             float(np.nanmax(abs_err)),
+            float(np.nanmean(abs_err)),
             coeffs,
             float(np.nanmin(R_fit.value)),
             float(np.nanmax(R_fit.value)),
@@ -864,18 +1214,23 @@ class WindModelPathAligned2D(BaseWindModel):
         course_angles,
         nb_speed_steps: int = 40,
         nb_angle_steps: int = 21,
-        debug: bool = False,
         conservative: bool = False,
+        diagnostic_wind_samples=None,
+        show_fit_plots: bool = False,
     ):
         nb_segments = wind_speed_x.shape[0]
         nb_timesteps = wind_speed_x.shape[1]
 
         self.thrust_coeffs = np.zeros((nb_segments, nb_timesteps, 11))
         self.relative_errors = np.zeros((nb_segments, nb_timesteps))
+        self.mean_abs_errors = np.zeros((nb_segments, nb_timesteps))
         self.max_convex_resistance = np.zeros((nb_segments, nb_timesteps))
         self.min_convex_resistance = np.zeros((nb_segments, nb_timesteps))
         self.mean_true_resistance = np.zeros((nb_segments, nb_timesteps))
         self.max_true_resistance = np.zeros((nb_segments, nb_timesteps))
+        if diagnostic_wind_samples is not None:
+            self.combined_mean_abs_errors = np.zeros((nb_segments, nb_timesteps))
+            self.combined_max_abs_errors = np.zeros((nb_segments, nb_timesteps))
 
         self.speed_constraint_A = np.zeros((nb_segments, 2, 2))
         self.speed_constraint_b = np.zeros((nb_segments, 2))
@@ -899,6 +1254,7 @@ class WindModelPathAligned2D(BaseWindModel):
             for t in range(nb_timesteps):
                 (
                     err,
+                    mean_err,
                     coeffs,
                     min_fit,
                     max_fit,
@@ -917,16 +1273,37 @@ class WindModelPathAligned2D(BaseWindModel):
                     course_angles[s, t],
                     nb_speed_steps=nb_speed_steps,
                     nb_angle_steps=nb_angle_steps,
-                    debug=False,
                     conservative=conservative,
                 )
 
                 self.relative_errors[s, t] = err
+                self.mean_abs_errors[s, t] = mean_err
                 self.thrust_coeffs[s, t, :] = coeffs
                 self.min_convex_resistance[s, t] = min_fit
                 self.max_convex_resistance[s, t] = max_fit
                 self.mean_true_resistance[s, t] = mean_true
                 self.max_true_resistance[s, t] = max_true
+                if diagnostic_wind_samples is not None:
+                    fit_vals = _eval_wind_poly_2d(
+                        coeffs,
+                        VX,
+                        VY,
+                        self.ship.info.max_speed,
+                    )
+                    diag = np.asarray(diagnostic_wind_samples[s, t], dtype=float)
+                    errs = []
+                    for w in diag:
+                        true_vals = np.zeros_like(VX, dtype=float)
+                        for iy in range(VX.shape[0]):
+                            for ix in range(VX.shape[1]):
+                                true_vals[iy, ix] = self.compute_resistance(
+                                    w,
+                                    np.array([VX[iy, ix], VY[iy, ix]], dtype=float),
+                                )
+                        errs.append(np.abs(fit_vals - true_vals))
+                    errs = np.asarray(errs, dtype=float)
+                    self.combined_mean_abs_errors[s, t] = float(np.nanmean(errs))
+                    self.combined_max_abs_errors[s, t] = float(np.nanmax(errs))
 
                 if err > worst["err"]:
                     worst.update({
@@ -940,18 +1317,22 @@ class WindModelPathAligned2D(BaseWindModel):
                         "E": E,
                     })
 
-            print("path segment", s, "wind fitted")
+            log.debug("path segment %s wind fitted", s)
 
-        if debug:
-            print("\n[WindModelPathAligned2D debug]")
-            print("Worst absolute fit error:", worst["err"])
-            print("Worst segment:", worst["s"])
-            print("Worst timestep:", worst["t"])
-            print("Average true wind resistance:",
-                  np.nanmean(np.abs(self.mean_true_resistance)))
-            print("Max true wind resistance:",
-                  np.nanmax(np.abs(self.max_true_resistance)))
+        _print_wind_fit_summary(
+            "WindModelPathAligned2D",
+            self.mean_abs_errors,
+            self.combined_mean_abs_errors if diagnostic_wind_samples is not None else None,
+        )
 
+        log.debug("[WindModelPathAligned2D diagnostics]")
+        log.debug("Worst absolute fit error: %s", worst["err"])
+        log.debug("Worst segment: %s", worst["s"])
+        log.debug("Worst timestep: %s", worst["t"])
+        log.debug("Average true wind resistance: %s", np.nanmean(np.abs(self.mean_true_resistance)))
+        log.debug("Max true wind resistance: %s", np.nanmax(np.abs(self.max_true_resistance)))
+
+        if show_fit_plots:
             for Z, title in [
                 (worst["Rtrue"], "True wind resistance"),
                 (worst["Rfit"], "Fitted wind resistance"),
@@ -995,6 +1376,9 @@ class PropulsionModel:
     max_thrust: Optional[np.float] = field(default=None, init=False)
     min_ua: Optional[np.float] = field(default=None, init=False)
     max_ua: Optional[np.float] = field(default=None, init=False)
+    physical_max_ua: Optional[np.float] = field(default=None, init=False)
+    physical_max_thrust: Optional[np.float] = field(default=None, init=False)
+    pitches: Optional[np.ndarray] = field(default=None, init=False)
     max_J: Optional[np.ndarray] = field(default=None, init=False)
 
     # Study Grid
@@ -1012,6 +1396,7 @@ class PropulsionModel:
     power_coeffs: Optional[np.ndarray] = field(default=None, init=False)
     thrust_coeffs: Optional[np.ndarray] = field(default=None, init=False)
     constraint_params: Optional[np.ndarray] = field(default=None, init=False)
+    constraint_fit_stats: Optional[dict] = field(default=None, init=False)
 
     def __post_init__(self):
         #simple limits
@@ -1019,6 +1404,14 @@ class PropulsionModel:
         self.max_ua = (1.0 - self.ship.propulsion.wake_fraction) * self.fit_range.max_speed
         self.min_thrust = self.fit_range.min_resistance/self.ship.propulsion.nb_propellers
         self.pitches = np.linspace(self.ship.propulsion.min_pitch,self.ship.propulsion.max_pitch,self.pitch_granularity)
+        self.physical_max_ua = (
+            (1.0 - self.ship.propulsion.wake_fraction)
+            * self.ship.info.max_speed
+        )
+        self.physical_max_thrust = max(
+            float(self.compute_thrust(0.0, self.ship.propulsion.max_n, pitch))
+            for pitch in self.pitches
+        )
         self.max_thrust = 0
         self.max_J = np.zeros(len(self.pitches))
         for p in range(len(self.pitches)):
@@ -1028,13 +1421,37 @@ class PropulsionModel:
         if self.max_thrust>self.fit_range.max_resistance/self.ship.propulsion.nb_propellers:
             self.max_thrust = self.fit_range.max_resistance/self.ship.propulsion.nb_propellers
 
+        for p in range(len(self.pitches)):
+            self.max_J[p] = self.compute_max_J(self.pitches[p])
+
+    def has_fit_grid(self) -> bool:
+        return (
+            self.ua_vals is not None
+            and self.thrust_vals is not None
+            and self.U is not None
+            and self.T is not None
+            and self.P_real is not None
+            and self.mask_feasible_n is not None
+        )
+
+    def has_convex_fit(self) -> bool:
+        return (
+            self.power_coeffs is not None
+            and self.constraint_params is not None
+        )
+
+    def require_convex_fit(self, context: str = "This operation") -> None:
+        if not self.has_convex_fit():
+            raise ValueError(f"{context} requires PropulsionModel.fit_convex_model() first.")
+
+    def ensure_fit_grid(self) -> None:
+        if self.has_fit_grid():
+            return
+
         #study grid
         self.ua_vals = np.linspace(self.min_ua, self.max_ua, num=self.grid_granularity, endpoint=True, retstep=False, dtype=None)
         self.n_vals = np.linspace(0.1, self.ship.propulsion.max_n, num=self.grid_granularity, endpoint=True, retstep=False, dtype=None)
         self.thrust_vals = np.linspace(self.min_thrust, self.max_thrust, num=self.grid_granularity, endpoint=True, retstep=False, dtype=None)
-
-        for p in range(len(self.pitches)):
-            self.max_J[p] = self.compute_max_J(self.pitches[p], debug=False)
 
         # Compute real Powers
         self.T, self.U = np.meshgrid(self.thrust_vals, self.ua_vals)
@@ -1042,7 +1459,7 @@ class PropulsionModel:
         mask = np.ones(np.shape(P_real), dtype=bool)
         for i in range(self.T.shape[0]):
             for j in range(self.T.shape[1]):
-                p, n_solution, feasible, best_pitch = self.compute_power_from_ua_res(self.U[i, j], self.T[i, j], eval_infeasible=False, debug=False)
+                p, n_solution, feasible, best_pitch = self.compute_power_from_ua_res(self.U[i, j], self.T[i, j], eval_infeasible=False)
                 mask[i, j] = feasible
                 P_real[i, j] = p
             progress = (i + 1) / self.T.shape[0]
@@ -1106,69 +1523,80 @@ class PropulsionModel:
         Power = (2*np.pi * n * Q)/1000000
         return max(Power,0)
 
-    def compute_max_J(self,pitch, debug=False):
+    def compute_max_J(self,pitch):
         #compute max J (0 thrust value)
-        U, N = np.meshgrid(self.ua_vals, self.n_vals)
-        J = U/(N*self.ship.propulsion.D)
-        j_vals = np.linspace(np.min(J), np.max(J), num=self.grid_granularity*2, endpoint=True, retstep=False, dtype=None)
-        KT = self.compute_KT(j_vals,pitch)
+        nb_samples = max(200, int(self.grid_granularity) * 20)
+        j_max = 2.0
+        max_search_j = 64.0
 
-        # Find indices where KT crosses zero
-        sign_change_indices = np.where(np.diff(np.sign(KT)))[0]
+        while j_max <= max_search_j:
+            j_vals = np.linspace(0.0, j_max, num=nb_samples, endpoint=True)
+            KT = np.asarray(self.compute_KT(j_vals,pitch), dtype=float)
 
-        # Interpolate to find more accurate J values where KT crosses 0
-        J_zero_crossings = []
-        for i in sign_change_indices:
-            j1, j2 = j_vals[i], j_vals[i + 1]
-            kt1, kt2 = KT[i], KT[i + 1]
-            # Linear interpolation: J_zero = j1 - kt1 * (j2 - j1) / (kt2 - kt1)
-            if kt2 != kt1:  # avoid divide-by-zero
-                j_zero = j1 - kt1 * (j2 - j1) / (kt2 - kt1)
-                J_zero_crossings.append(j_zero)
+            # Find indices where KT crosses zero
+            sign_change_indices = np.where(np.diff(np.sign(KT)))[0]
 
-        if debug:
-            print("KT = 0 at J ≈", J_zero_crossings)
-        return np.min(J_zero_crossings)
+            # Interpolate to find more accurate J values where KT crosses 0
+            J_zero_crossings = []
+            for i in sign_change_indices:
+                j1, j2 = j_vals[i], j_vals[i + 1]
+                kt1, kt2 = KT[i], KT[i + 1]
+                # Linear interpolation: J_zero = j1 - kt1 * (j2 - j1) / (kt2 - kt1)
+                if kt2 != kt1:  # avoid divide-by-zero
+                    j_zero = j1 - kt1 * (j2 - j1) / (kt2 - kt1)
+                    J_zero_crossings.append(j_zero)
+
+            if J_zero_crossings:
+                log.debug("KT = 0 at J approx %s", J_zero_crossings)
+                return np.min(J_zero_crossings)
+
+            j_max *= 2.0
+
+        raise ValueError(f"Could not find KT=0 crossing for pitch {pitch}.")
 
 
-    def power_from_ua_res_fixed_pitch(self, ua, R_req, pitch, max_J, eval_infeasible=False, debug=False):
+    def power_from_ua_res_fixed_pitch(self, ua, R_req, pitch, max_J, eval_infeasible=False):
         feasible = True
         max_thrust_at_speed = self.compute_thrust(ua-eps, self.ship.propulsion.max_n-eps, pitch)
 
         if(max_thrust_at_speed-eps<R_req):
-            if debug:
-                print("R_req (", R_req,") too High at speed", ua, "combination infeasible.")
+            log.debug("R_req (%s) too high at speed %s; combination infeasible.", R_req, ua)
             feasible = False
             if(eval_infeasible==False):
                 return 0,0, feasible
 
         if(R_req<eps):
-            if debug:
-                print("negative R_req : ", R_req, "0 power required. Still feasible.")
+            log.debug("negative R_req: %s; 0 power required. Still feasible.", R_req)
             return 0, 0, feasible  # 0 power if 0 thrust or less required
 
         zero_thrust_n = ua/(max_J*self.ship.propulsion.D)
 
         def f(n):
             return self.compute_thrust(ua, n, pitch) - R_req
-        if eval_infeasible:
-            n_solution = bisection(f, zero_thrust_n, 2*self.ship.propulsion.max_n, tol=1e-6, max_iter=100)
-        else:
-            try:
-                n_solution = bisection(f, zero_thrust_n, self.ship.propulsion.max_n, tol=1e-6, max_iter=60)
-            except:
-                print(f(zero_thrust_n),f(self.ship.propulsion.max_n))
-                print(R_req)
-                print(self.compute_thrust(ua, zero_thrust_n,pitch))
-                print(ua/(zero_thrust_n*self.ship.propulsion.D))
+
+        upper_n = (
+            2*self.ship.propulsion.max_n
+            if eval_infeasible
+            else self.ship.propulsion.max_n
+        )
+        try:
+            n_solution = bisection(f, zero_thrust_n, upper_n, tol=1e-6, max_iter=100 if eval_infeasible else 60)
+        except ValueError:
+            log.debug("Bisection failed: f(zero_thrust_n)=%s, f(upper_n)=%s", f(zero_thrust_n), f(upper_n))
+            log.debug("R_req=%s", R_req)
+            log.debug("zero-thrust thrust=%s", self.compute_thrust(ua, zero_thrust_n, pitch))
+            log.debug("advance ratio=%s", ua/(zero_thrust_n*self.ship.propulsion.D))
+            if eval_infeasible:
+                return np.nan, np.nan, False
+            return 0.0, 0.0, False
 
         P = self.compute_power(ua, n_solution,pitch)
         return P, n_solution, feasible
 
-    def compute_power_from_ua_res(self, ua, R_req, eval_infeasible=False, debug=False):
+    def compute_power_from_ua_res(self, ua, R_req, eval_infeasible=False):
 
         if(abs(self.ship.propulsion.min_pitch-self.ship.propulsion.max_pitch)<eps):
-            P, n_solution, feasible = self.power_from_ua_res_fixed_pitch(ua, R_req, self.ship.propulsion.max_pitch, self.max_J[-1], eval_infeasible=eval_infeasible, debug=False)
+            P, n_solution, feasible = self.power_from_ua_res_fixed_pitch(ua, R_req, self.ship.propulsion.max_pitch, self.max_J[-1], eval_infeasible=eval_infeasible)
             return P, n_solution, feasible, self.ship.propulsion.max_pitch
 
         min_power = 100000000000000000000000000
@@ -1176,7 +1604,7 @@ class PropulsionModel:
         best_n = -1
         feas = False
         for p in range(len(self.pitches)):
-            P, n_solution, feasible = self.power_from_ua_res_fixed_pitch(ua, R_req, self.pitches[p], self.max_J[p], eval_infeasible=eval_infeasible, debug=False)
+            P, n_solution, feasible = self.power_from_ua_res_fixed_pitch(ua, R_req, self.pitches[p], self.max_J[p], eval_infeasible=eval_infeasible)
             if(feasible and (P<min_power)):
                 feas = True
                 min_power = P
@@ -1191,20 +1619,30 @@ class PropulsionModel:
     #=======================================Convex approximation===================================================
     def fit_feasibility_boundary(
         self,
-        debug: bool = False,
+        verbose: bool = False,
     ) -> np.ndarray:
         """
-        Fit a conservative convex feasible-region constraint from a feasibility mask.
+        Fit a conservative linear max-rotation constraint on the propulsion
+        fit-domain grid.
 
         Returns
         -------
-        constraint_params : np.ndarray, shape (K, 3)
-            Each row is [a, b, c] for inequality a*thrust + b*speed <= c.
+        constraint_params : np.ndarray, shape (2,)
+            Values [a, b] for inequality a*advance_speed + thrust + b <= 0.
         """
+        if (
+            self.ua_vals is None
+            or self.thrust_vals is None
+            or self.U is None
+            or self.T is None
+            or self.mask_feasible_n is None
+        ):
+            self.ensure_fit_grid()
+
         M = 10000
+        ua_vals = np.asarray(self.ua_vals, dtype=float)
+        thrust_vals = np.asarray(self.thrust_vals, dtype=float)
         mask = np.asarray(self.mask_feasible_n, dtype=bool)
-        ua_vals = np.asarray(self.ua_vals, dtype=float).ravel()
-        thrust_vals = np.asarray(self.thrust_vals, dtype=float).ravel()
         nb_s = len(ua_vals)
         nb_t = len(thrust_vals)
 
@@ -1215,23 +1653,56 @@ class PropulsionModel:
         constraints = []
         for i_s in range(nb_s):
             for i_t in range(nb_t):
-                if(self.mask_feasible_n[i_s,i_t]):
+                if(mask[i_s,i_t]):
                     constraints += [a*ua_vals[i_s]+thrust_vals[i_t]+b<=M*(1-included[i_s,i_t])]
 
                 else:
-                    constraints += [a*ua_vals[i_s]+thrust_vals[i_t] + b>=0]
+                    constraints += [a*ua_vals[i_s]+thrust_vals[i_t] + b>=eps]
                     constraints += [included[i_s,i_t] == 0]
 
 
         objective = cp.Maximize(cp.sum(included))
 
         prob = cp.Problem(objective, constraints)
-        prob.solve(solver="MOSEK", verbose=debug)
+        solve_with_logging(prob, solver="MOSEK", echo_verbose=verbose)
 
-        if prob.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-            raise RuntimeError(f"Feasibility-boundary fit failed: {prob.status}")
+        _require_cvxpy_success(prob, "Feasibility-boundary fit")
 
         constraint_params = np.array([a.value,b.value])
+
+        a_val, b_val = float(constraint_params[0]), float(constraint_params[1])
+        line_values = a_val * np.asarray(self.U, dtype=float) + np.asarray(self.T, dtype=float) + b_val
+        excluded_feasible = mask & (line_values > eps)
+        feasible_fit_points = int(np.sum(mask))
+        excluded_feasible_points = int(np.sum(excluded_feasible))
+        excluded_feasible_fraction = (
+            excluded_feasible_points / feasible_fit_points
+            if feasible_fit_points > 0
+            else 0.0
+        )
+        self.constraint_fit_stats = {
+            "feasible_fit_points": feasible_fit_points,
+            "excluded_feasible_points": excluded_feasible_points,
+            "excluded_feasible_fraction": excluded_feasible_fraction,
+        }
+        message = (
+            "Propulsion rotation boundary excluded %d / %d feasible fit-grid "
+            "points (%.2f%%)."
+        )
+        log.progress(
+            message,
+            excluded_feasible_points,
+            feasible_fit_points,
+            100.0 * excluded_feasible_fraction,
+        )
+        if excluded_feasible_fraction > 0.05:
+            log.warning(
+                "[PROPULSION WARNING] Rotation boundary excluded %d / %d "
+                "feasible fit-grid points (%.2f%% > 5%%).",
+                excluded_feasible_points,
+                feasible_fit_points,
+                100.0 * excluded_feasible_fraction,
+            )
 
         self.constraint_params = constraint_params
         return constraint_params
@@ -1248,6 +1719,7 @@ class PropulsionModel:
         return min_pow, max_pow
 
     def _power_fit_domain_mask(self) -> np.ndarray:
+        self.ensure_fit_grid()
         min_pow, max_pow = self._power_fit_limits()
         mask_power = (
             np.isfinite(self.P_real)
@@ -1259,10 +1731,12 @@ class PropulsionModel:
 
     def fit_convex_model(
         self,
-        debug: bool = False
+        verbose: bool = False,
     ):
+        self.ensure_fit_grid()
+
         #Compute feasibility constraints to exclude infeasible speed thrust combinations
-        self.fit_feasibility_boundary(debug=debug)
+        self.fit_feasibility_boundary(verbose=verbose)
 
         #Only include points in the power limits in the fit
         min_pow, max_pow = self._power_fit_limits()
@@ -1273,7 +1747,7 @@ class PropulsionModel:
                 f"and fit limits [{self.fit_range.min_prop_power/self.ship.propulsion.nb_propellers}, {self.fit_range.max_prop_power/self.ship.propulsion.nb_propellers}]"
             )
         mask_fit = self._power_fit_domain_mask()
-        print(np.sum(mask_fit), "feasible points are considered in the propulsion fit")
+        log.debug("%s feasible points are considered in the propulsion fit", np.sum(mask_fit))
 
         #Fit a convex power model
         r_vals_norm = self.thrust_vals/self.max_thrust
@@ -1309,9 +1783,8 @@ class PropulsionModel:
 
         objective = cp.Minimize(cp.sum_squares(cp.multiply(Pow_fit-self.P_real,mask_fit)))
         problem = cp.Problem(objective, constraints)
-        problem.solve(solver="MOSEK", verbose=debug)
-        if problem.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-            raise RuntimeError(f"Power fit problem not solved optimally: {problem.status}")
+        solve_with_logging(problem, solver="MOSEK", echo_verbose=verbose)
+        _require_cvxpy_success(problem, "Power fit")
 
         # Save coefficients in the object
         self.power_coeffs = np.array([
@@ -1327,8 +1800,7 @@ class PropulsionModel:
         self.P_fit = Pow_fit.value
 
         # Check solve status
-        if problem.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-            raise RuntimeError(f"Power fit problem not solved optimally: {problem.status}")
+        _require_cvxpy_success(problem, "Power fit")
         abs_err_P = np.abs(Pow_fit.value[mask_fit] - self.P_real[mask_fit])
         self.mask_fit = mask_fit
 
@@ -1508,8 +1980,7 @@ class PropulsionModel:
         Optionally overlays the fitted physical boundary from constraint_params
         and the smaller power-fit domain used by the power heatmaps.
         """
-        if self.mask_fit is None or self.ua_vals is None or self.thrust_vals is None:
-            raise ValueError("Missing mask/ua_vals/thrust_vals. Run fit_convex_model() first.")
+        self.ensure_fit_grid()
 
         Th, S, mask, ua_vals, thrust_vals = self._mesh()
 
@@ -1532,7 +2003,7 @@ class PropulsionModel:
 
         if show_boundary:
             if self.constraint_params is None or len(self.constraint_params) < 2:
-                print("No constraint_params to plot boundary.")
+                log.warning("No constraint_params to plot boundary.")
             else:
                 # Your constraint_params is [a, b] (based on your code)
                 # and your constraint was: a*ua_vals + thrust + b <= 0 (up to your formulation)
@@ -1644,7 +2115,7 @@ class GeneratorModel:
     power_coeffs: Optional[np.ndarray] = field(default=None, init=False)
 
     def __post_init__(self):
-        self.fit_convex_model(debug=False)
+        self.fit_convex_model()
 
     def compute_fuel_consumption(self, p_mw):
         # Returns fuel consumption in kg/h based on output power in MW.
@@ -1657,7 +2128,7 @@ class GeneratorModel:
 
     def fit_convex_model(
         self,
-        debug: bool = False
+        show_fit_plot: bool = False,
     ):
         self.power_coeffs = np.array([
             float(self.generator.fuel_intercept),
@@ -1665,7 +2136,7 @@ class GeneratorModel:
             float(self.generator.fuel_quadratic),
         ], dtype=float)
 
-        if debug:
+        if show_fit_plot:
             fig, ax = plt.subplots(figsize=(8, 6))
 
             powers = np.linspace(
@@ -1689,12 +2160,10 @@ class GeneratorModel:
             ax.legend(fontsize=12)
             plt.tight_layout()
             plt.show()
-            print(
-                "Fuel rate = ",
+            log.debug(
+                "Fuel rate = %s *power^2 + %s *power + %s",
                 self.generator.fuel_quadratic,
-                "*power^2 + ",
                 self.generator.fuel_linear,
-                "*power + ",
                 self.generator.fuel_intercept,
             )
 

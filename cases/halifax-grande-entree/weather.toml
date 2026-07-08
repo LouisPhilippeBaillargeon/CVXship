@@ -1,0 +1,4 @@
+[files]
+currents = "../../weather_data/currents_2025_06_01_to_2025_06_02.nc"
+atmo = "../../weather_data/atmo_2025_06_01_to_2025_06_02.nc"
+sun = "../../weather_data/sun_2025_06_01_to_2025_06_02.nc"

@@ -24,6 +24,10 @@ tmp/
 simulation/
 weather_data/
 
+# Generated map data
+cases/**/map/depth_grid.csv
+config/**/map*/depth_grid.csv
+
 
 *.png
 *.pdf

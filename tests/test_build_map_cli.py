@@ -3,13 +3,11 @@ from pathlib import Path
 import pytest
 
 from build_map import _parse_args
-from lib.paths import CONFIG
 
 
-def test_build_map_defaults_to_baseline_case():
-    args = _parse_args([])
-
-    assert args.case == CONFIG
+def test_build_map_requires_case_directory():
+    with pytest.raises(SystemExit):
+        _parse_args([])
 
 
 def test_build_map_accepts_case_flag():
@@ -32,4 +30,4 @@ def test_build_map_normalizes_common_cases_path_typo():
 
 def test_build_map_rejects_duplicate_case_paths():
     with pytest.raises(SystemExit):
-        _parse_args(["--case", "cases/baseline", "cases/sept-iles-gaspe"])
+        _parse_args(["--case", "cases/halifax-grande-entree", "cases/sept-iles-gaspe"])
