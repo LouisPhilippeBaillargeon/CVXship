@@ -6,7 +6,7 @@
 # min_depth     : Minimum navigable water depth (m)
 # ============================
 [info]
-max_speed       = 7.8
+max_speed       = 10
 rho_water       = 1025
 rho_air         = 1.224
 min_depth       = 15.525

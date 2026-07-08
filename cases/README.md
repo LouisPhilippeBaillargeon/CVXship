@@ -62,6 +62,32 @@ Build or edit a case map with:
 python build_map.py --case cases/sept-iles-gaspe
 ```
 
+Seed a fresh case map from exact coordinate-defined sets with:
+
+```powershell
+python seed_coordinate_sets.py --case cases/sept-iles-gaspe
+```
+
+The script reads `coordinate_sets.toml` from the case directory unless
+`--coordinate-sets` points to another file. If the case already has files in
+`map/`, it asks before deleting them and rebuilding the map from only the
+coordinate-defined sets. Use `--yes` for non-interactive runs. Set IDs are
+assigned in the same order as the TOML tables and can be referenced from
+`map.toml` speed limits.
+
+Example `coordinate_sets.toml`:
+
+```toml
+[[set]]
+name = "dynamic_shipping_zone_a"
+points = [
+  { lat = "49 41 N", lon = "065 00 W" },
+  { lat = "49 20 N", lon = "065 00 W" },
+  { lat = "49 11 N", lon = "064 00 W" },
+  { lat = "49 22 N", lon = "064 00 W" },
+]
+```
+
 Each run writes to `results/runs/<timestamp>_<name>/` with input snapshots,
 plots, solution pickles, `summary.csv`, `summary.json`, `manifest.json`, and
 `console.log`.

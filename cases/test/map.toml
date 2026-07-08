@@ -9,20 +9,7 @@ resolution_km = 1.0
 # the generated set index. Omitted sets/times default to ship.info.max_speed.
 # Time windows apply conservatively to every itinerary interval they overlap.
 # Boundary-only path contact is ignored with a 1e-5 km tolerance.
-# set = id
-# speed = max
-# from = "2024-03-21T18:00"
-# until = "2024-03-22T18:00"
-
-[[speed_limit]]
-set = 1
-speed = 5.14444444
-
-[[speed_limit]]
-set = 2
-speed = 5.14444444
-
-[[speed_limit]]
-set = 3
-speed = 5.14444444
-
+#
+#[[speed_limit]]
+#set = 0
+#speed = 5.14444444

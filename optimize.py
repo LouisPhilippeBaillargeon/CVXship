@@ -36,6 +36,7 @@ new_ship = True
 dimensions = "both"  # "1D", "2D" or "both"
 solver_verbose = True
 unit_commitment = False
+run_jpcse_transit_wind = False
 
 
 def _parse_args(argv=None):
@@ -382,6 +383,11 @@ if __name__ == "__main__":
         raise ValueError("dimensions must be one of: 1D, 2D, both")
     solver_verbose = bool(_option(args.solver_verbose, run_toml_options, "solver_verbose", solver_verbose))
     unit_commitment = bool(_option(args.unit_commitment, run_toml_options, "unit_commitment", unit_commitment))
+    run_jpcse_transit_wind = _run_bool_option(
+        run_toml_options,
+        ("run_jpcse_transit_wind",),
+        run_jpcse_transit_wind,
+    )
     ordered_sets = _run_bool_option(
         run_toml_options,
         ("ordered_sets",),
@@ -456,6 +462,7 @@ if __name__ == "__main__":
         "new_weather": new_weather,
         "solver_verbose": solver_verbose,
         "unit_commitment": unit_commitment,
+        "run_jpcse_transit_wind": run_jpcse_transit_wind,
         "ordered_sets": ordered_sets,
         "path_generator": path_generator,
         "path_solution_json": str(path_solution_json) if path_solution_json is not None else None,
@@ -493,7 +500,8 @@ if __name__ == "__main__":
     log.progress("[RUN] cache=%s", run_context.cache_dir)
 
     WIND_MODEL_1D = run_context.cache_path("wind_model_1d")
-    WIND_MODEL_TRANSITION_1D = run_context.cache_path("wind_model_transition_1d")
+    if run_jpcse_transit_wind:
+        WIND_MODEL_TRANSITION_1D = run_context.cache_path("wind_model_transition_1d")
     WIND_MODEL_2D = run_context.cache_path("wind_model_2d")
     WIND_MODEL_PATH_ALIGNED_2D = run_context.cache_path("wind_model_path_aligned_2d")
     PROPULSION_MODEL = run_context.cache_path("propulsion_model")
@@ -697,14 +705,15 @@ if __name__ == "__main__":
         weather_files=cache_weather_files,
         ordered_sets=True,
     )
-    wind_model_transition_1d_metadata = _cache_metadata(
-        run_context,
-        fit_range,
-        "wind_model_transition_1d",
-        case_inputs=cache_case_inputs,
-        weather_files=cache_weather_files,
-        route_directions=bool(ordered_sets),
-    )
+    if run_jpcse_transit_wind:
+        wind_model_transition_1d_metadata = _cache_metadata(
+            run_context,
+            fit_range,
+            "wind_model_transition_1d",
+            case_inputs=cache_case_inputs,
+            weather_files=cache_weather_files,
+            route_directions=bool(ordered_sets),
+        )
 
     if new_ship:
         log.progress("[RUN] Starting ship model fitting")
@@ -799,7 +808,7 @@ if __name__ == "__main__":
                 log.debug("average max error wind 2D %.6g %%", np.mean(set_wind_model_2D.relative_errors))
                 save_obj(WIND_MODEL_2D, set_wind_model_2D, metadata=wind_model_2d_metadata)
 
-        if dimensions == "both":
+        if dimensions == "both" and run_jpcse_transit_wind:
             transition_weather = build_transition_weather_inputs(
                 nc_sources,
                 map,
@@ -840,7 +849,7 @@ if __name__ == "__main__":
                 )
             else:
                 set_wind_model_2D = load_obj(WIND_MODEL_2D, expected_metadata=wind_model_2d_metadata)
-        if dimensions == "both":
+        if dimensions == "both" and run_jpcse_transit_wind:
             wind_model_transition_1D = load_obj(
                 WIND_MODEL_TRANSITION_1D,
                 expected_metadata=wind_model_transition_1d_metadata,
@@ -1104,7 +1113,7 @@ if __name__ == "__main__":
         def run_jpcse_variant(key, label, use_transition_wind_model):
             optimizer = JPCSE(
                 wind_model=set_wind_model_2D,
-                wind_model_nd=wind_model_transition_1D,
+                wind_model_nd=wind_model_transition_1D if use_transition_wind_model else None,
                 propulsion_model=propulsion_model,
                 calm_model=calm_model,
                 generator_models=generatorModels,
@@ -1164,11 +1173,16 @@ if __name__ == "__main__":
             )
             return optimizer, rule_sol, energy_sol
 
-        jpcse_optimizer, JPCSE_rule_sol, JPCSE_energy_sol = run_jpcse_variant(
-            "JPCSE_transit_wind",
-            "JPCSE_transit_wind",
-            True,
-        )
+        jpcse_performance_rows = []
+        if run_jpcse_transit_wind:
+            jpcse_optimizer, JPCSE_rule_sol, JPCSE_energy_sol = run_jpcse_variant(
+                "JPCSE_transit_wind",
+                "JPCSE_transit_wind",
+                True,
+            )
+            jpcse_performance_rows.append(
+                ("JPCSE_transit_wind", jpcse_optimizer, JPCSE_rule_sol, JPCSE_energy_sol)
+            )
         (
             jpcse_departure_wind_optimizer,
             JPCSE_departure_wind_rule_sol,
@@ -1178,21 +1192,21 @@ if __name__ == "__main__":
             "JPCSE_departure_wind",
             False,
         )
+        jpcse_performance_rows.append(
+            (
+                "JPCSE_departure_wind",
+                jpcse_departure_wind_optimizer,
+                JPCSE_departure_wind_rule_sol,
+                JPCSE_departure_wind_energy_sol,
+            )
+        )
 
         log.verbose("JPCSE performance comparison")
         log.verbose(
             "variant                         optimizer_cost      solve_s   opt_status          "
             "rule_cost       rule_valid  energy_cost     energy_status       energy_solve_s"
         )
-        for label, optimizer, rule_sol, energy_sol in [
-            ("JPCSE_transit_wind", jpcse_optimizer, JPCSE_rule_sol, JPCSE_energy_sol),
-            (
-                "JPCSE_departure_wind",
-                jpcse_departure_wind_optimizer,
-                JPCSE_departure_wind_rule_sol,
-                JPCSE_departure_wind_energy_sol,
-            ),
-        ]:
+        for label, optimizer, rule_sol, energy_sol in jpcse_performance_rows:
             opt_sol = getattr(optimizer, "sol", None)
             opt_solve = np.nan if opt_sol is None else float(opt_sol.solve_time)
             opt_status = _status_or_na(opt_sol)
@@ -1221,11 +1235,16 @@ if __name__ == "__main__":
         ("fpjse_energy", "FPJSE + energy", locals().get("FPJSE_energy_sol")),
         ("jpdse_rule", "JPDSE + rule-based", locals().get("JPDSE_rule_sol")),
         ("jpdse_energy", "JPDSE + energy", locals().get("JPDSE_energy_sol")),
-        ("jpcse_transit_wind_rule", "JPCSE_transit_wind + rule-based", locals().get("JPCSE_rule_sol")),
-        ("jpcse_transit_wind_energy", "JPCSE_transit_wind + energy", locals().get("JPCSE_energy_sol")),
         ("jpcse_departure_wind_rule", "JPCSE_departure_wind + rule-based", locals().get("JPCSE_departure_wind_rule_sol")),
         ("jpcse_departure_wind_energy", "JPCSE_departure_wind + energy", locals().get("JPCSE_departure_wind_energy_sol")),
     ]
+    if run_jpcse_transit_wind:
+        solution_records.extend(
+            [
+                ("jpcse_transit_wind_rule", "JPCSE_transit_wind + rule-based", locals().get("JPCSE_rule_sol")),
+                ("jpcse_transit_wind_energy", "JPCSE_transit_wind + energy", locals().get("JPCSE_energy_sol")),
+            ]
+        )
 
     available_comparison = [
         (label, sol)

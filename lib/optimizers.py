@@ -378,37 +378,155 @@ def _segment_indices_from_distance(D_breaks: np.ndarray, d_values: np.ndarray) -
     return np.clip(s, 0, len(D_breaks) - 2).astype(int)
 
 
+def _fixed_path_waypoint_crossing_indices(
+    D_breaks: np.ndarray,
+    d_start: float,
+    d_end: float,
+    eps: float = 1e-7,
+) -> np.ndarray:
+    D_breaks = np.asarray(D_breaks, dtype=float).reshape(-1)
+    interior = D_breaks[1:-1]
+    lo = min(float(d_start), float(d_end))
+    hi = max(float(d_start), float(d_end))
+    return np.where((lo + eps < interior) & (interior < hi - eps))[0].astype(int) + 1
+
+
 def _fixed_path_waypoint_crossing_counts(
     D_breaks: np.ndarray,
     d_values: np.ndarray,
     eps: float = 1e-7,
 ) -> np.ndarray:
-    D_breaks = np.asarray(D_breaks, dtype=float).reshape(-1)
     d_values = np.asarray(d_values, dtype=float).reshape(-1)
-    interior = D_breaks[1:-1]
 
     counts = np.zeros(max(0, d_values.size - 1), dtype=int)
     for t in range(counts.size):
-        lo = min(float(d_values[t]), float(d_values[t + 1]))
-        hi = max(float(d_values[t]), float(d_values[t + 1]))
-        counts[t] = int(np.count_nonzero((lo + eps < interior) & (interior < hi - eps)))
+        counts[t] = len(
+            _fixed_path_waypoint_crossing_indices(
+                D_breaks,
+                d_values[t],
+                d_values[t + 1],
+                eps=eps,
+            )
+        )
 
     return counts
+
+
+def _format_fixed_path_waypoint_crossing_details(
+    D_breaks: np.ndarray,
+    d_values: np.ndarray,
+    timestep: int,
+    waypoints: Optional[np.ndarray] = None,
+    path_set_ids: Optional[np.ndarray] = None,
+    eps: float = 1e-7,
+) -> str:
+    D_breaks = np.asarray(D_breaks, dtype=float).reshape(-1)
+    d_values = np.asarray(d_values, dtype=float).reshape(-1)
+    t = int(timestep)
+    d_start = float(d_values[t])
+    d_end = float(d_values[t + 1])
+    forward = d_end >= d_start
+
+    crossed_waypoint_indices = _fixed_path_waypoint_crossing_indices(
+        D_breaks,
+        d_start,
+        d_end,
+        eps=eps,
+    )
+    if not forward:
+        crossed_waypoint_indices = crossed_waypoint_indices[::-1]
+
+    parts = [f"path_distance_km {d_start:.6g}->{d_end:.6g}"]
+
+    path_set_ids_arr = None
+    if path_set_ids is not None:
+        path_set_ids_arr = np.asarray(path_set_ids, dtype=int).reshape(-1)
+
+    if path_set_ids_arr is not None and path_set_ids_arr.size > 0:
+        start_segment = int(
+            np.clip(
+                np.searchsorted(D_breaks, d_start, side="right") - 1,
+                0,
+                path_set_ids_arr.size - 1,
+            )
+        )
+        end_segment = int(
+            np.clip(
+                np.searchsorted(D_breaks, d_end, side="right") - 1,
+                0,
+                path_set_ids_arr.size - 1,
+            )
+        )
+        segment_sequence = [start_segment]
+        for waypoint_idx in crossed_waypoint_indices:
+            entered_segment = int(waypoint_idx if forward else waypoint_idx - 1)
+            if 0 <= entered_segment < path_set_ids_arr.size:
+                segment_sequence.append(entered_segment)
+        if segment_sequence[-1] != end_segment:
+            segment_sequence.append(end_segment)
+        set_sequence = [str(int(path_set_ids_arr[s])) for s in segment_sequence]
+        parts.append("sets " + " -> ".join(set_sequence))
+
+    waypoint_details = []
+    waypoints_arr = None
+    if waypoints is not None:
+        waypoints_arr = np.asarray(waypoints, dtype=float)
+
+    for waypoint_idx in crossed_waypoint_indices:
+        idx = int(waypoint_idx)
+        detail = f"waypoint {idx} at d={float(D_breaks[idx]):.6g} km"
+        if (
+            waypoints_arr is not None
+            and waypoints_arr.ndim == 2
+            and waypoints_arr.shape[1] >= 2
+            and idx < waypoints_arr.shape[0]
+        ):
+            detail += (
+                f" xy=({float(waypoints_arr[idx, 0]):.6g}, "
+                f"{float(waypoints_arr[idx, 1]):.6g})"
+            )
+        if path_set_ids_arr is not None:
+            from_segment = idx - 1 if forward else idx
+            to_segment = idx if forward else idx - 1
+            if (
+                0 <= from_segment < path_set_ids_arr.size
+                and 0 <= to_segment < path_set_ids_arr.size
+            ):
+                detail += (
+                    f" set {int(path_set_ids_arr[from_segment])}"
+                    f"->{int(path_set_ids_arr[to_segment])}"
+                )
+        waypoint_details.append(detail)
+
+    if waypoint_details:
+        parts.append("crossed " + "; ".join(waypoint_details))
+
+    return "; ".join(parts)
 
 
 def _assert_fixed_path_single_waypoint_per_timestep(
     D_breaks: np.ndarray,
     d_values: np.ndarray,
     optimizer_name: str,
+    waypoints: Optional[np.ndarray] = None,
+    path_set_ids: Optional[np.ndarray] = None,
     eps: float = 1e-7,
 ) -> None:
     counts = _fixed_path_waypoint_crossing_counts(D_breaks, d_values, eps=eps)
     bad = np.where(counts > 1)[0]
     if bad.size:
         first = int(bad[0])
+        details = _format_fixed_path_waypoint_crossing_details(
+            D_breaks,
+            d_values,
+            first,
+            waypoints=waypoints,
+            path_set_ids=path_set_ids,
+            eps=eps,
+        )
         raise RuntimeError(
             f"{optimizer_name} crossed {int(counts[first])} fixed-path waypoints "
-            f"in timestep {first}; expected at most one."
+            f"in timestep {first}; expected at most one. {details}"
         )
 
 
@@ -3411,7 +3529,13 @@ class FPJSE:
 
         # ================================= RESULTS =================================
         d_opt = np.asarray(d.value, dtype=float)
-        _assert_fixed_path_single_waypoint_per_timestep(D_breaks, d_opt, "FPJSE")
+        _assert_fixed_path_single_waypoint_per_timestep(
+            D_breaks,
+            d_opt,
+            "FPJSE",
+            waypoints=waypoints,
+            path_set_ids=path_set_ids,
+        )
         set_selection_value = np.asarray(path_set_selection.value, dtype=float)
 
         set_selection_full = np.zeros((T_future + 1, self.map.nb_sets), dtype=float)
@@ -4024,10 +4148,17 @@ class FR_O:
         bad_crossings = np.where(waypoint_crossings > 1)[0]
         if bad_crossings.size:
             first = int(bad_crossings[0])
+            crossing_details = _format_fixed_path_waypoint_crossing_details(
+                D_breaks,
+                d_opt,
+                first,
+                waypoints=waypoints,
+                path_set_ids=path_set_ids,
+            )
             log.error(
                 "[FR_O ERROR] Timestep is too large for this fixed-path map: "
                 f"FR_O crossed {int(waypoint_crossings[first])} fixed-path "
-                f"waypoints during timestep {first}. "
+                f"waypoints during timestep {first} ({crossing_details}). "
                 "Aborting before binary optimizers; reduce itinerary.timestep "
                 "or refine the map/path."
             )
