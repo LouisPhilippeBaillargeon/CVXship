@@ -41,6 +41,104 @@ def _finalize_resistance_big_m(model):
         - np.nanmin(model.min_convex_resistance)
         + RESISTANCE_BIG_M_SAFETY
     )
+
+
+def _finite_summary(values, reducer):
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return float("nan")
+    return float(reducer(arr))
+
+
+def _fit_abs_error_summary(mean_abs_errors, max_abs_errors):
+    return (
+        _finite_summary(mean_abs_errors, np.mean),
+        _finite_summary(max_abs_errors, np.max),
+    )
+
+
+def _fit_average_abs_value_summary(mean_abs_values):
+    return _finite_summary(mean_abs_values, np.mean)
+
+
+def _fit_report_ratio_pct(numerator, denominator):
+    numerator = float(numerator)
+    denominator = float(denominator)
+    if not np.isfinite(numerator) or not np.isfinite(denominator) or abs(denominator) <= eps:
+        return float("nan")
+    return 100.0 * numerator / denominator
+
+
+def _fit_report_count(values):
+    arr = np.asarray(values, dtype=float)
+    return int(np.sum(np.isfinite(arr)))
+
+
+def _fit_report_metrics(true_values, abs_errors):
+    true_values = np.asarray(true_values, dtype=float)
+    abs_errors = np.asarray(abs_errors, dtype=float)
+    valid = np.isfinite(true_values) & np.isfinite(abs_errors)
+    true_values = true_values[valid]
+    abs_errors = abs_errors[valid]
+    mean_abs_value = _finite_summary(np.abs(true_values), np.mean)
+    average_abs_error = _finite_summary(abs_errors, np.mean)
+    worst_abs_error = _finite_summary(abs_errors, np.max)
+    return {
+        "worst_abs_error": worst_abs_error,
+        "average_abs_error": average_abs_error,
+        "mean_abs_value": mean_abs_value,
+        "worst_abs_error_pct_of_mean_abs_value": _fit_report_ratio_pct(
+            worst_abs_error,
+            mean_abs_value,
+        ),
+        "average_abs_error_pct_of_mean_abs_value": _fit_report_ratio_pct(
+            average_abs_error,
+            mean_abs_value,
+        ),
+        "sample_count": _fit_report_count(abs_errors),
+    }
+
+
+def _wind_fit_index_label(index):
+    index = tuple(int(i) for i in index)
+    if len(index) == 2:
+        return f"set {index[0]}, timestep {index[1]}"
+    if len(index) == 3:
+        return f"transition {index[0]}->{index[1]}, timestep {index[2]}"
+    return "index " + ",".join(str(i) for i in index)
+
+
+def _log_fit_abs_error_summary(name, mean_abs_errors, max_abs_errors, unit, mean_abs_values):
+    average_error, worst_error = _fit_abs_error_summary(mean_abs_errors, max_abs_errors)
+    average_value = _fit_average_abs_value_summary(mean_abs_values)
+    log.progress(
+        "[FIT] %s fit: average_abs_value=%.6g %s, average_abs_error=%.6g %s, worst_abs_error=%.6g %s",
+        name,
+        average_value,
+        unit,
+        average_error,
+        unit,
+        worst_error,
+        unit,
+    )
+
+
+def _save_tight_pdf(fig, path, show: bool = False, *, top: float = 0.9, pad_inches: float = 0.02):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, top), pad=0.02)
+    fig.savefig(path, format="pdf", bbox_inches="tight", pad_inches=pad_inches)
+    log.debug("[SAVED] %s", path)
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return path
+
+
 @dataclass
 class FitRange:
     min_speed: float
@@ -272,6 +370,9 @@ class CalmWaterModel:
     fit_range : Optional[FitRange] = field(default=None) #A good fit is often possible over 1 m/s to max speed, so its often preferable to not give a fit range and fit over all possible speed values above 1m/s
     fitted_Cx : Optional[float] = field(default=None, init=False)
     res_coeffs: Optional[np.ndarray] = field(default=None, init=False)
+    res_fit_mean_abs_value: Optional[float] = field(default=None, init=False)
+    res_fit_mean_abs_error: Optional[float] = field(default=None, init=False)
+    res_fit_max_abs_error: Optional[float] = field(default=None, init=False)
 
     def require_convex_fit(self, context: str = "This operation") -> None:
         if self.res_coeffs is None:
@@ -296,6 +397,48 @@ class CalmWaterModel:
         C = self.compute_C(speed)
         Fcalm = 0.5*C*self.ship.hull.total_wet_area*self.ship.info.rho_water*np.square(speed)/1000000
         return Fcalm
+
+    def naive_average_speed(self) -> float:
+        """
+        Return the midpoint of the operating speed range used as the nominal
+        speed for single-C calm-water comparisons.
+        """
+        if self.fit_range is not None:
+            v_min = float(self.fit_range.min_speed)
+            v_max = float(self.fit_range.max_speed)
+        else:
+            v_min = 1.0
+            v_max = float(self.ship.info.max_speed)
+
+        if v_max <= v_min:
+            raise ValueError(
+                f"Cannot compute naive average speed because max speed "
+                f"{v_max} is not greater than min speed {v_min}."
+            )
+
+        return 0.5 * (v_min + v_max)
+
+    def compute_naive_nominal_C_resistance(self, speed, nominal_speed: float | None = None):
+        """
+        Evaluate C once at the naive nominal speed and reuse it for resistance.
+        """
+        if nominal_speed is None:
+            nominal_speed = self.naive_average_speed()
+
+        C_nominal = self.compute_C(float(nominal_speed))
+        scalar_input = np.isscalar(speed)
+        speed = np.asarray(speed, dtype=float)
+        resistance = (
+            0.5
+            * C_nominal
+            * self.ship.hull.total_wet_area
+            * self.ship.info.rho_water
+            * np.square(speed)
+            / 1_000_000
+        )
+        if scalar_input:
+            return float(resistance)
+        return resistance
 
     def fit_constant_C(self, nb_points: int = 100) -> float:
         """
@@ -389,6 +532,16 @@ class CalmWaterModel:
         _require_cvxpy_success(problem, "Power fit")
 
         abs_err = np.abs(R_fit.value - Resistance)
+        self.res_fit_mean_abs_value = float(np.nanmean(np.abs(Resistance)))
+        self.res_fit_mean_abs_error = float(np.nanmean(abs_err))
+        self.res_fit_max_abs_error = float(np.nanmax(abs_err))
+        _log_fit_abs_error_summary(
+            "CalmWaterModel resistance",
+            [self.res_fit_mean_abs_error],
+            [self.res_fit_max_abs_error],
+            "MN",
+            [self.res_fit_mean_abs_value],
+        )
 
         coeffs = np.array([
             intercept.value,
@@ -407,6 +560,9 @@ class CalmWaterModel:
         show: bool = False,
         subfolder: str | None = None,
         output_root: str | None = None,
+        text_size: str = "default",
+        file_format: str = "png",
+        pad_inches: float = 0.1,
     ):
         """
         Generate IEEE-style diagnostic plots for calm-water resistance models.
@@ -414,7 +570,7 @@ class CalmWaterModel:
         Plots:
         - C(v)
         - True resistance
-        - Constant Cx quadratic approximation (if fitted_Cx is available)
+        - Naive nominal-speed C quadratic approximation
         - Convex polynomial approximation (if res_coeffs is available)
 
         All figures are saved through the plotting.py utilities.
@@ -422,23 +578,33 @@ class CalmWaterModel:
         Parameters
         ----------
         nb_points : int
-            Number of speed samples between 1 m/s and ship.info.max_speed.
+            Number of speed samples over fit_range, or between 1 m/s and
+            ship.info.max_speed when no fit_range is set.
         fit_if_needed : bool
-            If True, automatically fits constant Cx and convex model if missing.
+            If True, automatically fits the convex model if missing.
         show : bool
             If True, display figures in addition to saving them.
         subfolder : str | None
             Optional subfolder inside PLOTS.
+        text_size : str
+            Use "default" for IEEE-sized text, or "big" for presentation-sized
+            text matching the previous enlarged plot style.
+        file_format : str
+            Output file extension passed to matplotlib, e.g. "png" or "pdf".
+        pad_inches : float
+            Padding around tight saved figures.
         """
         if nb_points < 2:
             raise ValueError(f"nb_points must be >= 2, got {nb_points}.")
+        if text_size not in {"default", "big"}:
+            raise ValueError(f"text_size must be 'default' or 'big', got {text_size!r}.")
+
+        font_scale = 2.0 if text_size == "big" else 1.0
 
         # ---------------------------------
         # Fit models if needed
         # ---------------------------------
         if fit_if_needed:
-            if self.fitted_Cx is None:
-                self.fit_constant_C()
             if self.res_coeffs is None:
                 self.fit_convex_model()
 
@@ -454,24 +620,29 @@ class CalmWaterModel:
         # ---------------------------------
         set_ieee_plot_style()
 
-        speeds = np.linspace(1.0, self.ship.info.max_speed, nb_points)
+        if self.fit_range is not None:
+            v_min = float(self.fit_range.min_speed)
+            v_max = float(self.fit_range.max_speed)
+        else:
+            v_min = 1.0
+            v_max = float(self.ship.info.max_speed)
+
+        speeds = np.linspace(v_min, v_max, nb_points)
 
         rho = self.ship.info.rho_water
         A_hull = self.ship.hull.total_wet_area
+        nominal_speed = self.naive_average_speed()
+        C_nominal = self.compute_C(nominal_speed)
 
         C_values = []
         R_true = []
-        R_const = []
+        R_nominal_C = []
         R_convex = []
 
         for v in speeds:
             C = self.compute_C(v)
             F_true = self.compute_resistance(v)  # MN
-
-            if self.fitted_Cx is not None:
-                F_const = 0.5 * rho * A_hull * self.fitted_Cx * v**2 / 1_000_000
-            else:
-                F_const = np.nan
+            F_nominal_C = 0.5 * rho * A_hull * C_nominal * v**2 / 1_000_000
 
             if self.res_coeffs is not None:
                 x = v / self.ship.info.max_speed
@@ -487,12 +658,12 @@ class CalmWaterModel:
 
             C_values.append(C)
             R_true.append(F_true)
-            R_const.append(F_const)
+            R_nominal_C.append(F_nominal_C)
             R_convex.append(F_conv)
 
         C_values = np.asarray(C_values)
         R_true = np.asarray(R_true)
-        R_const = np.asarray(R_const)
+        R_nominal_C = np.asarray(R_nominal_C)
         R_convex = np.asarray(R_convex)
 
         # ---------------------------------
@@ -500,14 +671,27 @@ class CalmWaterModel:
         # ---------------------------------
         fig, ax = plt.subplots()
         ax.plot(speeds, C_values, label="True $C(v)$")
+        ax.axhline(
+            C_nominal,
+            linestyle="--",
+            linewidth=1.0,
+            label="Evaluated $C$",
+        )
         _finalize_axis(
             ax,
             xlabel="Speed relative to water [m/s]",
             ylabel="Resistance coefficient [-]",
-            title="Calm-water resistance coefficient",
         )
         ax.legend(loc="best", frameon=False)
-        _save_and_maybe_show(fig, "calm_water_C_vs_speed", show, directory=plot_dir, font_scale=2)
+        _save_and_maybe_show(
+            fig,
+            "calm_water_C_vs_speed",
+            show,
+            directory=plot_dir,
+            font_scale=font_scale,
+            file_format=file_format,
+            pad_inches=pad_inches,
+        )
 
         # ---------------------------------
         # Plot resistance comparison
@@ -515,13 +699,12 @@ class CalmWaterModel:
         fig, ax = plt.subplots()
         ax.plot(speeds, R_true, label="True resistance")
 
-        if self.fitted_Cx is not None:
-            ax.plot(
-                speeds,
-                R_const,
-                linestyle="--",
-                label=f"Constant $C_x$ = {self.fitted_Cx:.6f}",
-            )
+        ax.plot(
+            speeds,
+            R_nominal_C,
+            linestyle="--",
+            label="Evaluated $C$",
+        )
 
         if self.res_coeffs is not None:
             ax.plot(
@@ -530,22 +713,25 @@ class CalmWaterModel:
                 linestyle=":",
                 label="Convex fit",
             )
-        if self.fit_range != None:
-            ax.axvline(self.fit_range.min_speed, linestyle="--", linewidth=0.8, alpha=0.6)
-            ax.axvline(self.fit_range.max_speed, linestyle="--", linewidth=0.8, alpha=0.6)
-        else:
-            ax.axvline(1.0, linestyle="--", linewidth=0.8, alpha=0.6)
-            ax.axvline(self.ship.info.max_speed, linestyle="--", linewidth=0.8, alpha=0.6)
+        ax.axvline(v_min, linestyle="--", linewidth=0.8, alpha=0.6)
+        ax.axvline(v_max, linestyle="--", linewidth=0.8, alpha=0.6)
 
 
         _finalize_axis(
             ax,
             xlabel="Speed relative to water [m/s]",
             ylabel="Resistance [MN]",
-            title="Calm-water resistance model comparison",
         )
         ax.legend(loc="best", frameon=False)
-        _save_and_maybe_show(fig, "calm_water_resistance_comparison", show, directory=plot_dir, font_scale=2)
+        _save_and_maybe_show(
+            fig,
+            "calm_water_resistance_comparison",
+            show,
+            directory=plot_dir,
+            font_scale=font_scale,
+            file_format=file_format,
+            pad_inches=pad_inches,
+        )
 
 
 @dataclass
@@ -556,11 +742,16 @@ class BaseWindModel:
     thrust_coeffs: Optional[np.ndarray] = field(default=None, init=False)
     relative_errors: Optional[np.ndarray] = field(default=None, init=False)
     mean_abs_errors: Optional[np.ndarray] = field(default=None, init=False)
+    mean_abs_fit_values: Optional[np.ndarray] = field(default=None, init=False)
     max_convex_resistance: Optional[np.ndarray] = field(default=None, init=False)
     min_convex_resistance: Optional[np.ndarray] = field(default=None, init=False)
     combined_mean_abs_errors: Optional[np.ndarray] = field(default=None, init=False)
     combined_max_abs_errors: Optional[np.ndarray] = field(default=None, init=False)
     big_m_resistance: Optional[float] = field(default=None, init=False)
+    worst_fit_heatmap: Optional[dict] = field(default=None, init=False)
+    best_fit_heatmap: Optional[dict] = field(default=None, init=False)
+    worst_fit_lineplot: Optional[dict] = field(default=None, init=False)
+    best_fit_lineplot: Optional[dict] = field(default=None, init=False)
 
     def compute_resistance(self,
                     wind_speed_vector, #eastward, northward wind speed m/s [vx, vy]
@@ -578,6 +769,311 @@ class BaseWindModel:
         CX = -CDlAF * np.cos(gamma_rw) / den
         tauX = 0.5 * CX * self.ship.info.rho_air * V_rw**2 * self.ship.hull.AF_air
         return -tauX/1000000
+
+    def _worst_fit_diagnostic_record(self):
+        candidates = []
+        for attr in ("worst_fit_heatmap", "worst_fit_lineplot"):
+            diag = getattr(self, attr, None)
+            if diag is None:
+                continue
+            worst_abs_error = _finite_summary(diag.get("abs_error", []), np.max)
+            if np.isfinite(worst_abs_error):
+                candidates.append((worst_abs_error, diag))
+
+        if not candidates:
+            return None
+
+        return max(candidates, key=lambda item: item[0])[1]
+
+    def fit_error_report_row(self, model_name: str | None = None):
+        """
+        Return fit error metrics for the worst wind time-set only.
+
+        The diagnostic plot records are preferred because they preserve the
+        exact fitting-range mask shown in the saved worst-fit subplot.
+        """
+        model_name = model_name or type(self).__name__
+        diag = self._worst_fit_diagnostic_record()
+        if diag is not None:
+            metrics = _fit_report_metrics(
+                diag.get("true_resistance", []),
+                diag.get("abs_error", []),
+            )
+            return {
+                "model": model_name,
+                "quantity": "wind_resistance",
+                "unit": "MN",
+                "scope": "worst_time_set",
+                "fit_subset": diag.get("combination", ""),
+                "min_fit_speed_mps": float(self.fit_range.min_speed),
+                "max_fit_speed_mps": float(self.fit_range.max_speed),
+                **metrics,
+            }
+
+        max_errors = getattr(self, "relative_errors", None)
+        mean_errors = getattr(self, "mean_abs_errors", None)
+        mean_values = getattr(self, "mean_abs_fit_values", None)
+        if max_errors is None or mean_errors is None or mean_values is None:
+            return None
+
+        max_errors = np.asarray(max_errors, dtype=float)
+        finite_mask = np.isfinite(max_errors)
+        if not np.any(finite_mask):
+            return None
+
+        worst_index = np.unravel_index(int(np.nanargmax(max_errors)), max_errors.shape)
+        worst_abs_error = float(max_errors[worst_index])
+        average_abs_error = float(np.asarray(mean_errors, dtype=float)[worst_index])
+        mean_abs_value = float(np.asarray(mean_values, dtype=float)[worst_index])
+        return {
+            "model": model_name,
+            "quantity": "wind_resistance",
+            "unit": "MN",
+            "scope": "worst_time_set",
+            "fit_subset": _wind_fit_index_label(worst_index),
+            "min_fit_speed_mps": float(self.fit_range.min_speed),
+            "max_fit_speed_mps": float(self.fit_range.max_speed),
+            "worst_abs_error": worst_abs_error,
+            "average_abs_error": average_abs_error,
+            "mean_abs_value": mean_abs_value,
+            "worst_abs_error_pct_of_mean_abs_value": _fit_report_ratio_pct(
+                worst_abs_error,
+                mean_abs_value,
+            ),
+            "average_abs_error_pct_of_mean_abs_value": _fit_report_ratio_pct(
+                average_abs_error,
+                mean_abs_value,
+            ),
+            "sample_count": "",
+        }
+
+    def _fit_heatmap_record(
+        self,
+        *,
+        max_abs_error,
+        combination,
+        ship_speed_x,
+        ship_speed_y,
+        true_resistance,
+        convex_resistance,
+        abs_error,
+        mask=None,
+    ):
+        mask_arr = None if mask is None else np.asarray(mask, dtype=bool)
+
+        def _plot_array(value):
+            arr = np.asarray(value, dtype=float).copy()
+            if mask_arr is not None:
+                arr = np.where(mask_arr, arr, np.nan)
+            return arr
+
+        return {
+            "model": type(self).__name__,
+            "max_abs_error": float(max_abs_error),
+            "combination": str(combination),
+            "ship_speed_x": np.asarray(ship_speed_x, dtype=float).copy(),
+            "ship_speed_y": np.asarray(ship_speed_y, dtype=float).copy(),
+            "true_resistance": _plot_array(true_resistance),
+            "convex_resistance": _plot_array(convex_resistance),
+            "abs_error": _plot_array(abs_error),
+        }
+
+    def _record_worst_fit_heatmap(self, **kwargs):
+        max_abs_error = float(kwargs["max_abs_error"])
+        if not np.isfinite(max_abs_error):
+            return
+
+        current = getattr(self, "worst_fit_heatmap", None)
+        if current is not None and max_abs_error <= float(current["max_abs_error"]):
+            return
+
+        self.worst_fit_heatmap = self._fit_heatmap_record(**kwargs)
+
+    def _record_best_fit_heatmap(self, **kwargs):
+        max_abs_error = float(kwargs["max_abs_error"])
+        if not np.isfinite(max_abs_error):
+            return
+
+        current = getattr(self, "best_fit_heatmap", None)
+        if current is not None and max_abs_error >= float(current["max_abs_error"]):
+            return
+
+        self.best_fit_heatmap = self._fit_heatmap_record(**kwargs)
+
+    def _plot_fit_heatmaps(
+        self,
+        attr: str,
+        label: str,
+        show: bool = False,
+        directory=None,
+        filename: str | None = None,
+    ):
+        diag = getattr(self, attr, None)
+        if diag is None:
+            log.debug("[%s diagnostics] No %s wind fit heatmap recorded.", type(self).__name__, label)
+            return None
+
+        set_ieee_plot_style()
+        fig, axes = plt.subplots(1, 3, figsize=(11.5, 3.6))
+        panels = [
+            (diag["true_resistance"], "True wind resistance"),
+            (diag["convex_resistance"], "Fitted wind resistance"),
+            (diag["abs_error"], "Absolute error"),
+        ]
+
+        x = diag["ship_speed_x"]
+        y = diag["ship_speed_y"]
+        for ax, (values, title) in zip(axes, panels):
+            pcm = ax.pcolormesh(x, y, values, shading="auto")
+            fig.colorbar(pcm, ax=ax, label="MN")
+            ax.set_xlabel("ship speed x [m/s]")
+            ax.set_ylabel("ship speed y [m/s]")
+            ax.set_title(title)
+            ax.set_aspect("equal", adjustable="box")
+
+        if filename is None:
+            model_slug = "".join(
+                ch.lower() if ch.isalnum() else "_"
+                for ch in str(diag.get("model", type(self).__name__))
+            ).strip("_")
+            filename = f"wind_fit_{label}_abs_error_{model_slug}"
+
+        output_dir = Path(directory or PLOTS)
+        return _save_tight_pdf(fig, output_dir / f"{filename}.pdf", show, top=1.0)
+
+    def plot_worst_fit_heatmaps(
+        self,
+        show: bool = False,
+        directory=None,
+        filename: str | None = None,
+    ):
+        return self._plot_fit_heatmaps(
+            "worst_fit_heatmap",
+            "worst",
+            show=show,
+            directory=directory,
+            filename=filename,
+        )
+
+    def plot_best_fit_heatmaps(
+        self,
+        show: bool = False,
+        directory=None,
+        filename: str | None = None,
+    ):
+        return self._plot_fit_heatmaps(
+            "best_fit_heatmap",
+            "best",
+            show=show,
+            directory=directory,
+            filename=filename,
+        )
+
+    def _fit_line_record(
+        self,
+        *,
+        max_abs_error,
+        combination,
+        speed,
+        true_resistance,
+        convex_resistance,
+        abs_error,
+    ):
+        return {
+            "model": type(self).__name__,
+            "max_abs_error": float(max_abs_error),
+            "combination": str(combination),
+            "speed": np.asarray(speed, dtype=float).copy(),
+            "true_resistance": np.asarray(true_resistance, dtype=float).copy(),
+            "convex_resistance": np.asarray(convex_resistance, dtype=float).copy(),
+            "abs_error": np.asarray(abs_error, dtype=float).copy(),
+        }
+
+    def _record_worst_fit_lineplot(self, **kwargs):
+        max_abs_error = float(kwargs["max_abs_error"])
+        if not np.isfinite(max_abs_error):
+            return
+
+        current = getattr(self, "worst_fit_lineplot", None)
+        if current is not None and max_abs_error <= float(current["max_abs_error"]):
+            return
+
+        self.worst_fit_lineplot = self._fit_line_record(**kwargs)
+
+    def _record_best_fit_lineplot(self, **kwargs):
+        max_abs_error = float(kwargs["max_abs_error"])
+        if not np.isfinite(max_abs_error):
+            return
+
+        current = getattr(self, "best_fit_lineplot", None)
+        if current is not None and max_abs_error >= float(current["max_abs_error"]):
+            return
+
+        self.best_fit_lineplot = self._fit_line_record(**kwargs)
+
+    def _plot_fit_lineplot(
+        self,
+        attr: str,
+        label: str,
+        show: bool = False,
+        directory=None,
+        filename: str | None = None,
+    ):
+        diag = getattr(self, attr, None)
+        if diag is None:
+            log.debug("[%s diagnostics] No %s wind fit line plot recorded.", type(self).__name__, label)
+            return None
+
+        set_ieee_plot_style()
+        fig, ax = plt.subplots(figsize=(5.2, 3.4))
+        ax.plot(diag["speed"], diag["true_resistance"], label="True wind resistance")
+        ax.plot(
+            diag["speed"],
+            diag["convex_resistance"],
+            linestyle="--",
+            label="Convex estimated wind resistance",
+        )
+        ax.set_xlabel("ship speed magnitude [m/s]")
+        ax.set_ylabel("wind resistance [MN]")
+        ax.legend(loc="best", frameon=False)
+
+        if filename is None:
+            model_slug = "".join(
+                ch.lower() if ch.isalnum() else "_"
+                for ch in str(diag.get("model", type(self).__name__))
+            ).strip("_")
+            filename = f"wind_fit_{label}_abs_error_{model_slug}"
+
+        output_dir = Path(directory or PLOTS)
+        return _save_tight_pdf(fig, output_dir / f"{filename}.pdf", show, top=1.0)
+
+    def plot_worst_fit_lineplot(
+        self,
+        show: bool = False,
+        directory=None,
+        filename: str | None = None,
+    ):
+        return self._plot_fit_lineplot(
+            "worst_fit_lineplot",
+            "worst",
+            show=show,
+            directory=directory,
+            filename=filename,
+        )
+
+    def plot_best_fit_lineplot(
+        self,
+        show: bool = False,
+        directory=None,
+        filename: str | None = None,
+    ):
+        return self._plot_fit_lineplot(
+            "best_fit_lineplot",
+            "best",
+            show=show,
+            directory=directory,
+            filename=filename,
+        )
 
 
 def _eval_wind_poly_1d(coeffs, speed, ship_max_speed):
@@ -612,13 +1108,14 @@ def _eval_wind_poly_2d(coeffs, vx, vy, ship_max_speed):
     )
 
 
-def _print_wind_fit_summary(name, fit_err, combined_err=None):
-    log.debug("[%s diagnostics]", name)
-    log.debug("  fit mean abs error: %.6g MN", np.nanmean(fit_err))
-    log.debug("  fit worst abs error: %.6g MN", np.nanmax(fit_err))
-    if combined_err is not None:
-        log.debug("  combined mean abs error: %.6g MN", np.nanmean(combined_err))
-        log.debug("  combined worst abs error: %.6g MN", np.nanmax(combined_err))
+def _print_wind_fit_summary(name, mean_abs_errors, max_abs_errors, mean_abs_values):
+    _log_fit_abs_error_summary(
+        f"{name} resistance",
+        mean_abs_errors,
+        max_abs_errors,
+        "MN",
+        mean_abs_values,
+    )
 
 
 @dataclass
@@ -751,7 +1248,9 @@ class WindModel2D(BaseWindModel):
             plt.tight_layout()
             plt.show()
 
-        abs_err = np.abs(R_fit.value[mask] - Resistance[mask])
+        err_grid = np.full_like(Resistance, np.nan, dtype=float)
+        err_grid[mask] = np.abs(R_fit.value[mask] - Resistance[mask])
+        abs_err = err_grid[mask]
 
         coeffs = np.array([
             intercept.value,
@@ -775,6 +1274,9 @@ class WindModel2D(BaseWindModel):
             VX,
             VY,
             mask,
+            Resistance,
+            R_fit.value,
+            err_grid,
         )
 
     def fit_convex_models(
@@ -790,6 +1292,7 @@ class WindModel2D(BaseWindModel):
         self.thrust_coeffs      = np.zeros((nb_sets,nb_timesteps,11))
         self.relative_errors    = np.zeros((nb_sets,nb_timesteps))
         self.mean_abs_errors    = np.zeros((nb_sets,nb_timesteps))
+        self.mean_abs_fit_values = np.zeros((nb_sets,nb_timesteps))
         self.max_convex_resistance    = np.zeros((nb_sets,nb_timesteps))
         self.min_convex_resistance    = np.zeros((nb_sets,nb_timesteps))
         if diagnostic_wind_samples is not None:
@@ -807,7 +1310,42 @@ class WindModel2D(BaseWindModel):
                     VX,
                     VY,
                     mask,
+                    Resistance,
+                    Rfit,
+                    E,
                 ) = self.fit_convex_model(wind_speed_x[iz,it],wind_speed_y[iz,it])
+                speed_mag = np.sqrt(VX * VX + VY * VY)
+                fit_range_mask = (
+                    mask
+                    & (speed_mag >= float(self.fit_range.min_speed))
+                    & (speed_mag <= float(self.fit_range.max_speed))
+                )
+                if not np.any(fit_range_mask):
+                    fit_range_mask = mask
+                fit_abs_errors = E[fit_range_mask]
+                self.relative_errors[iz, it] = float(np.nanmax(fit_abs_errors))
+                self.mean_abs_errors[iz, it] = float(np.nanmean(fit_abs_errors))
+                self.mean_abs_fit_values[iz, it] = float(np.nanmean(np.abs(Resistance[fit_range_mask])))
+                self._record_worst_fit_heatmap(
+                    max_abs_error=np.nanmax(E[fit_range_mask]),
+                    combination=f"set {iz}, timestep {it}",
+                    ship_speed_x=VX,
+                    ship_speed_y=VY,
+                    true_resistance=Resistance,
+                    convex_resistance=Rfit,
+                    abs_error=E,
+                    mask=fit_range_mask,
+                )
+                self._record_best_fit_heatmap(
+                    max_abs_error=np.nanmax(E[fit_range_mask]),
+                    combination=f"set {iz}, timestep {it}",
+                    ship_speed_x=VX,
+                    ship_speed_y=VY,
+                    true_resistance=Resistance,
+                    convex_resistance=Rfit,
+                    abs_error=E,
+                    mask=fit_range_mask,
+                )
                 if diagnostic_wind_samples is not None:
                     fit_vals = _eval_wind_poly_2d(
                         self.thrust_coeffs[iz, it, :],
@@ -830,7 +1368,8 @@ class WindModel2D(BaseWindModel):
         _print_wind_fit_summary(
             "WindModel2D",
             self.mean_abs_errors,
-            self.combined_mean_abs_errors if diagnostic_wind_samples is not None else None,
+            self.relative_errors,
+            self.mean_abs_fit_values,
         )
         _finalize_resistance_big_m(self)
 
@@ -916,6 +1455,7 @@ class WindModel1D(BaseWindModel):
         self.thrust_coeffs      = np.zeros((nb_sets,nb_timesteps,5))
         self.relative_errors    = np.zeros((nb_sets,nb_timesteps))
         self.mean_abs_errors    = np.zeros((nb_sets,nb_timesteps))
+        self.mean_abs_fit_values = np.zeros((nb_sets,nb_timesteps))
         self.max_convex_resistance    = np.zeros((nb_sets,nb_timesteps))
         self.min_convex_resistance    = np.zeros((nb_sets,nb_timesteps))
         if diagnostic_wind_samples is not None:
@@ -931,9 +1471,21 @@ class WindModel1D(BaseWindModel):
                     self.min_convex_resistance[iz,it],
                     self.max_convex_resistance[iz,it],
                     vs_vals,
-                    _Resistance,
-                    _R_fit,
+                    Resistance,
+                    Rfit,
                 ) = self.fit_convex_model(wind_speed_x[iz,it],wind_speed_y[iz,it], course_angles[iz,it], nb_steps=nb_steps)
+                E = np.abs(Rfit - Resistance)
+                self.mean_abs_fit_values[iz, it] = float(np.nanmean(np.abs(Resistance)))
+                line_kwargs = {
+                    "max_abs_error": np.nanmax(E),
+                    "combination": f"set {iz}, timestep {it}",
+                    "speed": vs_vals,
+                    "true_resistance": Resistance,
+                    "convex_resistance": Rfit,
+                    "abs_error": E,
+                }
+                self._record_worst_fit_lineplot(**line_kwargs)
+                self._record_best_fit_lineplot(**line_kwargs)
                 if diagnostic_wind_samples is not None:
                     coeffs = self.thrust_coeffs[iz, it, :]
                     fit_vals = _eval_wind_poly_1d(coeffs, vs_vals, self.ship.info.max_speed)
@@ -957,7 +1509,8 @@ class WindModel1D(BaseWindModel):
         _print_wind_fit_summary(
             "WindModel1D",
             self.mean_abs_errors,
-            self.combined_mean_abs_errors if diagnostic_wind_samples is not None else None,
+            self.relative_errors,
+            self.mean_abs_fit_values,
         )
         _finalize_resistance_big_m(self)
 
@@ -995,6 +1548,7 @@ class WindModelTransition1D(WindModel1D):
         self.thrust_coeffs = np.full((nb_sets, nb_sets, nb_timesteps, 5), np.nan, dtype=float)
         self.relative_errors = np.full((nb_sets, nb_sets, nb_timesteps), np.nan, dtype=float)
         self.mean_abs_errors = np.full((nb_sets, nb_sets, nb_timesteps), np.nan, dtype=float)
+        self.mean_abs_fit_values = np.full((nb_sets, nb_sets, nb_timesteps), np.nan, dtype=float)
         self.max_convex_resistance = np.full((nb_sets, nb_sets, nb_timesteps), np.nan, dtype=float)
         self.min_convex_resistance = np.full((nb_sets, nb_sets, nb_timesteps), np.nan, dtype=float)
         if diagnostic_wind_samples is not None:
@@ -1013,14 +1567,26 @@ class WindModelTransition1D(WindModel1D):
                         self.min_convex_resistance[z0, z1, t],
                         self.max_convex_resistance[z0, z1, t],
                         vs_vals,
-                        _Resistance,
-                        _R_fit,
+                        Resistance,
+                        Rfit,
                     ) = self.fit_convex_model(
                         wind_speed_x[z0, z1, t],
                         wind_speed_y[z0, z1, t],
                         course_angles[z0, z1, t],
                         nb_steps=nb_steps,
                     )
+                    E = np.abs(Rfit - Resistance)
+                    self.mean_abs_fit_values[z0, z1, t] = float(np.nanmean(np.abs(Resistance)))
+                    line_kwargs = {
+                        "max_abs_error": np.nanmax(E),
+                        "combination": f"transition {z0}->{z1}, timestep {t}",
+                        "speed": vs_vals,
+                        "true_resistance": Resistance,
+                        "convex_resistance": Rfit,
+                        "abs_error": E,
+                    }
+                    self._record_worst_fit_lineplot(**line_kwargs)
+                    self._record_best_fit_lineplot(**line_kwargs)
                     if diagnostic_wind_samples is not None:
                         coeffs = self.thrust_coeffs[z0, z1, t, :]
                         fit_vals = _eval_wind_poly_1d(coeffs, vs_vals, self.ship.info.max_speed)
@@ -1045,7 +1611,8 @@ class WindModelTransition1D(WindModel1D):
         _print_wind_fit_summary(
             "WindModelTransition1D",
             self.mean_abs_errors,
-            self.combined_mean_abs_errors if diagnostic_wind_samples is not None else None,
+            self.relative_errors,
+            self.mean_abs_fit_values,
         )
         _finalize_resistance_big_m(self)
 
@@ -1224,6 +1791,7 @@ class WindModelPathAligned2D(BaseWindModel):
         self.thrust_coeffs = np.zeros((nb_segments, nb_timesteps, 11))
         self.relative_errors = np.zeros((nb_segments, nb_timesteps))
         self.mean_abs_errors = np.zeros((nb_segments, nb_timesteps))
+        self.mean_abs_fit_values = np.zeros((nb_segments, nb_timesteps))
         self.max_convex_resistance = np.zeros((nb_segments, nb_timesteps))
         self.min_convex_resistance = np.zeros((nb_segments, nb_timesteps))
         self.mean_true_resistance = np.zeros((nb_segments, nb_timesteps))
@@ -1283,6 +1851,7 @@ class WindModelPathAligned2D(BaseWindModel):
                 self.max_convex_resistance[s, t] = max_fit
                 self.mean_true_resistance[s, t] = mean_true
                 self.max_true_resistance[s, t] = max_true
+                self.mean_abs_fit_values[s, t] = mean_true
                 if diagnostic_wind_samples is not None:
                     fit_vals = _eval_wind_poly_2d(
                         coeffs,
@@ -1305,6 +1874,25 @@ class WindModelPathAligned2D(BaseWindModel):
                     self.combined_mean_abs_errors[s, t] = float(np.nanmean(errs))
                     self.combined_max_abs_errors[s, t] = float(np.nanmax(errs))
 
+                self._record_worst_fit_heatmap(
+                    max_abs_error=err,
+                    combination=f"segment {s}, timestep {t}",
+                    ship_speed_x=VX,
+                    ship_speed_y=VY,
+                    true_resistance=Rtrue,
+                    convex_resistance=Rfit,
+                    abs_error=E,
+                )
+                self._record_best_fit_heatmap(
+                    max_abs_error=err,
+                    combination=f"segment {s}, timestep {t}",
+                    ship_speed_x=VX,
+                    ship_speed_y=VY,
+                    true_resistance=Rtrue,
+                    convex_resistance=Rfit,
+                    abs_error=E,
+                )
+
                 if err > worst["err"]:
                     worst.update({
                         "err": err,
@@ -1322,7 +1910,8 @@ class WindModelPathAligned2D(BaseWindModel):
         _print_wind_fit_summary(
             "WindModelPathAligned2D",
             self.mean_abs_errors,
-            self.combined_mean_abs_errors if diagnostic_wind_samples is not None else None,
+            self.relative_errors,
+            self.mean_abs_fit_values,
         )
 
         log.debug("[WindModelPathAligned2D diagnostics]")
@@ -1397,6 +1986,9 @@ class PropulsionModel:
     thrust_coeffs: Optional[np.ndarray] = field(default=None, init=False)
     constraint_params: Optional[np.ndarray] = field(default=None, init=False)
     constraint_fit_stats: Optional[dict] = field(default=None, init=False)
+    power_fit_mean_abs_value: Optional[float] = field(default=None, init=False)
+    power_fit_mean_abs_error: Optional[float] = field(default=None, init=False)
+    power_fit_max_abs_error: Optional[float] = field(default=None, init=False)
 
     def __post_init__(self):
         #simple limits
@@ -1802,9 +2394,42 @@ class PropulsionModel:
         # Check solve status
         _require_cvxpy_success(problem, "Power fit")
         abs_err_P = np.abs(Pow_fit.value[mask_fit] - self.P_real[mask_fit])
+        self.power_fit_mean_abs_value = float(np.nanmean(np.abs(self.P_real[mask_fit])))
+        self.power_fit_mean_abs_error = float(np.nanmean(abs_err_P))
+        self.power_fit_max_abs_error = float(np.nanmax(abs_err_P))
+        _log_fit_abs_error_summary(
+            "PropulsionModel power",
+            [self.power_fit_mean_abs_error],
+            [self.power_fit_max_abs_error],
+            "MW",
+            [self.power_fit_mean_abs_value],
+        )
         self.mask_fit = mask_fit
 
         return 100*np.nanmax(abs_err_P)/np.nanmax(self.P_real[mask_fit]), 100*np.nanmean(abs_err_P)/np.nanmax(self.P_real[mask_fit])
+
+    def fit_error_report_row(self, model_name: str | None = None):
+        if self.mask_fit is None or self.P_real is None or self.P_fit is None:
+            return None
+
+        mask = np.asarray(self.mask_fit, dtype=bool)
+        if not np.any(mask):
+            return None
+
+        metrics = _fit_report_metrics(
+            np.asarray(self.P_real, dtype=float)[mask],
+            np.abs(np.asarray(self.P_fit, dtype=float)[mask] - np.asarray(self.P_real, dtype=float)[mask]),
+        )
+        return {
+            "model": model_name or type(self).__name__,
+            "quantity": "propulsion_power",
+            "unit": "MW",
+            "scope": "fit_range",
+            "fit_subset": "power_fit_domain",
+            "min_fit_speed_mps": float(self.fit_range.min_speed),
+            "max_fit_speed_mps": float(self.fit_range.max_speed),
+            **metrics,
+        }
 
 
     #=======================================Plots===================================================
@@ -1919,6 +2544,119 @@ class PropulsionModel:
 
         fig.tight_layout()
         _save_and_maybe_show(fig, "power_fit_error_heatmap", show, directory=directory or PLOTS)
+
+    def plot_power_fit_heatmaps_pdf(
+        self,
+        show: bool = False,
+        directory=None,
+        filename: str = "propulsion_power_fit_heatmaps",
+    ):
+        if self.mask_fit is None or self.P_real is None or self.P_fit is None:
+            raise ValueError("Missing power fit data. Run fit_convex_model() first.")
+
+        set_ieee_plot_style()
+        mask = np.asarray(self.mask_fit, dtype=bool)
+        true_power = np.where(mask, self.P_real, np.nan)
+        fitted_power = np.where(mask, self.P_fit, np.nan)
+        abs_error = np.where(mask, np.abs(self.P_fit - self.P_real), np.nan)
+
+        fig, axes = plt.subplots(1, 3, figsize=(11.5, 3.6))
+        panels = [
+            (true_power, "True B-series power", "MW"),
+            (fitted_power, "Fitted convex power", "MW"),
+            (abs_error, "Absolute error", "MW"),
+        ]
+        extent = [self.min_thrust, self.max_thrust, self.min_ua, self.max_ua]
+
+        for ax, (values, title, unit) in zip(axes, panels):
+            pcm = ax.imshow(
+                values,
+                extent=extent,
+                origin="lower",
+                aspect="auto",
+                cmap="inferno",
+            )
+            fig.colorbar(pcm, ax=ax, label=unit)
+            ax.set_xlabel("resistance per propeller [MN]")
+            ax.set_ylabel("advance speed [m/s]")
+            ax.set_title(title)
+
+        output_dir = Path(directory or PLOTS)
+        return _save_tight_pdf(fig, output_dir / f"{filename}.pdf", show, top=1.0)
+
+    def plot_feasibility_classification_pdf(
+        self,
+        show: bool = False,
+        directory=None,
+        filename: str = "propulsion_feasibility_classification",
+    ):
+        """
+        Plot sampled feasible and infeasible propulsion grid points over the
+        fitted advance-speed/resistance range, with the fitted linear boundary.
+        """
+        self.ensure_fit_grid()
+        if self.constraint_params is None:
+            self.fit_feasibility_boundary()
+
+        Th, S, mask, ua_vals, thrust_vals = self._mesh()
+
+        set_ieee_plot_style()
+        fig, ax = plt.subplots(figsize=(4.0, 3.0))
+
+        infeasible = ~mask
+        ax.scatter(
+            Th[mask],
+            S[mask],
+            s=9,
+            marker="s",
+            linewidths=0,
+            color="tab:green",
+            alpha=0.75,
+            label="Feasible",
+            zorder=2,
+        )
+        ax.scatter(
+            Th[infeasible],
+            S[infeasible],
+            s=9,
+            marker="s",
+            linewidths=0,
+            color="tab:red",
+            alpha=0.75,
+            label="Infeasible",
+            zorder=3,
+        )
+
+        a, b = float(self.constraint_params[0]), float(self.constraint_params[1])
+        speed_line = np.linspace(float(ua_vals[0]), float(ua_vals[-1]), max(2, int(self.grid_granularity) * 2))
+        thrust_line = -(a * speed_line + b)
+        ax.plot(
+            thrust_line,
+            speed_line,
+            color="black",
+            linewidth=1.2,
+            label="Linear boundary",
+            zorder=4,
+        )
+
+        boundary_thrust = thrust_line[np.isfinite(thrust_line)]
+        x_min = float(thrust_vals[0])
+        x_max = float(thrust_vals[-1])
+        if boundary_thrust.size:
+            x_min = min(x_min, float(np.nanmin(boundary_thrust)))
+            x_max = max(x_max, float(np.nanmax(boundary_thrust)))
+        y_min = float(ua_vals[0])
+        y_max = float(ua_vals[-1])
+        x_pad = max(0.03 * (x_max - x_min), eps)
+        y_pad = max(0.03 * (y_max - y_min), eps)
+        ax.set_xlim(x_min - x_pad, x_max + x_pad)
+        ax.set_ylim(y_min - y_pad, y_max + y_pad)
+        ax.set_xlabel("resistance per propeller [MN]")
+        ax.set_ylabel("advance speed [m/s]")
+        ax.legend(loc="best", frameon=False)
+
+        output_dir = Path(directory or PLOTS)
+        return _save_tight_pdf(fig, output_dir / f"{filename}.pdf", show, top=1.0)
 
     def _require_fit_data(self):
         if self.mask_fit is None or self.ua_vals is None or self.thrust_vals is None:

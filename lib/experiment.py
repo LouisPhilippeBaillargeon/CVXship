@@ -214,22 +214,54 @@ def save_run_results(
     rows = []
 
     for key, label, sol in solution_records:
-        if sol is None:
-            continue
+        row = save_solution_record(
+            ctx,
+            key,
+            label,
+            sol,
+            save_solutions=save_solutions,
+        )
+        if row is not None:
+            rows.append(row)
 
-        filename = f"{_slug(key)}.pkl"
-        solution_path = ctx.solutions_dir / filename
-        if save_solutions:
-            with open(solution_path, "wb") as f:
-                pickle.dump(sol, f)
+    return complete_run_results(ctx, rows)
 
-        row = summarize_solution(key, label, sol)
-        row["solution_file"] = str(Path("solutions") / filename) if save_solutions else ""
-        rows.append(row)
-        _log_solution_quality(label, sol)
 
+def save_solution_record(
+    ctx: RunContext,
+    key: str,
+    label: str,
+    sol: Any,
+    *,
+    save_solutions: bool = True,
+) -> dict[str, Any] | None:
+    if sol is None:
+        return None
+
+    filename = f"{_slug(key)}.pkl"
+    solution_path = ctx.solutions_dir / filename
+    if save_solutions:
+        with open(solution_path, "wb") as f:
+            pickle.dump(sol, f)
+
+    row = summarize_solution(key, label, sol)
+    row["solution_file"] = str(Path("solutions") / filename) if save_solutions else ""
+    _log_solution_quality(label, sol)
+    return row
+
+
+def write_run_summary_files(ctx: RunContext, rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = list(rows)
     _write_summary_csv(ctx.run_dir / "summary.csv", rows)
     _write_json(ctx.run_dir / "summary.json", rows)
+    return rows
+
+
+def complete_run_results(
+    ctx: RunContext,
+    rows: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    rows = write_run_summary_files(ctx, rows)
     _append_run_index(ctx, rows)
     update_manifest(
         ctx,

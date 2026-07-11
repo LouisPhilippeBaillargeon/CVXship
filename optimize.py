@@ -3,6 +3,7 @@ from typing import List
 import time
 import argparse
 import atexit
+import csv
 import hashlib
 import json
 import shutil
@@ -20,15 +21,17 @@ from lib.weather_interpolation import build_transition_weather_inputs, prepare_n
 from lib.debug_diagnostics import clear_debug_reports, print_debug_report
 from lib import logging_utils as log
 from lib.experiment import (
+    complete_run_results,
     create_run_context,
     load_case_cache_options,
     load_case_output_options,
     load_case_run_options,
     mark_failed_if_running,
-    save_run_results,
+    save_solution_record,
     solution_power_management_solver_status,
     solution_solver_status,
     update_manifest,
+    write_run_summary_files,
 )
 
 new_weather = True
@@ -37,6 +40,71 @@ dimensions = "both"  # "1D", "2D" or "both"
 solver_verbose = True
 unit_commitment = False
 run_jpcse_transit_wind = False
+
+OPTIMIZER_ALL = "all"
+OPTIMIZER_CHOICES = (
+    "FR_O",
+    "FPJSE",
+    "JPDSE",
+    "JPCSE_departure_wind",
+    "JPCSE_transit_wind",
+)
+
+
+def _optimizer_lookup_key(value):
+    return "".join(ch for ch in str(value).lower() if ch.isalnum())
+
+
+OPTIMIZER_ALIASES = {
+    _optimizer_lookup_key(name): name
+    for name in OPTIMIZER_CHOICES
+}
+OPTIMIZER_ALIASES.update(
+    {
+        "all": OPTIMIZER_ALL,
+        "jpcse": "JPCSE_departure_wind",
+        "jpcsedeparture": "JPCSE_departure_wind",
+        "jpcsetransit": "JPCSE_transit_wind",
+    }
+)
+
+FIT_ERROR_REPORT_COLUMNS = (
+    "model",
+    "quantity",
+    "unit",
+    "scope",
+    "fit_subset",
+    "min_fit_speed_mps",
+    "max_fit_speed_mps",
+    "worst_abs_error",
+    "average_abs_error",
+    "mean_abs_value",
+    "worst_abs_error_pct_of_mean_abs_value",
+    "average_abs_error_pct_of_mean_abs_value",
+    "sample_count",
+)
+
+
+def _normalize_optimizer_selection(value):
+    if value in (None, ""):
+        return None
+
+    key = _optimizer_lookup_key(value)
+    if key in OPTIMIZER_ALIASES:
+        optimizer = OPTIMIZER_ALIASES[key]
+        return None if optimizer == OPTIMIZER_ALL else optimizer
+
+    choices = ", ".join(OPTIMIZER_CHOICES)
+    raise ValueError(f"optimizer must be one of: {choices}")
+
+
+def _optimizer_arg(value):
+    try:
+        if _optimizer_lookup_key(value) == "all":
+            return OPTIMIZER_ALL
+        return _normalize_optimizer_selection(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _parse_args(argv=None):
@@ -54,6 +122,14 @@ def _parse_args(argv=None):
     parser.add_argument("--quiet-solver", dest="solver_verbose", action="store_false")
     parser.add_argument("--unit-commitment", dest="unit_commitment", action="store_true", default=None)
     parser.add_argument("--no-unit-commitment", dest="unit_commitment", action="store_false")
+    parser.add_argument(
+        "--optimizer",
+        "--o",
+        dest="optimizer",
+        type=_optimizer_arg,
+        default=None,
+        help="Run one optimizer after shared baselines/preflight. Use 'all' to run the default set.",
+    )
     parser.add_argument("--path-generator", choices=["shortest", "wrt", "saved"], default=None)
     parser.add_argument("--path-solution-json", type=Path, default=None)
     parser.add_argument("--wrt-algorithm", choices=["isofuel", "genetic"], default=None)
@@ -370,6 +446,39 @@ def _save_path_artifacts(run_context, path_generator, path_obj):
     return artifacts
 
 
+def _collect_fit_error_report_rows(model_records):
+    rows = []
+    for model_name, model in model_records:
+        if model is None:
+            continue
+        report_row = getattr(model, "fit_error_report_row", None)
+        if report_row is None:
+            continue
+        row = report_row(model_name=model_name)
+        if row is not None:
+            rows.append(row)
+    return rows
+
+
+def _write_fit_error_report(run_context, model_records):
+    rows = _collect_fit_error_report_rows(model_records)
+    if not rows:
+        return None
+
+    report_dir = run_context.plots_dir / "fits"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_path = report_dir / "fit_error_report.csv"
+    with report_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=FIT_ERROR_REPORT_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+    relative_path = _run_relative_path(run_context, report_path)
+    update_manifest(run_context, {"fit_error_report_csv": relative_path})
+    log.progress("[RUN] Saved fit error report to %s", report_path)
+    return report_path
+
+
 if __name__ == "__main__":
     args = _parse_args()
     run_toml_options = load_case_run_options(args.case)
@@ -381,6 +490,9 @@ if __name__ == "__main__":
     dimensions = str(_option(args.dimensions, run_toml_options, "dimensions", dimensions))
     if dimensions not in {"1D", "2D", "both"}:
         raise ValueError("dimensions must be one of: 1D, 2D, both")
+    selected_optimizer = _normalize_optimizer_selection(
+        _option(args.optimizer, run_toml_options, "optimizer", None)
+    )
     solver_verbose = bool(_option(args.solver_verbose, run_toml_options, "solver_verbose", solver_verbose))
     unit_commitment = bool(_option(args.unit_commitment, run_toml_options, "unit_commitment", unit_commitment))
     run_jpcse_transit_wind = _run_bool_option(
@@ -388,6 +500,14 @@ if __name__ == "__main__":
         ("run_jpcse_transit_wind",),
         run_jpcse_transit_wind,
     )
+    if selected_optimizer is not None:
+        if selected_optimizer in {"FR_O", "FPJSE"}:
+            dimensions = "1D"
+        elif selected_optimizer == "JPDSE":
+            dimensions = "2D"
+        else:
+            dimensions = "both"
+        run_jpcse_transit_wind = selected_optimizer == "JPCSE_transit_wind"
     ordered_sets = _run_bool_option(
         run_toml_options,
         ("ordered_sets",),
@@ -462,6 +582,7 @@ if __name__ == "__main__":
         "new_weather": new_weather,
         "solver_verbose": solver_verbose,
         "unit_commitment": unit_commitment,
+        "optimizer": selected_optimizer,
         "run_jpcse_transit_wind": run_jpcse_transit_wind,
         "ordered_sets": ordered_sets,
         "path_generator": path_generator,
@@ -521,10 +642,57 @@ if __name__ == "__main__":
         plot_kwargs.setdefault("show", show_plots)
         return plot_sets_and_points(*plot_args, **plot_kwargs)
 
+    fit_plots_dir = run_context.plots_dir / "fits"
+
+    def maybe_plot_wind_fit(wind_model, kind, filename, plot_type="heatmaps"):
+        if not save_plots or wind_model is None:
+            return None
+        plot = getattr(wind_model, f"plot_{kind}_fit_{plot_type}", None)
+        if plot is None:
+            return None
+        return plot(
+            show=show_plots,
+            directory=fit_plots_dir,
+            filename=filename,
+        )
+
     all_solution_comparison_dir = "all_sol_compared"
 
     def relaxation_quality_dir(optimizer_name):
         return f"relaxation_quality/{optimizer_name}"
+
+    solution_records = []
+    summary_rows = []
+
+    def should_run_optimizer(optimizer_name):
+        return selected_optimizer is None or selected_optimizer == optimizer_name
+
+    def save_evaluated_solutions(*records):
+        new_rows = []
+        for key, label, sol in records:
+            row = save_solution_record(
+                run_context,
+                key,
+                label,
+                sol,
+                save_solutions=save_solutions,
+            )
+            if row is None:
+                continue
+            solution_records.append((key, label, sol))
+            summary_rows.append(row)
+            new_rows.append(row)
+
+        if new_rows:
+            write_run_summary_files(run_context, summary_rows)
+            artifact = "pickle(s)" if save_solutions else "summary row(s)"
+            log.progress(
+                "[RUN] Saved %d solution %s; summary now has %d rows",
+                len(new_rows),
+                artifact,
+                len(summary_rows),
+            )
+        return new_rows
 
     clear_debug_reports()
     log.progress("[RUN] Loading case inputs")
@@ -689,6 +857,7 @@ if __name__ == "__main__":
         "wind_model_1d",
         case_inputs=cache_case_inputs,
         weather_files=cache_weather_files,
+        fit_plot_diagnostics_schema=1,
     )
     wind_model_2d_metadata = _cache_metadata(
         run_context,
@@ -696,6 +865,7 @@ if __name__ == "__main__":
         "wind_model_2d",
         case_inputs=cache_case_inputs,
         weather_files=cache_weather_files,
+        fit_plot_diagnostics_schema=1,
     )
     wind_model_path_aligned_2d_metadata = _cache_metadata(
         run_context,
@@ -704,6 +874,7 @@ if __name__ == "__main__":
         case_inputs=cache_case_inputs,
         weather_files=cache_weather_files,
         ordered_sets=True,
+        fit_plot_diagnostics_schema=1,
     )
     if run_jpcse_transit_wind:
         wind_model_transition_1d_metadata = _cache_metadata(
@@ -713,21 +884,14 @@ if __name__ == "__main__":
             case_inputs=cache_case_inputs,
             weather_files=cache_weather_files,
             route_directions=bool(ordered_sets),
+            fit_plot_diagnostics_schema=1,
         )
 
     if new_ship:
         log.progress("[RUN] Starting ship model fitting")
         start = time.time()
         calm_model = CalmWaterModel(ship=ship, fit_range=fit_range)
-        if save_plots:
-            calm_model.plot_calm_water_models_ieee(
-                nb_points=200,
-                fit_if_needed=True,
-                show=show_plots,
-                output_root=run_context.plots_dir,
-            )
-        else:
-            calm_model.fit_convex_model()
+        calm_model.fit_convex_model()
 
         propulsion_model = PropulsionModel(
             ship=ship,
@@ -736,24 +900,8 @@ if __name__ == "__main__":
             fit_range=fit_range,
         )
 
-        fit_error_P_max, fit_error_P_mean = propulsion_model.fit_convex_model()
-        log.debug("max error power %.6g %%", fit_error_P_max)
-        log.debug("mean error power %.6g %%", fit_error_P_mean)
+        propulsion_model.fit_convex_model()
         log.debug("Ship model fit took %.3f seconds", time.time() - start)
-
-        if save_plots:
-            propulsion_model.plot_power_surface_speed_resistance(
-                show=show_plots,
-                directory=run_context.plots_dir,
-            )
-            propulsion_model.plot_power_error_heatmap(
-                show=show_plots,
-                directory=run_context.plots_dir,
-            )
-            propulsion_model.plot_feasibility_mask(
-                show=show_plots,
-                directory=run_context.plots_dir,
-            )
 
         save_obj(CALM_MODEL, calm_model, metadata=calm_model_metadata)
         save_obj(PROPULSION_MODEL, propulsion_model, metadata=propulsion_model_metadata)
@@ -763,6 +911,30 @@ if __name__ == "__main__":
         calm_model = load_obj(CALM_MODEL, expected_metadata=calm_model_metadata)
         propulsion_model = load_obj(PROPULSION_MODEL, expected_metadata=propulsion_model_metadata)
         log.debug("Saved ship model loaded; generator cost models use ship.toml.")
+
+    if save_plots:
+        calm_model.plot_calm_water_models_ieee(
+            nb_points=200,
+            fit_if_needed=True,
+            show=show_plots,
+            output_root=fit_plots_dir,
+            file_format="pdf",
+            pad_inches=0.02,
+        )
+        try:
+            propulsion_model.plot_power_fit_heatmaps_pdf(
+                show=show_plots,
+                directory=fit_plots_dir,
+            )
+        except ValueError as exc:
+            log.debug("Skipping propulsion power fit PDF: %s", exc)
+        try:
+            propulsion_model.plot_feasibility_classification_pdf(
+                show=show_plots,
+                directory=fit_plots_dir,
+            )
+        except ValueError as exc:
+            log.debug("Skipping propulsion feasibility classification PDF: %s", exc)
 
     if new_weather:
         log.progress("[RUN] Starting weather model fitting")
@@ -775,8 +947,6 @@ if __name__ == "__main__":
                 set_course_angles,
                 diagnostic_wind_samples=getattr(weather, "diagnostic_wind_samples", None),
             )
-            log.debug("average max error wind 1D %.6g %%", np.mean(wind_model_1D.relative_errors))
-
             save_obj(WIND_MODEL_1D, wind_model_1D, metadata=wind_model_1d_metadata)
 
         naive.wind_model = base_wind_model
@@ -805,7 +975,6 @@ if __name__ == "__main__":
                     weather.wind_y,
                     diagnostic_wind_samples=getattr(weather, "diagnostic_wind_samples", None),
                 )
-                log.debug("average max error wind 2D %.6g %%", np.mean(set_wind_model_2D.relative_errors))
                 save_obj(WIND_MODEL_2D, set_wind_model_2D, metadata=wind_model_2d_metadata)
 
         if dimensions == "both" and run_jpcse_transit_wind:
@@ -855,6 +1024,61 @@ if __name__ == "__main__":
                 expected_metadata=wind_model_transition_1d_metadata,
             )
         log.debug("Saved weather model loaded")
+
+    if dimensions in ("1D", "both"):
+        maybe_plot_wind_fit(
+            wind_model_1D,
+            "worst",
+            "wind_fit_worst_abs_error_1d",
+            plot_type="lineplot",
+        )
+        maybe_plot_wind_fit(
+            wind_model_1D,
+            "best",
+            "wind_fit_best_abs_error_1d",
+            plot_type="lineplot",
+        )
+
+    if dimensions == "2D" or dimensions == "both":
+        wind_fit_suffix = "path_aligned_2d" if ordered_sets else "2d"
+        maybe_plot_wind_fit(
+            set_wind_model_2D,
+            "worst",
+            f"wind_fit_worst_abs_error_{wind_fit_suffix}",
+        )
+        maybe_plot_wind_fit(
+            set_wind_model_2D,
+            "best",
+            f"wind_fit_best_abs_error_{wind_fit_suffix}",
+        )
+
+    if dimensions == "both" and run_jpcse_transit_wind:
+        maybe_plot_wind_fit(
+            wind_model_transition_1D,
+            "worst",
+            "wind_fit_worst_abs_error_transition_1d",
+            plot_type="lineplot",
+        )
+        maybe_plot_wind_fit(
+            wind_model_transition_1D,
+            "best",
+            "wind_fit_best_abs_error_transition_1d",
+            plot_type="lineplot",
+        )
+
+    fit_report_models = [("PropulsionModel", propulsion_model)]
+    if dimensions in ("1D", "both"):
+        fit_report_models.append(("WindModel1D", wind_model_1D))
+    if dimensions in ("2D", "both"):
+        fit_report_models.append(
+            (
+                "WindModelPathAligned2D" if ordered_sets else "WindModel2D",
+                set_wind_model_2D,
+            )
+        )
+    if dimensions == "both" and run_jpcse_transit_wind:
+        fit_report_models.append(("WindModelTransition1D", wind_model_transition_1D))
+    _write_fit_error_report(run_context, fit_report_models)
 
     naive.wind_model = base_wind_model
     naive.propulsion_model = propulsion_model
@@ -933,6 +1157,10 @@ if __name__ == "__main__":
         naive,
         "Naive Controller",
     )
+    save_evaluated_solutions(
+        ("naive_rule", "Naive Controller + rule-based", naive_rule_sol),
+        ("naive_energy", "Naive Controller + energy", naive_nonconv_sol),
+    )
 
     maybe_plot_solutions(
         [naive.sol, naive_rule_sol],
@@ -985,6 +1213,10 @@ if __name__ == "__main__":
         fr_o_runner,
         "FR_O",
     )
+    save_evaluated_solutions(
+        ("fr_o_rule", "FR_O + rule-based", FR_O_rule_sol),
+        ("fr_o_energy", "FR_O + energy", FR_O_nonconv_sol_pow),
+    )
     maybe_plot_solutions(
         [fr_o_runner.sol, FR_O_rule_sol],
         ["Convex FR_O solution", "FR_O rule-based evaluator"],
@@ -994,7 +1226,7 @@ if __name__ == "__main__":
         map=fr_o_runner.map,
     )
 
-    if dimensions == "1D" or dimensions == "both":
+    if (dimensions == "1D" or dimensions == "both") and should_run_optimizer("FPJSE"):
         optimizer = FPJSE(
             wind_model          = wind_model_1D,
             propulsion_model    = propulsion_model,
@@ -1015,6 +1247,7 @@ if __name__ == "__main__":
         ok = optimizer.optimize(
             unit_commitment     = unit_commitment,
             restrict_to_base    = False,
+            min_timestep        = False,
             base_solution       = naive.sol,
             base_set_radius = 1,
             verbose             = solver_verbose,
@@ -1024,6 +1257,10 @@ if __name__ == "__main__":
             FPJSE_rule_sol, FPJSE_energy_sol = evaluate_with_both_power_management(
                 optimizer,
                 "FPJSE",
+            )
+            save_evaluated_solutions(
+                ("fpjse_rule", "FPJSE + rule-based", FPJSE_rule_sol),
+                ("fpjse_energy", "FPJSE + energy", FPJSE_energy_sol),
             )
             maybe_plot_solutions(
                 [optimizer.sol, FPJSE_rule_sol],
@@ -1037,19 +1274,15 @@ if __name__ == "__main__":
             log.error("FPJSE optimization failed.")
             FPJSE_rule_sol = _failed_optimizer_summary(optimizer, "FPJSE")
             FPJSE_energy_sol = _failed_optimizer_summary(optimizer, "FPJSE")
+            save_evaluated_solutions(
+                ("fpjse_rule", "FPJSE + rule-based", FPJSE_rule_sol),
+                ("fpjse_energy", "FPJSE + energy", FPJSE_energy_sol),
+            )
 
         if dimensions == "1D":
             print_debug_report()
-            maybe_plot_solutions(
-                [naive_rule_sol, naive_nonconv_sol, FR_O_rule_sol, FR_O_nonconv_sol_pow, FPJSE_rule_sol, FPJSE_energy_sol],
-                ["Naive + rule-based", "Naive + energy", "FR_O + rule-based", "FR_O + energy", "FPJSE + rule-based", "FPJSE + energy"],
-                benchmark_label="Naive + rule-based",
-                show=False,
-                subfolder=all_solution_comparison_dir,
-                map=optimizer.map,
-            )
 
-    if dimensions == "2D" or dimensions == "both":
+    if (dimensions == "2D" or dimensions == "both") and should_run_optimizer("JPDSE"):
         optimizer = JPDSE(
             wind_model          = set_wind_model_2D,
             propulsion_model    = propulsion_model,
@@ -1071,7 +1304,7 @@ if __name__ == "__main__":
         ok = optimizer.optimize(
             unit_commitment=unit_commitment,
             ordered_sets = ordered_sets,
-            min_timestep = True,
+            min_timestep = False,
             enforce_adjacency=True,
             restrict_to_base=False,
             base_solution=naive.sol,
@@ -1083,6 +1316,10 @@ if __name__ == "__main__":
             JPDSE_rule_sol, JPDSE_energy_sol = evaluate_with_both_power_management(
                 optimizer,
                 "JPDSE",
+            )
+            save_evaluated_solutions(
+                ("jpdse_rule", "JPDSE + rule-based", JPDSE_rule_sol),
+                ("jpdse_energy", "JPDSE + energy", JPDSE_energy_sol),
             )
             maybe_plot_solutions(
                 [optimizer.sol, JPDSE_rule_sol],
@@ -1096,20 +1333,18 @@ if __name__ == "__main__":
             log.error("JPDSE optimization failed.")
             JPDSE_rule_sol = _failed_optimizer_summary(optimizer, "JPDSE")
             JPDSE_energy_sol = _failed_optimizer_summary(optimizer, "JPDSE")
+            save_evaluated_solutions(
+                ("jpdse_rule", "JPDSE + rule-based", JPDSE_rule_sol),
+                ("jpdse_energy", "JPDSE + energy", JPDSE_energy_sol),
+            )
 
         if dimensions == "2D":
             print_debug_report()
-            if ok:
-                maybe_plot_solutions(
-                    [naive_rule_sol, naive_nonconv_sol, JPDSE_rule_sol, JPDSE_energy_sol],
-                    ["Naive + rule-based", "Naive + energy", "JPDSE + rule-based", "JPDSE + energy"],
-                    benchmark_label="Naive + rule-based",
-                    show=show_plots,
-                    subfolder=all_solution_comparison_dir,
-                    map=optimizer.map,
-                )
 
-    if dimensions == "both":
+    if dimensions == "both" and (
+        should_run_optimizer("JPCSE_departure_wind")
+        or should_run_optimizer("JPCSE_transit_wind")
+    ):
         def run_jpcse_variant(key, label, use_transition_wind_model):
             optimizer = JPCSE(
                 wind_model=set_wind_model_2D,
@@ -1135,7 +1370,7 @@ if __name__ == "__main__":
             ok = optimizer.optimize(
                 unit_commitment=unit_commitment,
                 ordered_sets=ordered_sets,
-                min_timestep=True,
+                min_timestep=False,
                 enforce_adjacency=True,
                 restrict_to_base=False,
                 base_solution=naive.sol,
@@ -1146,12 +1381,22 @@ if __name__ == "__main__":
             if not ok:
                 log.error("%s optimization failed.", label)
                 failed_sol = _failed_optimizer_summary(optimizer, label)
+                base_key = key.lower()
+                save_evaluated_solutions(
+                    (f"{base_key}_rule", f"{label} + rule-based", failed_sol),
+                    (f"{base_key}_energy", f"{label} + energy", failed_sol),
+                )
                 return optimizer, failed_sol, failed_sol
 
             maybe_plot_sets_and_points(optimizer.sol.ship_pos, optimizer.map.set_ineq)
             rule_sol, energy_sol = evaluate_with_both_power_management(
                 optimizer,
                 label,
+            )
+            base_key = key.lower()
+            save_evaluated_solutions(
+                (f"{base_key}_rule", f"{label} + rule-based", rule_sol),
+                (f"{base_key}_energy", f"{label} + energy", energy_sol),
             )
             for name in [
                 "prop_power",
@@ -1174,7 +1419,7 @@ if __name__ == "__main__":
             return optimizer, rule_sol, energy_sol
 
         jpcse_performance_rows = []
-        if run_jpcse_transit_wind:
+        if run_jpcse_transit_wind and should_run_optimizer("JPCSE_transit_wind"):
             jpcse_optimizer, JPCSE_rule_sol, JPCSE_energy_sol = run_jpcse_variant(
                 "JPCSE_transit_wind",
                 "JPCSE_transit_wind",
@@ -1183,23 +1428,24 @@ if __name__ == "__main__":
             jpcse_performance_rows.append(
                 ("JPCSE_transit_wind", jpcse_optimizer, JPCSE_rule_sol, JPCSE_energy_sol)
             )
-        (
-            jpcse_departure_wind_optimizer,
-            JPCSE_departure_wind_rule_sol,
-            JPCSE_departure_wind_energy_sol,
-        ) = run_jpcse_variant(
-            "JPCSE_departure_wind",
-            "JPCSE_departure_wind",
-            False,
-        )
-        jpcse_performance_rows.append(
+        if should_run_optimizer("JPCSE_departure_wind"):
             (
-                "JPCSE_departure_wind",
                 jpcse_departure_wind_optimizer,
                 JPCSE_departure_wind_rule_sol,
                 JPCSE_departure_wind_energy_sol,
+            ) = run_jpcse_variant(
+                "JPCSE_departure_wind",
+                "JPCSE_departure_wind",
+                False,
             )
-        )
+            jpcse_performance_rows.append(
+                (
+                    "JPCSE_departure_wind",
+                    jpcse_departure_wind_optimizer,
+                    JPCSE_departure_wind_rule_sol,
+                    JPCSE_departure_wind_energy_sol,
+                )
+            )
 
         log.verbose("JPCSE performance comparison")
         log.verbose(
@@ -1226,26 +1472,6 @@ if __name__ == "__main__":
 
         print_debug_report()
 
-    solution_records = [
-        ("naive_rule", "Naive Controller + rule-based", locals().get("naive_rule_sol")),
-        ("naive_energy", "Naive Controller + energy", locals().get("naive_nonconv_sol")),
-        ("fr_o_rule", "FR_O + rule-based", locals().get("FR_O_rule_sol")),
-        ("fr_o_energy", "FR_O + energy", locals().get("FR_O_nonconv_sol_pow")),
-        ("fpjse_rule", "FPJSE + rule-based", locals().get("FPJSE_rule_sol")),
-        ("fpjse_energy", "FPJSE + energy", locals().get("FPJSE_energy_sol")),
-        ("jpdse_rule", "JPDSE + rule-based", locals().get("JPDSE_rule_sol")),
-        ("jpdse_energy", "JPDSE + energy", locals().get("JPDSE_energy_sol")),
-        ("jpcse_departure_wind_rule", "JPCSE_departure_wind + rule-based", locals().get("JPCSE_departure_wind_rule_sol")),
-        ("jpcse_departure_wind_energy", "JPCSE_departure_wind + energy", locals().get("JPCSE_departure_wind_energy_sol")),
-    ]
-    if run_jpcse_transit_wind:
-        solution_records.extend(
-            [
-                ("jpcse_transit_wind_rule", "JPCSE_transit_wind + rule-based", locals().get("JPCSE_rule_sol")),
-                ("jpcse_transit_wind_energy", "JPCSE_transit_wind + energy", locals().get("JPCSE_energy_sol")),
-            ]
-        )
-
     available_comparison = [
         (label, sol)
         for _, label, sol in solution_records
@@ -1261,12 +1487,8 @@ if __name__ == "__main__":
             map=map,
         )
 
-    log.progress("[RUN] Writing run summaries")
-    summary_rows = save_run_results(
-        run_context,
-        solution_records,
-        save_solutions=save_solutions,
-    )
+    log.progress("[RUN] Finalizing run summaries")
+    summary_rows = complete_run_results(run_context, summary_rows)
     _print_result_table(summary_rows)
     log.debug("[RUN] saved %d solution summaries", len(summary_rows))
     log.debug("[RUN] summary=%s", run_context.run_dir / "summary.csv")

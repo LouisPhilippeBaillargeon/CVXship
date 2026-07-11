@@ -49,6 +49,18 @@ def test_optimize_accepts_saved_path_solution_flag():
     assert args.path_solution_json == Path("results/runs/demo/routes/path_solution.json")
 
 
+def test_optimize_accepts_short_optimizer_flag():
+    args = _parse_args(["--case", "cases/sept-iles-gaspe", "--o", "FPJSE"])
+
+    assert args.optimizer == "FPJSE"
+
+
+def test_optimize_normalizes_optimizer_alias():
+    args = _parse_args(["--case", "cases/sept-iles-gaspe", "--optimizer", "jpcse"])
+
+    assert args.optimizer == "JPCSE_departure_wind"
+
+
 def test_format_result_table_includes_solution_statuses():
     lines = _format_result_table(
         [

@@ -58,9 +58,12 @@ def _save_and_maybe_show(
     show: bool = False,
     directory=PLOTS,
     font_scale: float = 1.0,
+    file_format: str = "png",
+    pad_inches: float = 0.1,
 ):
     os.makedirs(directory, exist_ok=True)
-    path = os.path.join(directory, f"{name}.png")
+    file_format = str(file_format).lstrip(".")
+    path = os.path.join(directory, f"{name}.{file_format}")
 
     if font_scale != 1.0:
         for ax in fig.get_axes():
@@ -83,7 +86,7 @@ def _save_and_maybe_show(
     fig.tight_layout(pad=1.2)
     fig.subplots_adjust(left=0.18, bottom=0.18)
 
-    fig.savefig(path, bbox_inches="tight", dpi=300)
+    fig.savefig(path, bbox_inches="tight", pad_inches=pad_inches, dpi=300)
     log.debug("[SAVED] %s", path)
 
     if show:

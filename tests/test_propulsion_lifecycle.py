@@ -9,6 +9,13 @@ from lib.models import CalmWaterModel, FitRange, PropulsionModel
 def _ship():
     return SimpleNamespace(
         info=SimpleNamespace(max_speed=12.0, rho_water=1025.0),
+        hull=SimpleNamespace(
+            B=25.4,
+            LWL=175.0,
+            CB=0.569,
+            T=9.5,
+            total_wet_area=4927.6,
+        ),
         propulsion=SimpleNamespace(
             wake_fraction=0.2,
             nb_propellers=2,
@@ -125,3 +132,29 @@ def test_calm_water_model_initialization_does_not_fit():
     assert model.res_coeffs is None
     with pytest.raises(ValueError, match="fit_convex_model"):
         model.require_convex_fit("test")
+
+
+def test_naive_nominal_c_resistance_uses_fit_range_midpoint(monkeypatch):
+    model = CalmWaterModel(ship=_ship(), fit_range=_fit_range())
+    calls = []
+
+    def fake_compute_c(self, speed):
+        calls.append(speed)
+        return 0.01
+
+    monkeypatch.setattr(CalmWaterModel, "compute_C", fake_compute_c)
+
+    speeds = np.array([2.0, 4.0, 6.0])
+    resistance = model.compute_naive_nominal_C_resistance(speeds)
+
+    expected = (
+        0.5
+        * 0.01
+        * model.ship.hull.total_wet_area
+        * model.ship.info.rho_water
+        * speeds**2
+        / 1_000_000
+    )
+    np.testing.assert_allclose(resistance, expected)
+    assert len(calls) == 1
+    assert calls[0] == pytest.approx(4.5)
