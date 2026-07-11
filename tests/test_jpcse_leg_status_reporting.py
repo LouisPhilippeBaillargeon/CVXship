@@ -9,6 +9,7 @@ from lib.optimizers import (
     _jpcse_leg_metrics,
     _jpcse_normal_wind_inactive_expr,
     _jpcse_transition_wind_inactive_expr,
+    _relaxed_set_membership_rhs,
 )
 from lib.plotting import _print_cost_summary_vs_benchmark
 
@@ -34,6 +35,11 @@ def test_jpcse_transition_wind_model_uses_normal_model_on_same_set_leg():
 
     assert _jpcse_normal_wind_inactive_expr(set_selection, 0, 0, True) == 0.0
     assert _jpcse_transition_wind_inactive_expr(set_selection, 0, 0, 1) == 1.0
+
+
+def test_transition_overlap_tolerance_is_flat_km_slack():
+    assert _relaxed_set_membership_rhs(-7.0, 1.0, 0.05) == -0.05
+    assert _relaxed_set_membership_rhs(-7.0, 0.0, 0.05) == -7.0
 
 
 def test_jpcse_leg_metrics_use_total_leg_and_water_relative_distances():

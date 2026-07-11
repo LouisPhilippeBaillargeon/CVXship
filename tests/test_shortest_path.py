@@ -138,6 +138,37 @@ class ShortestPathTests(unittest.TestCase):
             optimizer_name="test",
         )
 
+    def test_shortest_path_extracts_degenerate_portal_for_corner_only_contact(self):
+        corner_xy = {
+            0: np.array([0.0, 0.0]),
+            1: np.array([1.0, 0.0]),
+            2: np.array([1.0, 1.0]),
+            3: np.array([0.0, 1.0]),
+            4: np.array([2.0, 1.0]),
+            5: np.array([2.0, 2.0]),
+            6: np.array([1.0, 2.0]),
+        }
+        set_edges = {
+            0: {
+                frozenset((0, 1)),
+                frozenset((1, 2)),
+                frozenset((2, 3)),
+                frozenset((3, 0)),
+            },
+            1: {
+                frozenset((2, 4)),
+                frozenset((4, 5)),
+                frozenset((5, 6)),
+                frozenset((6, 2)),
+            },
+        }
+
+        portals = ShortestPath._extract_portals([0, 1], set_edges, corner_xy)
+
+        self.assertEqual(len(portals), 1)
+        self.assertEqual(portals[0].shape, (2, 2))
+        np.testing.assert_allclose(portals[0], [[1.0, 1.0], [1.0, 1.0]])
+
 
 if __name__ == "__main__":
     unittest.main()

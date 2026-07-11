@@ -1,7 +1,18 @@
 import pandas as pd
+import numpy as np
 from types import SimpleNamespace
 
-from lib.map_builder import Corner, Set, SetEditor, normalize_zero_based_set_tables, validate_zero_based_set_tables
+from lib.map_builder import (
+    Corner,
+    Set,
+    SetEditor,
+    build_adjacency_zero_based,
+    build_transition_arrays_zero_based,
+    compute_lambda_array_zero_based,
+    normalize_zero_based_set_tables,
+    shared_corner_ids,
+    validate_zero_based_set_tables,
+)
 
 
 def test_normalize_zero_based_set_tables_compacts_deleted_set_gap():
@@ -65,3 +76,33 @@ def test_set_editor_compacts_live_ids_after_delete_and_add_sequence():
     assert [c.id for c in editor.corners] == [0, 1, 2, 3, 4, 5]
     assert Set._next_id == 3
     assert Corner._next_id == 6
+
+
+def test_adjacency_includes_corner_only_contacts_without_edge_transition_arrays():
+    corners_df = pd.DataFrame({
+        "corner_id": [0, 1, 2, 3, 4, 5, 6],
+        "x": [0, 1, 1, 0, 2, 2, 1],
+        "y": [0, 0, 1, 1, 1, 2, 2],
+    })
+    sets_df = pd.DataFrame({
+        "set_id": [0, 0, 0, 0, 1, 1, 1, 1],
+        "order": [0, 1, 2, 3, 0, 1, 2, 3],
+        "corner_id": [0, 1, 2, 3, 2, 4, 5, 6],
+    })
+
+    adj = build_adjacency_zero_based(sets_df)
+
+    assert shared_corner_ids(0, 1, sets_df) == [2]
+    assert int(adj[0, 1]) == 1
+    assert int(adj[1, 0]) == 1
+
+    lambda_array = compute_lambda_array_zero_based(corners_df, sets_df)
+    trans_from, trans_to, adj_from_trans = build_transition_arrays_zero_based(
+        lambda_array,
+        sets_df,
+        corners_df,
+    )
+
+    np.testing.assert_array_equal(adj_from_trans, adj)
+    assert np.isnan(trans_from[:, :, 0, 1]).all()
+    assert np.isnan(trans_to[:, :, 0, 1]).all()

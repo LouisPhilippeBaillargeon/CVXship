@@ -874,6 +874,7 @@ if __name__ == "__main__":
             case_inputs=cache_case_inputs,
             weather_files=cache_weather_files,
             route_directions=bool(ordered_sets),
+            transition_weather_schema=2,
             fit_plot_diagnostics_schema=1,
         )
 
@@ -1147,7 +1148,7 @@ if __name__ == "__main__":
 
     # ============================================================
     # FR_O continuous fixed-path preflight.
-    # Run before any binary formulation so oversized timesteps fail fast.
+    # Run before any binary formulation so fixed-path issues fail fast.
     # ============================================================
     fr_o_runner = FR_O(
         wind_model=wind_model_1D,
@@ -1170,17 +1171,10 @@ if __name__ == "__main__":
         verbose=solver_verbose,
     )
     if not fr_o_ok:
-        if getattr(fr_o_runner, "failure_reason", None) == "waypoint_crossing":
-            log.error(
-                "[ABORT] Binary fixed-path and set optimizers are being "
-                "skipped because FR_O showed the timestep is too large for "
-                "this map/path."
-            )
-        else:
-            log.error(
-                "[ABORT] FR_O preflight failed before binary optimizers could run; "
-                f"reason={getattr(fr_o_runner, 'failure_reason', 'unknown')}."
-            )
+        log.error(
+            "[ABORT] FR_O preflight failed before binary optimizers could run; "
+            f"reason={getattr(fr_o_runner, 'failure_reason', 'unknown')}."
+        )
         sys.exit(1)
 
     _, FR_O_eval_sol, _, _ = evaluate_solution(

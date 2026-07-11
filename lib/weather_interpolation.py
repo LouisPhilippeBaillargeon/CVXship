@@ -404,26 +404,36 @@ def _load_map_corner_geometry(map_obj):
     }
     set_corner_ids = _ordered_set_corner_ids(set_corners_df)
     set_edges = _set_edges_from_corner_ids(set_corner_ids)
-    return corner_xy, set_edges
+    return corner_xy, set_corner_ids, set_edges
+
+
+def _shared_corner_ids(set_corner_ids, z0: int, z1: int) -> list[int]:
+    c0 = set(int(cid) for cid in set_corner_ids[int(z0)])
+    c1 = set(int(cid) for cid in set_corner_ids[int(z1)])
+    return [int(cid) for cid in sorted(c0 & c1)]
 
 
 def shared_boundary_sample_points(map_obj, z0: int, z1: int, n_points: int = 3) -> np.ndarray:
-    corner_xy, set_edges = _load_map_corner_geometry(map_obj)
+    if n_points <= 0:
+        raise ValueError("n_points must be positive.")
+
+    corner_xy, set_corner_ids, set_edges = _load_map_corner_geometry(map_obj)
     shared_edges = set_edges[int(z0)] & set_edges[int(z1)]
-    if len(shared_edges) != 1:
-        c0 = np.asarray(map_obj.set_centroids[int(z0)], dtype=float)
-        c1 = np.asarray(map_obj.set_centroids[int(z1)], dtype=float)
-        return segment_sample_points(c0, c1, n_points=n_points)
+    if len(shared_edges) == 1:
+        corner_ids = list(next(iter(shared_edges)))
+        if len(corner_ids) == 2:
+            a = corner_xy[int(corner_ids[0])]
+            b = corner_xy[int(corner_ids[1])]
+            return segment_sample_points(a, b, n_points=n_points)
 
-    corner_ids = list(next(iter(shared_edges)))
-    if len(corner_ids) != 2:
-        c0 = np.asarray(map_obj.set_centroids[int(z0)], dtype=float)
-        c1 = np.asarray(map_obj.set_centroids[int(z1)], dtype=float)
-        return segment_sample_points(c0, c1, n_points=n_points)
+    shared_corners = _shared_corner_ids(set_corner_ids, int(z0), int(z1))
+    if len(shared_corners) == 1:
+        p = corner_xy[int(shared_corners[0])]
+        return np.repeat(p[None, :], int(n_points), axis=0)
 
-    a = corner_xy[int(corner_ids[0])]
-    b = corner_xy[int(corner_ids[1])]
-    return segment_sample_points(a, b, n_points=n_points)
+    c0 = np.asarray(map_obj.set_centroids[int(z0)], dtype=float)
+    c1 = np.asarray(map_obj.set_centroids[int(z1)], dtype=float)
+    return segment_sample_points(c0, c1, n_points=n_points)
 
 
 def timestep_mid_times(itinerary, start_index: int = 0, count: int | None = None):

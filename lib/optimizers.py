@@ -602,6 +602,10 @@ def _validate_ordered_set_adjacency(
             )
 
 
+def _relaxed_set_membership_rhs(big_m, selected, transition_overlap_tol_km: float):
+    return big_m * (1 - selected) - float(transition_overlap_tol_km) * selected
+
+
 def _add_ordered_set_constraints(
     constraints: list,
     selection,
@@ -1151,10 +1155,14 @@ class JPDSE:
         restrict_to_base=False,
         base_solution=None,
         base_set_radius=1,
+        transition_overlap_tol_km=0.05,
         verbose=False,
     ):
         constraints = []
         _require_convex_ship_models(self, "JPDSE")
+        transition_overlap_tol_km = float(transition_overlap_tol_km)
+        if transition_overlap_tol_km < 0.0:
+            raise ValueError("transition_overlap_tol_km must be nonnegative.")
 
         if self.states.timesteps_completed >= self.itinerary.nb_timesteps:
             raise ValueError("No timesteps left to optimize; trip is finished.")
@@ -1297,13 +1305,21 @@ class JPDSE:
                     # q in set[t]
                     constraints += [
                         Ay * q[1] + Ax * q[0] + Ac
-                        >= big_M_set[z] * (1 - set_selection[t, z])
+                        >= _relaxed_set_membership_rhs(
+                            big_M_set[z],
+                            set_selection[t, z],
+                            transition_overlap_tol_km,
+                        )
                     ]
 
                     # q in set[t+1]
                     constraints += [
                         Ay * q[1] + Ax * q[0] + Ac
-                        >= big_M_set[z] * (1 - set_selection[t + 1, z])
+                        >= _relaxed_set_membership_rhs(
+                            big_M_set[z],
+                            set_selection[t + 1, z],
+                            transition_overlap_tol_km,
+                        )
                     ]
 
         # ========================================== MINIMUM TIMESTEPS PER SET =======================================
@@ -1828,10 +1844,14 @@ class JPCSE:
         base_solution=None,
         base_set_radius=1,
         use_transition_wind_model=None,
+        transition_overlap_tol_km=0.05,
         verbose=False,
     ):
         constraints = []
         _require_convex_ship_models(self, "JPCSE")
+        transition_overlap_tol_km = float(transition_overlap_tol_km)
+        if transition_overlap_tol_km < 0.0:
+            raise ValueError("transition_overlap_tol_km must be nonnegative.")
         if use_transition_wind_model is None:
             use_transition_wind_model = bool(self.use_transition_wind_model)
 
@@ -1988,13 +2008,21 @@ class JPCSE:
                     # q in set[t]
                     constraints += [
                         Ay * q[1] + Ax * q[0] + Ac
-                        >= big_M_set[z] * (1 - set_selection[t, z])
+                        >= _relaxed_set_membership_rhs(
+                            big_M_set[z],
+                            set_selection[t, z],
+                            transition_overlap_tol_km,
+                        )
                     ]
 
                     # q in set[t+1]
                     constraints += [
                         Ay * q[1] + Ax * q[0] + Ac
-                        >= big_M_set[z] * (1 - set_selection[t + 1, z])
+                        >= _relaxed_set_membership_rhs(
+                            big_M_set[z],
+                            set_selection[t + 1, z],
+                            transition_overlap_tol_km,
+                        )
                     ]
 
         # ========================================== MINIMUM TIMESTEPS PER SET =======================================
@@ -3736,27 +3764,6 @@ class FR_O:
 
         # ================================= RESULTS =================================
         d_opt = np.asarray(d.value, dtype=float)
-        waypoint_crossings = _fixed_path_waypoint_crossing_counts(D_breaks, d_opt)
-        bad_crossings = np.where(waypoint_crossings > 1)[0]
-        if bad_crossings.size:
-            first = int(bad_crossings[0])
-            crossing_details = _format_fixed_path_waypoint_crossing_details(
-                D_breaks,
-                d_opt,
-                first,
-                waypoints=waypoints,
-                path_set_ids=path_set_ids,
-            )
-            log.error(
-                "[FR_O ERROR] Timestep is too large for this fixed-path map: "
-                f"FR_O crossed {int(waypoint_crossings[first])} fixed-path "
-                f"waypoints during timestep {first} ({crossing_details}). "
-                "Aborting before binary optimizers; reduce itinerary.timestep "
-                "or refine the map/path."
-            )
-            self.failure_reason = "waypoint_crossing"
-            return 0
-
         set_selection_full = np.zeros((T_future + 1, self.map.nb_sets), dtype=float)
 
         for t, d_km in enumerate(d_opt):
@@ -4696,22 +4703,26 @@ class ShortestPath:
         for z1, z2 in zip(set_seq[:-1], set_seq[1:]):
             shared_edges = set_edges[z1] & set_edges[z2]
 
-            if len(shared_edges) != 1:
-                raise ValueError(
-                    f"Expected exactly one shared edge between sets {z1} and {z2}, "
-                    f"got {len(shared_edges)}."
-                )
-
-            shared_edge = next(iter(shared_edges))
-            corner_ids = list(shared_edge)
-
-            if len(corner_ids) != 2:
-                raise ValueError(
-                    f"Shared edge between sets {z1} and {z2} does not contain 2 corners."
-                )
-
-            a = corner_xy[int(corner_ids[0])]
-            b = corner_xy[int(corner_ids[1])]
+            if len(shared_edges) == 1:
+                corner_ids = list(next(iter(shared_edges)))
+                if len(corner_ids) != 2:
+                    raise ValueError(
+                        f"Shared edge between sets {z1} and {z2} does not contain 2 corners."
+                    )
+                a = corner_xy[int(corner_ids[0])]
+                b = corner_xy[int(corner_ids[1])]
+            else:
+                corners_1 = set().union(*(set(edge) for edge in set_edges[z1]))
+                corners_2 = set().union(*(set(edge) for edge in set_edges[z2]))
+                corner_ids = [int(cid) for cid in sorted(corners_1 & corners_2)]
+                if len(corner_ids) != 1:
+                    raise ValueError(
+                        f"Expected one shared edge or one shared corner between "
+                        f"sets {z1} and {z2}, got {len(shared_edges)} shared "
+                        f"edges and {len(corner_ids)} shared corners."
+                    )
+                a = corner_xy[int(corner_ids[0])]
+                b = a
 
             portal = np.vstack([a, b])
             portals.append(portal)

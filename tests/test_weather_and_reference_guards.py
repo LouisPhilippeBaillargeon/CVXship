@@ -12,7 +12,11 @@ from lib.utils import (
     path_interval_speed_limit_mps,
     ship_speed_limit_matrix,
 )
-from lib.weather_interpolation import prepare_nc_interp_source, resolve_weather_files_from_toml
+from lib.weather_interpolation import (
+    prepare_nc_interp_source,
+    resolve_weather_files_from_toml,
+    shared_boundary_sample_points,
+)
 
 
 def test_weather_paths_must_come_from_weather_toml(tmp_path):
@@ -67,6 +71,33 @@ def test_weather_files_must_cover_itinerary_window(tmp_path):
             itinerary,
             weather_files={"currents": currents, "atmo": atmo, "sun": sun},
         )
+
+
+def test_shared_boundary_sample_points_uses_shared_corner_for_corner_only_sets(tmp_path):
+    corners_path = tmp_path / "corners.csv"
+    sets_path = tmp_path / "sets.csv"
+    pd.DataFrame({
+        "corner_id": [0, 1, 2, 3, 4, 5, 6],
+        "x": [0, 1, 1, 0, 2, 2, 1],
+        "y": [0, 0, 1, 1, 1, 2, 2],
+    }).to_csv(corners_path, index=False)
+    pd.DataFrame({
+        "set_id": [0, 0, 0, 0, 1, 1, 1, 1],
+        "order": [0, 1, 2, 3, 0, 1, 2, 3],
+        "corner_id": [0, 1, 2, 3, 2, 4, 5, 6],
+    }).to_csv(sets_path, index=False)
+    map_obj = SimpleNamespace(
+        corners_path=corners_path,
+        set_corners_path=sets_path,
+        set_centroids=np.array([[0.5, 0.5], [1.5, 1.5]], dtype=float),
+    )
+
+    points = shared_boundary_sample_points(map_obj, 0, 1, n_points=4)
+
+    np.testing.assert_allclose(
+        points,
+        np.repeat(np.array([[1.0, 1.0]]), 4, axis=0),
+    )
 
 
 def test_constant_speed_reference_errors_when_speed_caps_cannot_cover_path():

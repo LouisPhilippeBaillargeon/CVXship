@@ -243,17 +243,21 @@ def build_adjacency_zero_based(sets_df: pd.DataFrame) -> np.ndarray:
 
     for i in range(Z):
         for j in range(i + 1, Z):
-            if len(corners_per_set[i] & corners_per_set[j]) >= 2:
+            if len(corners_per_set[i] & corners_per_set[j]) >= 1:
                 adj[i, j] = 1
                 adj[j, i] = 1
 
     return adj
 
 
-def shared_edge_corner_pair(zid_i: int, zid_j: int, sets_df: pd.DataFrame):
+def shared_corner_ids(zid_i: int, zid_j: int, sets_df: pd.DataFrame) -> list[int]:
     ci = set(sets_df[sets_df["set_id"] == zid_i]["corner_id"].astype(int).tolist())
     cj = set(sets_df[sets_df["set_id"] == zid_j]["corner_id"].astype(int).tolist())
-    shared = sorted(ci & cj)
+    return [int(cid) for cid in sorted(ci & cj)]
+
+
+def shared_edge_corner_pair(zid_i: int, zid_j: int, sets_df: pd.DataFrame):
+    shared = shared_corner_ids(zid_i, zid_j, sets_df)
 
     if len(shared) != 2:
         return None
