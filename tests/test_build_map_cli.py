@@ -14,6 +14,8 @@ def test_build_map_accepts_case_flag():
     args = _parse_args(["--case", "cases/sept-iles-gaspe"])
 
     assert args.case == Path("cases/sept-iles-gaspe")
+    assert not args.weather_overlay
+    assert not args.force_weather_overlay
 
 
 def test_build_map_accepts_positional_case_path():
@@ -31,3 +33,17 @@ def test_build_map_normalizes_common_cases_path_typo():
 def test_build_map_rejects_duplicate_case_paths():
     with pytest.raises(SystemExit):
         _parse_args(["--case", "cases/halifax-grande-entree", "cases/sept-iles-gaspe"])
+
+
+def test_build_map_accepts_weather_overlay_flag():
+    args = _parse_args(["--case", "cases/sept-iles-gaspe", "--weather-overlay"])
+
+    assert args.weather_overlay
+    assert not args.force_weather_overlay
+
+
+def test_build_map_force_weather_overlay_implies_overlay():
+    args = _parse_args(["--case", "cases/sept-iles-gaspe", "--force-weather-overlay"])
+
+    assert args.weather_overlay
+    assert args.force_weather_overlay

@@ -65,23 +65,21 @@ def test_format_result_table_includes_solution_statuses():
     lines = _format_result_table(
         [
             {
-                "label": "FR_O + energy",
+                "label": "FR_O",
                 "estimated_cost": 123.456789,
                 "solve_time": 4.2,
                 "is_valid": True,
                 "solver_status": "optimal",
-                "power_management_solver_status": "optimal",
                 "validation_warning_count": 0,
                 "fit_range_warning_count": 1,
                 "validation_error_count": 0,
             },
             {
-                "label": "JPDSE + energy",
+                "label": "JPDSE",
                 "estimated_cost": None,
                 "solve_time": None,
                 "is_valid": False,
                 "solver_status": "infeasible",
-                "power_management_solver_status": "",
                 "validation_warning_count": 2,
                 "fit_range_warning_count": 0,
                 "validation_error_count": 1,
@@ -91,12 +89,13 @@ def test_format_result_table_includes_solution_statuses():
 
     table = "\n".join(lines)
     assert "[RESULTS] Run result table" in table
-    assert "FR_O + energy" in table
+    assert "FR_O" in table
     assert "123.456789" in table
     assert "0+1f" in table
-    assert "JPDSE + energy" in table
+    assert "JPDSE" in table
     assert "invalid" in table
     assert "infeasible" in table
+    assert "energy_status" not in table
 
 
 def test_print_result_table_is_visible_when_verbose_disabled(tmp_path, capsys):
@@ -109,7 +108,7 @@ def test_print_result_table_is_visible_when_verbose_disabled(tmp_path, capsys):
         _print_result_table(
             [
                 {
-                    "label": "Naive + energy",
+                    "label": "Naive",
                     "estimated_cost": 1.0,
                     "solve_time": 2.0,
                     "is_valid": True,
@@ -121,4 +120,4 @@ def test_print_result_table_is_visible_when_verbose_disabled(tmp_path, capsys):
 
     captured = capsys.readouterr()
     assert "[RESULTS] Run result table" in captured.out
-    assert "Naive + energy" in captured.out
+    assert "Naive" in captured.out

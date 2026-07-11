@@ -1,0 +1,11 @@
+[params]
+sw_lat = 24.82
+sw_lon = -81
+span_km_east = 500
+span_km_north = 1100
+resolution_km = 1.0
+
+# Optional set speed limits in m/s. Set indices are zero-based and match
+# the generated set index. Omitted sets/times default to ship.info.max_speed.
+# Time windows apply conservatively to every itinerary interval they overlap.
+# Boundary-only path contact is ignored with a 1e-5 km tolerance.

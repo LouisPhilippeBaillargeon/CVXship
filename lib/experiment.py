@@ -355,10 +355,8 @@ def summarize_solution(key: str, label: str, sol: Any) -> dict[str, Any]:
         "key": key,
         "label": label,
         "first_stage_optimizer": getattr(sol, "first_stage_optimizer", "") or "",
-        "power_management_optimizer": getattr(sol, "power_management_optimizer", "") or "",
         "estimated_cost": _float_or_none(getattr(sol, "estimated_cost", None)),
         "solve_time": _float_or_none(getattr(sol, "solve_time", None)),
-        "energy_solve_time": _float_or_none(getattr(sol, "energy_solve_time", None)),
         "total_distance": _float_or_none(getattr(sol, "total_distance", None)),
         "final_soc": final_soc,
         "is_valid": bool(getattr(sol, "is_valid", True)),
@@ -377,7 +375,6 @@ def summarize_solution(key: str, label: str, sol: Any) -> dict[str, Any]:
         "fit_range_warning_count": len(fit_range_warnings),
         "fit_range_warning_keys": ";".join(sorted(str(k) for k in fit_range_warnings)),
         "solver_status": solution_solver_status(sol),
-        "power_management_solver_status": solution_power_management_solver_status(sol),
         "failure_reason": getattr(sol, "failure_reason", "") or "",
     }
 
@@ -391,13 +388,6 @@ def solution_solver_status(sol: Any) -> str:
     if isinstance(reason, str) and reason.startswith("solver_status:"):
         return reason.split(":", 1)[1]
 
-    return ""
-
-
-def solution_power_management_solver_status(sol: Any) -> str:
-    status = getattr(sol, "power_management_solver_status", None)
-    if status:
-        return str(status)
     return ""
 
 
@@ -524,10 +514,8 @@ def _write_summary_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "key",
         "label",
         "first_stage_optimizer",
-        "power_management_optimizer",
         "estimated_cost",
         "solve_time",
-        "energy_solve_time",
         "total_distance",
         "final_soc",
         "is_valid",
@@ -542,7 +530,6 @@ def _write_summary_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "fit_range_warning_count",
         "fit_range_warning_keys",
         "solver_status",
-        "power_management_solver_status",
         "failure_reason",
         "solution_file",
     ]

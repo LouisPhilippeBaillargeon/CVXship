@@ -27,23 +27,21 @@ def test_format_indexed_result_table_includes_numbered_rows():
     lines = _format_indexed_result_table(
         [
             {
-                "label": "Naive Controller + rule-based",
+                "label": "Naive Controller",
                 "estimated_cost": "13897.808700979465",
                 "solve_time": "0.0075092315673828125",
                 "is_valid": "True",
                 "solver_status": "",
-                "power_management_solver_status": "",
                 "validation_warning_count": "1",
                 "fit_range_warning_count": "0",
                 "validation_error_count": "0",
             },
             {
-                "label": "JPDSE + energy",
+                "label": "JPDSE",
                 "estimated_cost": "14648.010277233052",
                 "solve_time": "31.461581707000732",
                 "is_valid": "True",
                 "solver_status": "optimal",
-                "power_management_solver_status": "optimal",
                 "validation_warning_count": "0",
                 "fit_range_warning_count": "2",
                 "validation_error_count": "0",
@@ -53,10 +51,11 @@ def test_format_indexed_result_table_includes_numbered_rows():
 
     table = "\n".join(lines)
     assert "[PLOT] Saved solution table" in table
-    assert "  1  Naive Controller + rule-based" in table
+    assert "  1  Naive Controller" in table
     assert "13897.808701" in table
-    assert "  2  JPDSE + energy" in table
+    assert "  2  JPDSE" in table
     assert "0+2f" in table
+    assert "energy_status" not in table
 
 
 def test_load_selected_solutions_resolves_windows_style_summary_paths(tmp_path):

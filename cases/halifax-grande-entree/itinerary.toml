@@ -8,7 +8,7 @@
 # ============================
 [params]
 soc_i               = 1.5
-soc_f               = 3
+soc_f               = 0
 timestep            = 2.0
 fuel_price          = 1.396
 init_speed          = 0
@@ -19,9 +19,6 @@ init_speed          = 0
 # until              : Optional end datetime. Omit on the last band to use it for the rest of the trip.
 # from/start_datetime: Optional explicit start datetime. If omitted, bands are contiguous in file order.
 # ============================
-[[auxiliary_load]]
-power = 0.1
-until = "2025-06-01T11:00"
 
 [[auxiliary_load]]
 power = 0.11
@@ -39,18 +36,18 @@ power = 0.11
 city                = "Halifax"
 arrival_datetime    = "2025-06-01T00:00"
 departure_datetime  = "2025-06-01T02:00"
-lat                 = 44.5513889#47.047967
-lon                 = -63.384444#-60.698573#
+lat                 = 44.5513889
+lon                 = -63.384444
 power_cost          = 183
 max_charge_power    = 5
 
 [[transit]]
 city                = "GrandeEntree"
-arrival_datetime    = "2025-06-02T10:00"
-departure_datetime  = "2025-06-02T14:00"
-lat                 = 45.970663
-lon                 = -62.350969
+arrival_datetime    = "2025-06-02T8:00"
+departure_datetime  = "2025-06-02T10:00"
+lat                 = 47.439766
+lon                 = -61.256410
 power_cost          = 36.81
-max_charge_power    = 5
+max_charge_power    = 0
 # ============================
 

@@ -2,23 +2,11 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import cvxpy as cp
 import numpy as np
 
 from lib.evaluation import apply_rule_based_power_balance_interval, compute_non_convex_cost_all_timesteps_nc_interpolated
-from lib.load_params import (
-    Battery,
-    Generator,
-    Hull,
-    Itinerary,
-    Propulsion,
-    Ship,
-    ShipInfo,
-    SolarPanels,
-    States,
-    Transit,
-)
-from lib.optimizers import EnergyOnlyOptimizer, Solution
+from lib.load_params import Generator
+from lib.optimizers import Solution
 
 
 def _balance(**overrides):
@@ -568,73 +556,17 @@ class SpeedLimitEvaluatorTests(unittest.TestCase):
         self.assertTrue(evaluated.is_valid)
         self.assertNotIn("speed_limit_violation", evaluated.validation_errors)
 
-    def test_rule_based_ems_error_remains_active_without_energy_redispatch(self):
+    def test_rule_based_ems_error_remains_active(self):
         runner = self._runner_for_fixed_path([0.0, 5.0])
         runner.itinerary.soc_f = 6.0
 
-        evaluated = self._evaluate(runner, energy_solver=cp.CLARABEL)
+        evaluated = self._evaluate(runner)
 
         self.assertFalse(evaluated.is_valid)
         self.assertIn("terminal_soc_shortfall", evaluated.validation_errors)
         self.assertIn("terminal_soc_shortfall", evaluated.ems_validation_errors)
         self.assertEqual(evaluated.route_validation_errors, {})
         self.assertEqual(evaluated.pre_redispatch_ems_validation_errors, {})
-
-    def test_energy_redispatch_moves_preliminary_ems_errors_out_of_active_validity(self):
-        runner = self._runner_for_fixed_path([0.0, 5.0])
-        runner.itinerary.soc_f = 6.0
-
-        evaluated = self._evaluate(
-            runner,
-            redispatch_energy=True,
-            energy_solver=cp.CLARABEL,
-        )
-
-        self.assertTrue(evaluated.is_valid)
-        self.assertEqual(evaluated.validation_errors, {})
-        self.assertEqual(evaluated.ems_validation_errors, {})
-        self.assertIn(
-            "terminal_soc_shortfall",
-            evaluated.pre_redispatch_ems_validation_errors,
-        )
-
-    def test_route_error_survives_successful_energy_redispatch(self):
-        runner = self._runner_for_fixed_path([0.0, 10.0])
-
-        evaluated = self._evaluate(
-            runner,
-            redispatch_energy=True,
-            energy_solver=cp.CLARABEL,
-        )
-
-        self.assertFalse(evaluated.is_valid)
-        self.assertIn("speed_limit_violation", evaluated.validation_errors)
-        self.assertIn("speed_limit_violation", evaluated.route_validation_errors)
-        self.assertEqual(evaluated.ems_validation_errors, {})
-
-    def test_energy_redispatch_failure_returns_invalid_solution(self):
-        runner = self._runner_for_fixed_path([0.0, 5.0])
-
-        def fail_energy_optimizer(optimizer, *args, **kwargs):
-            optimizer.power_management_solver_status = "infeasible"
-            optimizer.energy_solve_time = 0.123
-            return 0
-
-        with patch(
-            "lib.evaluation.EnergyOnlyOptimizer.optimize",
-            new=fail_energy_optimizer,
-        ):
-            evaluated = self._evaluate(runner, redispatch_energy=True)
-
-        self.assertFalse(evaluated.is_valid)
-        self.assertIsNone(evaluated.estimated_cost)
-        self.assertEqual(evaluated.power_management_optimizer, "EnergyOnlyOptimizer")
-        self.assertEqual(evaluated.power_management_solver_status, "infeasible")
-        self.assertEqual(evaluated.energy_solve_time, 0.123)
-        self.assertTrue(evaluated.failure_reason.startswith("energy_redispatch_failed:"))
-        self.assertIn("energy_redispatch_failed", evaluated.validation_errors)
-        self.assertIn("energy_redispatch_failed", evaluated.ems_validation_errors)
-        self.assertEqual(evaluated.route_validation_errors, {})
 
     def test_propulsion_infeasibility_marks_evaluation_invalid_without_raising(self):
         runner = self._runner_for_fixed_path([0.0, 5.0])
@@ -651,7 +583,7 @@ class SpeedLimitEvaluatorTests(unittest.TestCase):
         self.assertIn("propulsion_infeasible", evaluated.route_validation_errors)
         self.assertFalse(np.isfinite(evaluated.prop_power[0, 0]))
 
-    def test_energy_redispatch_is_skipped_after_propulsion_infeasibility(self):
+    def test_propulsion_infeasibility_logs_fit_warning_context(self):
         runner = self._runner_for_fixed_path([0.0, 5.0])
         runner.propulsion_model.compute_power_from_ua_res = (
             lambda *args, **kwargs: (np.nan, np.nan, False, np.nan)
@@ -664,24 +596,12 @@ class SpeedLimitEvaluatorTests(unittest.TestCase):
             }
         }
 
-        with (
-            patch("lib.evaluation.EnergyOnlyOptimizer.optimize") as optimize,
-            patch("lib.evaluation.log.error") as log_error,
-        ):
-            evaluated = self._evaluate(runner, redispatch_energy=True)
+        with patch("lib.evaluation.log.error") as log_error:
+            evaluated = self._evaluate(runner)
 
-        optimize.assert_not_called()
         self.assertFalse(evaluated.is_valid)
         self.assertIsNone(evaluated.estimated_cost)
-        self.assertEqual(evaluated.power_management_optimizer, "EnergyOnlyOptimizer")
-        self.assertEqual(
-            evaluated.power_management_solver_status,
-            "not_run_route_infeasible",
-        )
-        self.assertEqual(
-            evaluated.failure_reason,
-            "energy_redispatch_skipped:propulsion_infeasible",
-        )
+        self.assertEqual(evaluated.failure_reason, "propulsion_infeasible")
         self.assertIn("propulsion_infeasible", evaluated.validation_errors)
         self.assertTrue(
             any(
@@ -696,208 +616,6 @@ class SpeedLimitEvaluatorTests(unittest.TestCase):
                 for call in log_error.call_args_list
             )
         )
-
-
-class EnergyRedispatchRegressionTest(unittest.TestCase):
-    def _tiny_ship(self, *, min_power=0.0, max_charge_pow=5.0, leak=1.0):
-        generator = Generator(
-            name="g0",
-            min_power=min_power,
-            max_power=10.0,
-            fuel_intercept=0.0,
-            fuel_linear=1.0,
-            fuel_quadratic=0.0,
-        )
-        ship = Ship(
-            hull=Hull(
-                B=1.0,
-                LWL=1.0,
-                CB=1.0,
-                T=1.0,
-                AL_air=1.0,
-                AF_air=1.0,
-                total_wet_area=1.0,
-                CDt=1.0,
-                CDlAF_bow=1.0,
-                CDlAF_stern=1.0,
-                delta=1.0,
-            ),
-            propulsion=Propulsion(
-                D=1.0,
-                min_pitch=0.0,
-                max_pitch=1.0,
-                AE_AO=1.0,
-                nb_blades=1,
-                nb_propellers=1,
-                max_n=1.0,
-                min_pow=0.0,
-                max_pow=10.0,
-                wake_fraction=0.0,
-            ),
-            info=ShipInfo(
-                max_speed=1.0,
-                rho_water=1.0,
-                rho_air=1.0,
-                min_depth=1.0,
-            ),
-            generators=[generator],
-            battery=Battery(
-                capacity=10.0,
-                max_charge_pow=max_charge_pow,
-                max_discharge_pow=5.0,
-                discharge_eff=1.0,
-                charge_eff=1.0,
-                leak=leak,
-            ),
-            solarPanels=SolarPanels(
-                area=0.0,
-                efficiency=0.0,
-            ),
-        )
-        return ship
-
-    def _tiny_itinerary(self, *, soc_f=0.0):
-        itinerary = Itinerary(
-            transits=[
-                Transit(
-                    city="port",
-                    arrival_datetime="",
-                    departure_datetime="",
-                    lat=0.0,
-                    lon=0.0,
-                    power_cost=0.0,
-                    max_charge_power=0.0,
-                )
-            ],
-            soc_i=5.0,
-            soc_f=0.0,
-            timestep=1.0,
-            init_speed=0.0,
-            base_nb_timesteps=1,
-            nb_timesteps=1,
-            target_x_pos=0.0,
-            target_y_pos=0.0,
-            fuel_price=1.0,
-        )
-        itinerary.soc_f = soc_f
-        return itinerary
-
-    def _tiny_states(self, *, soc=5.0):
-        states = States(
-            timesteps_completed=0,
-            current_x_pos=0.0,
-            current_y_pos=0.0,
-            current_speed=0.0,
-            soc=soc,
-            set_selection=0.0,
-            current_heading=0.0,
-        )
-        return states
-
-    def _tiny_solution(
-        self,
-        *,
-        prop_power=1.0,
-        generation_power=1.0,
-        battery_discharge=0.0,
-        soc=(5.0, 5.0),
-        gen_on=1.0,
-    ):
-        evaluated = Solution(
-            estimated_cost=0.0,
-            solve_time=0.0,
-            T_future=1,
-            instant_sail=np.array([1.0, 1.0]),
-            port_idx=np.array([0, 0]),
-            interval_sail_fraction=np.array([1.0]),
-            total_distance=0.0,
-            set_selection=np.zeros((2, 1)),
-            ship_pos=np.zeros((2, 2)),
-            ship_speed=np.zeros((1, 2, 1)),
-            speed_mag=np.zeros((1, 1)),
-            speed_rel_water=np.zeros((1, 2, 1)),
-            speed_rel_water_mag=np.zeros((1, 1)),
-            prop_power=np.array([[prop_power]]),
-            auxiliary_power=np.zeros(1),
-            wind_resistance=np.zeros((1, 1)),
-            calm_water_resistance=np.zeros((1, 1)),
-            total_resistance=np.zeros((1, 1)),
-            generation_power=np.array([[[generation_power]]]),
-            gen_costs=np.zeros((1, 1, 1)),
-            gen_on=np.array([[[gen_on]]]),
-            solar_power=np.zeros((1, 1)),
-            shore_power=np.zeros((1, 1)),
-            shore_power_cost=np.zeros((1, 1)),
-            battery_charge=np.zeros((1, 1)),
-            battery_discharge=np.array([[battery_discharge]]),
-            SOC=np.array(soc, dtype=float),
-            segment_dt_h=np.ones((1, 1)),
-            timestep_dt_h=np.ones(1),
-            interval_port_idx=np.zeros(1, dtype=int),
-            solar_power_available=np.zeros((1, 1)),
-            generator_unit_commitment=True,
-        )
-        return evaluated
-
-    def test_energy_only_optimizer_still_solves_tiny_problem(self):
-        ship = self._tiny_ship()
-        itinerary = self._tiny_itinerary()
-        states = self._tiny_states()
-        evaluated = self._tiny_solution()
-
-        optimizer = EnergyOnlyOptimizer(
-            generator_models=[object()],
-            itinerary=itinerary,
-            states=states,
-            ship=ship,
-        )
-        status = optimizer.optimize(evaluated, solver=cp.CLARABEL)
-
-        self.assertEqual(status, 1)
-        self.assertIsNotNone(optimizer.sol)
-        self.assertEqual(optimizer.sol.power_management_optimizer, "EnergyOnlyOptimizer")
-        self.assertEqual(optimizer.sol.power_management_solver_status, cp.OPTIMAL)
-
-    def test_energy_only_accounts_for_battery_leak(self):
-        ship = self._tiny_ship(leak=0.5)
-        itinerary = self._tiny_itinerary()
-        states = self._tiny_states(soc=1.0)
-        evaluated = self._tiny_solution(
-            prop_power=1.0,
-            generation_power=0.0,
-            battery_discharge=1.0,
-            soc=(1.0, 0.0),
-        )
-
-        optimizer = EnergyOnlyOptimizer(
-            generator_models=[object()],
-            itinerary=itinerary,
-            states=states,
-            ship=ship,
-        )
-        status = optimizer.optimize(evaluated, solver=cp.CLARABEL)
-
-        self.assertEqual(status, 1)
-        self.assertAlmostEqual(optimizer.sol.estimated_cost, 0.5, places=6)
-        self.assertAlmostEqual(optimizer.sol.generation_power[0, 0, 0], 0.5, places=6)
-        self.assertAlmostEqual(optimizer.sol.SOC[-1], 0.0, places=6)
-
-    def test_energy_only_enforces_generator_minimum_for_fixed_on_schedule(self):
-        ship = self._tiny_ship(min_power=2.0)
-        itinerary = self._tiny_itinerary()
-        states = self._tiny_states()
-        evaluated = self._tiny_solution(prop_power=2.0, generation_power=2.0)
-
-        optimizer = EnergyOnlyOptimizer(
-            generator_models=[object()],
-            itinerary=itinerary,
-            states=states,
-            ship=ship,
-        )
-        status = optimizer.optimize(evaluated, solver=cp.CLARABEL)
-
-        self.assertEqual(status, 1)
-        self.assertGreaterEqual(optimizer.sol.generation_power[0, 0, 0], 2.0 - 1e-7)
 
 
 if __name__ == "__main__":

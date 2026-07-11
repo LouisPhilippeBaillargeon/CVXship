@@ -210,19 +210,16 @@ def _format_indexed_result_table(rows: list[dict[str, Any]]) -> list[str]:
         "[PLOT] Saved solution table",
         (
             f"{'idx':>3s}  {'solution':<36s} {'cost':>14s} {'solve_s':>10s} "
-            f"{'valid':>8s} {'solver':>18s} {'energy_status':>18s} "
+            f"{'valid':>8s} {'solver':>18s} "
             f"{'warns':>7s} {'errors':>7s}"
         ),
-        "-" * 132,
+        "-" * 113,
     ]
 
     for index, row in enumerate(rows, start=1):
         label = str(_row_value(row, "label", _row_value(row, "key", "")))[:36]
         validity = "valid" if _row_is_valid(row) else "invalid"
         solver_status = str(_row_value(row, "solver_status", "") or "n/a")[:18]
-        energy_status = str(
-            _row_value(row, "power_management_solver_status", "") or "n/a"
-        )[:18]
         warning_count = _row_int(row, "validation_warning_count")
         fit_warning_count = _row_int(row, "fit_range_warning_count")
         error_count = _row_int(row, "validation_error_count")
@@ -238,7 +235,6 @@ def _format_indexed_result_table(rows: list[dict[str, Any]]) -> list[str]:
             f"{_row_float_label(row, 'solve_time', width=10)} "
             f"{validity:>8s} "
             f"{solver_status:>18s} "
-            f"{energy_status:>18s} "
             f"{warning_text:>7s} "
             f"{error_count:>7d}"
         )

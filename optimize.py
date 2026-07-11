@@ -15,6 +15,7 @@ from lib.load_params import load_config
 from lib.models import FitRange, PropulsionModel, BaseWindModel, WindModel1D, WindModelTransition1D, WindModel2D, WindModelPathAligned2D, GeneratorModel, CalmWaterModel, save_obj, load_obj
 from lib.plotting import plot_solutions, plot_sets_and_points
 from lib.optimizers import JPDSE, NaiveController, FPJSE, ShortestPath, WeatherRoutingToolPath, SavedPath, JPCSE, FR_O
+from lib.greedy import GreedyController
 from lib.utils import point_in_sets, dx_dy_km, classify_timesteps, _assert_finite
 from lib.evaluation import compute_non_convex_cost_all_timesteps_nc_interpolated
 from lib.weather_interpolation import build_transition_weather_inputs, prepare_nc_interp_source
@@ -28,7 +29,6 @@ from lib.experiment import (
     load_case_run_options,
     mark_failed_if_running,
     save_solution_record,
-    solution_power_management_solver_status,
     solution_solver_status,
     update_manifest,
     write_run_summary_files,
@@ -186,8 +186,6 @@ def _failed_optimizer_summary(optimizer, first_stage_optimizer):
         estimated_cost=None,
         solve_time=getattr(optimizer, "solve_time", None),
         first_stage_optimizer=first_stage_optimizer,
-        power_management_optimizer="",
-        power_management_solver_status="",
         is_valid=False,
         solver_status=solver_status or "",
         failure_reason=failure_reason or "",
@@ -215,12 +213,6 @@ def _status_or_na(sol):
     if sol is None:
         return "n/a"
     return solution_solver_status(sol) or "n/a"
-
-
-def _power_status_or_na(sol):
-    if sol is None:
-        return "n/a"
-    return solution_power_management_solver_status(sol) or "n/a"
 
 
 def _validity_or_na(sol):
@@ -258,17 +250,16 @@ def _format_result_table(summary_rows):
         "[RESULTS] Run result table",
         (
             f"{'solution':<36s} {'cost':>14s} {'solve_s':>10s} "
-            f"{'valid':>8s} {'solver':>18s} {'energy_status':>18s} "
+            f"{'valid':>8s} {'solver':>18s} "
             f"{'warns':>7s} {'errors':>7s}"
         ),
-        "-" * 126,
+        "-" * 107,
     ]
     for row in rows:
         label = str(_row_value(row, "label", _row_value(row, "key", "")))[:36]
         is_valid = bool(_row_value(row, "is_valid", True))
         validity = "valid" if is_valid else "invalid"
         solver_status = str(_row_value(row, "solver_status", "") or "n/a")[:18]
-        energy_status = str(_row_value(row, "power_management_solver_status", "") or "n/a")[:18]
         warning_count = int(_row_value(row, "validation_warning_count", 0) or 0)
         error_count = int(_row_value(row, "validation_error_count", 0) or 0)
         fit_warning_count = int(_row_value(row, "fit_range_warning_count", 0) or 0)
@@ -283,7 +274,6 @@ def _format_result_table(summary_rows):
             f"{_row_float_label(row, 'solve_time', width=10)} "
             f"{validity:>8s} "
             f"{solver_status:>18s} "
-            f"{energy_status:>18s} "
             f"{warning_text:>7s} "
             f"{error_count:>7d}"
         )
@@ -1093,82 +1083,66 @@ if __name__ == "__main__":
     sail_time = float(np.sum(interval_sail_fraction[states.timesteps_completed:] * timestep_dt_h))
     ref_speed = (path.sol.total_distance/sail_time)*1000/3600
 
-    def evaluate_with_updated_power_management(runner, label, verbose=solver_verbose):
-        log.progress("[RUN] Starting %s energy redispatch evaluation", label)
+    def evaluate_solution(runner, label, verbose=solver_verbose):
+        log.progress("[RUN] Starting %s evaluation", label)
         result = compute_non_convex_cost_all_timesteps_nc_interpolated(
             runner,
             verbose=verbose,
             nc_sources=nc_sources,
-            redispatch_energy=True,
-        )
-        sol = result[1]
-        energy_solve_time = getattr(sol, "energy_solve_time", None)
-        energy_solve_label = (
-            "n/a"
-            if energy_solve_time is None
-            else f"{float(energy_solve_time):.2f} s"
-        )
-        log.verbose(
-            "%s re-evaluated: first_stage=%s, power_management=%s, "
-            "energy_solver_status=%s, energy_solve_time=%s, cost=%s $",
-            label,
-            sol.first_stage_optimizer,
-            sol.power_management_optimizer,
-            _power_status_or_na(sol),
-            energy_solve_label,
-            _cost_label(sol),
-        )
-        return result
-
-    def evaluate_with_rule_based_power_management(runner, label, verbose=solver_verbose):
-        log.progress("[RUN] Starting %s rule-based EMS evaluation", label)
-        result = compute_non_convex_cost_all_timesteps_nc_interpolated(
-            runner,
-            verbose=verbose,
-            nc_sources=nc_sources,
-            redispatch_energy=False,
         )
         sol = result[1]
         log.verbose(
-            "%s rule-based EMS: first_stage=%s, power_management=%s, "
-            "route_validity=%s, cost=%s $",
+            "%s evaluated: first_stage=%s, validity=%s, cost=%s $",
             label,
             sol.first_stage_optimizer,
-            sol.power_management_optimizer,
             _validity_or_na(sol),
             _cost_label(sol),
         )
         return result
 
-    def evaluate_with_both_power_management(runner, label, verbose=solver_verbose):
-        _, rule_sol, _, _ = evaluate_with_rule_based_power_management(
-            runner,
-            label,
-            verbose=verbose,
-        )
-        _, energy_sol, _, _ = evaluate_with_updated_power_management(
-            runner,
-            label,
-            verbose=verbose,
-        )
-        return rule_sol, energy_sol
-
-    naive_rule_sol, naive_nonconv_sol = evaluate_with_both_power_management(
+    _, naive_eval_sol, _, _ = evaluate_solution(
         naive,
         "Naive Controller",
     )
     save_evaluated_solutions(
-        ("naive_rule", "Naive Controller + rule-based", naive_rule_sol),
-        ("naive_energy", "Naive Controller + energy", naive_nonconv_sol),
+        ("naive", "Naive Controller", naive_eval_sol),
     )
 
     maybe_plot_solutions(
-        [naive.sol, naive_rule_sol],
-        ["Naive estimated solution", "Naive rule-based evaluator"],
-        benchmark_label="Naive rule-based evaluator",
+        [naive.sol, naive_eval_sol],
+        ["Naive estimated solution", "Naive evaluated solution"],
+        benchmark_label="Naive evaluated solution",
         show=False,
         subfolder=relaxation_quality_dir("naive"),
         map=naive.map,
+    )
+
+    greedy = GreedyController(
+        map=map,
+        itinerary=itinerary,
+        states=states,
+        weather=weather,
+        ship=ship,
+        path_sol=path.sol,
+        course_angles=course_angles,
+    )
+    greedy.wind_model = base_wind_model
+    greedy.propulsion_model = propulsion_model
+    greedy.generator_models = generatorModels
+    greedy.calm_model = calm_model
+    greedy.nc_sources = nc_sources
+    log.progress("[RUN] Starting greedy controller benchmark")
+    greedy.compute()
+    save_evaluated_solutions(
+        ("greedy", "Greedy Controller", greedy.sol),
+    )
+    maybe_plot_solutions(
+        [naive_eval_sol, greedy.sol],
+        ["Naive evaluated solution", "Greedy Controller"],
+        benchmark_label="Naive evaluated solution",
+        show=False,
+        subfolder=relaxation_quality_dir("greedy"),
+        map=map,
     )
 
     # ============================================================
@@ -1209,18 +1183,17 @@ if __name__ == "__main__":
             )
         sys.exit(1)
 
-    FR_O_rule_sol, FR_O_nonconv_sol_pow = evaluate_with_both_power_management(
+    _, FR_O_eval_sol, _, _ = evaluate_solution(
         fr_o_runner,
         "FR_O",
     )
     save_evaluated_solutions(
-        ("fr_o_rule", "FR_O + rule-based", FR_O_rule_sol),
-        ("fr_o_energy", "FR_O + energy", FR_O_nonconv_sol_pow),
+        ("fr_o", "FR_O", FR_O_eval_sol),
     )
     maybe_plot_solutions(
-        [fr_o_runner.sol, FR_O_rule_sol],
-        ["Convex FR_O solution", "FR_O rule-based evaluator"],
-        benchmark_label="FR_O rule-based evaluator",
+        [fr_o_runner.sol, FR_O_eval_sol],
+        ["Convex FR_O solution", "FR_O evaluated solution"],
+        benchmark_label="FR_O evaluated solution",
         show=False,
         subfolder=relaxation_quality_dir("FR_O"),
         map=fr_o_runner.map,
@@ -1254,29 +1227,26 @@ if __name__ == "__main__":
         )
         if ok:
             log.debug("FPJSE optimization succeeded.")
-            FPJSE_rule_sol, FPJSE_energy_sol = evaluate_with_both_power_management(
+            _, FPJSE_eval_sol, _, _ = evaluate_solution(
                 optimizer,
                 "FPJSE",
             )
             save_evaluated_solutions(
-                ("fpjse_rule", "FPJSE + rule-based", FPJSE_rule_sol),
-                ("fpjse_energy", "FPJSE + energy", FPJSE_energy_sol),
+                ("fpjse", "FPJSE", FPJSE_eval_sol),
             )
             maybe_plot_solutions(
-                [optimizer.sol, FPJSE_rule_sol],
-                ["Convex FPJSE solution", "FPJSE rule-based evaluator"],
-                benchmark_label="FPJSE rule-based evaluator",
+                [optimizer.sol, FPJSE_eval_sol],
+                ["Convex FPJSE solution", "FPJSE evaluated solution"],
+                benchmark_label="FPJSE evaluated solution",
                 show=False,
                 subfolder=relaxation_quality_dir("FPJSE"),
                 map=optimizer.map,
             )
         else:
             log.error("FPJSE optimization failed.")
-            FPJSE_rule_sol = _failed_optimizer_summary(optimizer, "FPJSE")
-            FPJSE_energy_sol = _failed_optimizer_summary(optimizer, "FPJSE")
+            FPJSE_eval_sol = _failed_optimizer_summary(optimizer, "FPJSE")
             save_evaluated_solutions(
-                ("fpjse_rule", "FPJSE + rule-based", FPJSE_rule_sol),
-                ("fpjse_energy", "FPJSE + energy", FPJSE_energy_sol),
+                ("fpjse", "FPJSE", FPJSE_eval_sol),
             )
 
         if dimensions == "1D":
@@ -1313,29 +1283,26 @@ if __name__ == "__main__":
         )
         if ok:
             maybe_plot_sets_and_points(optimizer.sol.ship_pos, optimizer.map.set_ineq)
-            JPDSE_rule_sol, JPDSE_energy_sol = evaluate_with_both_power_management(
+            _, JPDSE_eval_sol, _, _ = evaluate_solution(
                 optimizer,
                 "JPDSE",
             )
             save_evaluated_solutions(
-                ("jpdse_rule", "JPDSE + rule-based", JPDSE_rule_sol),
-                ("jpdse_energy", "JPDSE + energy", JPDSE_energy_sol),
+                ("jpdse", "JPDSE", JPDSE_eval_sol),
             )
             maybe_plot_solutions(
-                [optimizer.sol, JPDSE_rule_sol],
-                ["Convex JPDSE solution", "JPDSE rule-based evaluator"],
-                benchmark_label="JPDSE rule-based evaluator",
+                [optimizer.sol, JPDSE_eval_sol],
+                ["Convex JPDSE solution", "JPDSE evaluated solution"],
+                benchmark_label="JPDSE evaluated solution",
                 show=False,
                 subfolder=relaxation_quality_dir("JPDSE"),
                 map=optimizer.map,
             )
         else:
             log.error("JPDSE optimization failed.")
-            JPDSE_rule_sol = _failed_optimizer_summary(optimizer, "JPDSE")
-            JPDSE_energy_sol = _failed_optimizer_summary(optimizer, "JPDSE")
+            JPDSE_eval_sol = _failed_optimizer_summary(optimizer, "JPDSE")
             save_evaluated_solutions(
-                ("jpdse_rule", "JPDSE + rule-based", JPDSE_rule_sol),
-                ("jpdse_energy", "JPDSE + energy", JPDSE_energy_sol),
+                ("jpdse", "JPDSE", JPDSE_eval_sol),
             )
 
         if dimensions == "2D":
@@ -1383,20 +1350,18 @@ if __name__ == "__main__":
                 failed_sol = _failed_optimizer_summary(optimizer, label)
                 base_key = key.lower()
                 save_evaluated_solutions(
-                    (f"{base_key}_rule", f"{label} + rule-based", failed_sol),
-                    (f"{base_key}_energy", f"{label} + energy", failed_sol),
+                    (base_key, label, failed_sol),
                 )
-                return optimizer, failed_sol, failed_sol
+                return optimizer, failed_sol
 
             maybe_plot_sets_and_points(optimizer.sol.ship_pos, optimizer.map.set_ineq)
-            rule_sol, energy_sol = evaluate_with_both_power_management(
+            _, eval_sol, _, _ = evaluate_solution(
                 optimizer,
                 label,
             )
             base_key = key.lower()
             save_evaluated_solutions(
-                (f"{base_key}_rule", f"{label} + rule-based", rule_sol),
-                (f"{base_key}_energy", f"{label} + energy", energy_sol),
+                (base_key, label, eval_sol),
             )
             for name in [
                 "prop_power",
@@ -1407,32 +1372,31 @@ if __name__ == "__main__":
             ]:
                 log.debug("%s", name)
                 log.debug("  optimizer: %s", np.asarray(optimizer.sol.__dict__[name]).shape)
-                log.debug("  evaluator: %s", np.asarray(energy_sol.__dict__[name]).shape)
+                log.debug("  evaluator: %s", np.asarray(eval_sol.__dict__[name]).shape)
             maybe_plot_solutions(
-                [optimizer.sol, rule_sol],
-                [f"Convex {label} solution", f"{label} rule-based evaluator"],
-                benchmark_label=f"{label} rule-based evaluator",
+                [optimizer.sol, eval_sol],
+                [f"Convex {label} solution", f"{label} evaluated solution"],
+                benchmark_label=f"{label} evaluated solution",
                 show=False,
                 subfolder=relaxation_quality_dir(key),
                 map=optimizer.map,
             )
-            return optimizer, rule_sol, energy_sol
+            return optimizer, eval_sol
 
         jpcse_performance_rows = []
         if run_jpcse_transit_wind and should_run_optimizer("JPCSE_transit_wind"):
-            jpcse_optimizer, JPCSE_rule_sol, JPCSE_energy_sol = run_jpcse_variant(
+            jpcse_optimizer, JPCSE_eval_sol = run_jpcse_variant(
                 "JPCSE_transit_wind",
                 "JPCSE_transit_wind",
                 True,
             )
             jpcse_performance_rows.append(
-                ("JPCSE_transit_wind", jpcse_optimizer, JPCSE_rule_sol, JPCSE_energy_sol)
+                ("JPCSE_transit_wind", jpcse_optimizer, JPCSE_eval_sol)
             )
         if should_run_optimizer("JPCSE_departure_wind"):
             (
                 jpcse_departure_wind_optimizer,
-                JPCSE_departure_wind_rule_sol,
-                JPCSE_departure_wind_energy_sol,
+                JPCSE_departure_wind_eval_sol,
             ) = run_jpcse_variant(
                 "JPCSE_departure_wind",
                 "JPCSE_departure_wind",
@@ -1442,32 +1406,24 @@ if __name__ == "__main__":
                 (
                     "JPCSE_departure_wind",
                     jpcse_departure_wind_optimizer,
-                    JPCSE_departure_wind_rule_sol,
-                    JPCSE_departure_wind_energy_sol,
+                    JPCSE_departure_wind_eval_sol,
                 )
             )
 
         log.verbose("JPCSE performance comparison")
         log.verbose(
             "variant                         optimizer_cost      solve_s   opt_status          "
-            "rule_cost       rule_valid  energy_cost     energy_status       energy_solve_s"
+            "eval_cost       eval_valid"
         )
-        for label, optimizer, rule_sol, energy_sol in jpcse_performance_rows:
+        for label, optimizer, eval_sol in jpcse_performance_rows:
             opt_sol = getattr(optimizer, "sol", None)
             opt_solve = np.nan if opt_sol is None else float(opt_sol.solve_time)
             opt_status = _status_or_na(opt_sol)
-            rule_validity = _validity_or_na(rule_sol)
-            energy_status = _power_status_or_na(energy_sol)
-            energy_solve = (
-                np.nan
-                if energy_sol is None or getattr(energy_sol, "energy_solve_time", None) is None
-                else float(energy_sol.energy_solve_time)
-            )
+            eval_validity = _validity_or_na(eval_sol)
             log.verbose(
                 f"{label:<30} "
                 f"{_cost_label(opt_sol, 14)} {opt_solve:>10.2f} {opt_status:>14s} "
-                f"{_cost_label(rule_sol, 14)} {rule_validity:>10s} "
-                f"{_cost_label(energy_sol, 14)} {energy_status:>17s} {energy_solve:>14.2f}"
+                f"{_cost_label(eval_sol, 14)} {eval_validity:>10s}"
             )
 
         print_debug_report()
@@ -1481,7 +1437,7 @@ if __name__ == "__main__":
         maybe_plot_solutions(
             [sol for _, sol in available_comparison],
             [label for label, _ in available_comparison],
-            benchmark_label="Naive Controller + rule-based",
+            benchmark_label="Naive Controller",
             show=show_plots,
             subfolder=all_solution_comparison_dir,
             map=map,

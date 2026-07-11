@@ -6,7 +6,7 @@ import pickle
 
 from lib.paths import PLOTS
 from lib.utils import _halfspace_polygon_4ineq
-from lib.experiment import solution_power_management_solver_status, solution_solver_status
+from lib.experiment import solution_solver_status
 from lib import logging_utils as log
 
 # ====================== PLOTTING UTILITIES ======================
@@ -539,13 +539,8 @@ def _print_cost_summary_vs_benchmark(solutions, labels, benchmark_label):
 
     def _status_label(sol):
         status = solution_solver_status(sol)
-        power_status = solution_power_management_solver_status(sol)
-        if status and power_status:
-            return f"{status}/{power_status}"
         if status:
             return status
-        if power_status:
-            return f"energy:{power_status}"
         if getattr(sol, "is_valid", True) is False and not np.isfinite(_cost_or_nan(sol)):
             return "failed"
         return "N/A"
@@ -693,8 +688,7 @@ def _print_cost_summary_vs_benchmark(solutions, labels, benchmark_label):
         f"{'prop MWh':>10s} "
         f"{'gen $':>12s} "
         f"{'shore $':>10s} "
-        f"{'SOC f':>10s} "
-        f"{'EMS':>18s}"
+        f"{'SOC f':>10s}"
     )
 
     for label, sol in zip(labels, solutions):
@@ -707,15 +701,13 @@ def _print_cost_summary_vs_benchmark(solutions, labels, benchmark_label):
         prop_energy = _time_weighted_sum(sol, sol.prop_power)
         final_soc = float(np.asarray(sol.SOC, dtype=float).reshape(-1)[-1])
         total_distance = float(getattr(sol, "total_distance", np.nan))
-        ems = str(getattr(sol, "power_management_optimizer", "") or "")
         log.verbose(
             f"{label:<35s} "
             f"{total_distance:>10.3f} "
             f"{prop_energy:>10.3f} "
             f"{gen_cost:>12.3f} "
             f"{shore_cost:>10.3f} "
-            f"{final_soc:>10.3f} "
-            f"{ems:>18s}"
+            f"{final_soc:>10.3f}"
         )
 
     log.verbose("=" * 80)

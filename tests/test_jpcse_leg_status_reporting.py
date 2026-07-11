@@ -114,7 +114,6 @@ def test_optimal_inaccurate_cost_and_status_are_reported(tmp_path):
     sol = SimpleNamespace(
         estimated_cost=12.5,
         solve_time=1.25,
-        energy_solve_time=0.5,
         total_distance=3.0,
         SOC=np.array([0.4, 0.6]),
         is_valid=True,
@@ -122,9 +121,7 @@ def test_optimal_inaccurate_cost_and_status_are_reported(tmp_path):
         validation_warnings={},
         fit_range_warnings={"wind_speed_outside_fit_range": {"count": 1}},
         first_stage_optimizer="JPCSE",
-        power_management_optimizer="EnergyOnlyOptimizer",
         solver_status="optimal_inaccurate",
-        power_management_solver_status="optimal",
         failure_reason="",
     )
     benchmark = SimpleNamespace(
@@ -132,21 +129,20 @@ def test_optimal_inaccurate_cost_and_status_are_reported(tmp_path):
         solve_time=0.75,
         is_valid=True,
         solver_status="optimal",
-        power_management_solver_status="",
     )
 
     row = experiment.summarize_solution("candidate", "Candidate", sol)
     assert row["estimated_cost"] == 12.5
     assert row["solver_status"] == "optimal_inaccurate"
-    assert row["power_management_solver_status"] == "optimal"
     assert row["fit_range_warning_count"] == 1
     assert row["fit_range_warning_keys"] == "wind_speed_outside_fit_range"
+    assert "power_management_solver_status" not in row
 
     csv_path = tmp_path / "summary.csv"
     experiment._write_summary_csv(csv_path, [row])
     csv_text = csv_path.read_text(encoding="utf-8")
-    assert "solver_status,power_management_solver_status" in csv_text
-    assert "optimal_inaccurate,optimal" in csv_text
+    assert "power_management_solver_status" not in csv_text
+    assert "optimal_inaccurate" in csv_text
 
     debug_log = tmp_path / "debug.log"
     warnings_errors_log = tmp_path / "warnings_errors.log"

@@ -1,0 +1,4 @@
+[files]
+currents = "../../weather_data/WestEnd-Southport/currents.nc"
+atmo = "../../weather_data/WestEnd-Southport/atmo.nc"
+sun = "../../weather_data/WestEnd-Southport/sun.nc"

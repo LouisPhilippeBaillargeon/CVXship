@@ -4,9 +4,11 @@ import argparse
 import tomllib
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
-from lib.load_params import MapInfo, load_ship
+from lib.load_params import MapInfo, load_itinerary, load_ship
 from lib.map_builder import MapBuilder
+from lib.weather_interpolation import resolve_weather_files_from_toml
 from lib import logging_utils as log
 
 
@@ -52,12 +54,27 @@ def _parse_args(argv: list[str] | None = None):
         action="store_true",
         help="Open the set editor without importing existing corners.csv/sets.csv.",
     )
+    parser.add_argument(
+        "--weather-overlay",
+        action="store_true",
+        help=(
+            "Precompute and show itinerary-average currents, wind, and irradiance "
+            "overlays in the set editor."
+        ),
+    )
+    parser.add_argument(
+        "--force-weather-overlay",
+        action="store_true",
+        help="Rebuild weather_overlay.npz even if its cache metadata is current.",
+    )
     args = parser.parse_args(_normalize_argv(sys.argv[1:] if argv is None else argv))
     if args.case is not None and args.case_path is not None:
         parser.error("provide the case directory either positionally or with --case, not both")
     if args.case is None and args.case_path is None:
         parser.error("provide a case directory with --case or as a positional argument")
     args.case = args.case or args.case_path
+    if args.force_weather_overlay:
+        args.weather_overlay = True
     del args.case_path
     return args
 
@@ -93,6 +110,7 @@ def main():
         ship=ship,
         map_dir=map_dir,
     )
+    weather_overlay = None
 
     log.progress("[MAP] Starting map build")
     log.progress("[MAP] case=%s", case_dir)
@@ -101,7 +119,21 @@ def main():
     try:
         builder.fetch_or_load_depth(force=args.force_depth)
         builder.build_or_load_navigability(force=args.force_nav or builder.depth_rebuilt)
-        builder.launch_set_editor(import_existing=not args.no_import_existing)
+        map_shell = SimpleNamespace(info=map_info)
+        itinerary = load_itinerary(map_shell, case_dir=case_dir)
+        if args.weather_overlay:
+            log.progress("[MAP] Preparing weather overlay")
+            weather_files = resolve_weather_files_from_toml(case_dir)
+            weather_overlay = builder.build_or_load_weather_overlay(
+                itinerary=itinerary,
+                weather_files=weather_files,
+                force=args.force_weather_overlay,
+            )
+        builder.launch_set_editor(
+            import_existing=not args.no_import_existing,
+            weather_overlay=weather_overlay,
+            itinerary=itinerary,
+        )
     finally:
         log.shutdown_run_logging()
 

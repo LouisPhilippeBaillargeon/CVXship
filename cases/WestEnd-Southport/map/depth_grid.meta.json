@@ -1,0 +1,12 @@
+{
+  "artifact": "depth_grid.csv",
+  "gmrt_layer": "topo",
+  "map_params": {
+    "resolution_km": 1.0,
+    "span_km_east": 500.0,
+    "span_km_north": 1100.0,
+    "sw_lat": 24.82,
+    "sw_lon": -81.0
+  },
+  "version": 1
+}

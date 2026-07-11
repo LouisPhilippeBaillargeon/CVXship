@@ -13,7 +13,6 @@ from lib.optimizers import (
     _future_interval_port_idx,
     _generator_dispatch_data,
     _generator_transition_cost_from_schedule,
-    EnergyOnlyOptimizer,
 )
 from lib.weather_interpolation import (
     interpolated_weather_at,
@@ -437,13 +436,364 @@ def apply_rule_based_power_balance_interval(
     }
 
 
+def build_evaluation_segment_records(
+    runner,
+    *,
+    sol=None,
+    eps=1e-9,
+):
+    """
+    Build the geometry/time subsegments used for exact weather/physics evaluation.
+
+    This is intentionally EMS-agnostic: it only translates a solution trajectory
+    into time-stamped segments with midpoint positions, speed vectors, and active
+    speed limits. Controllers that need exact nonconvex physics can reuse this
+    without inheriting the evaluator's rule-based power-balance repair.
+    """
+    if sol is None:
+        sol = runner.sol
+    if sol is None:
+        raise ValueError("sol is None. Did you run optimize()/compute()?")
+
+    ship = runner.ship
+    itinerary = runner.itinerary
+
+    P = np.asarray(sol.ship_pos, dtype=float)
+    T = P.shape[0] - 1
+
+    dt_source = getattr(sol, "timestep_dt_h", None)
+    if dt_source is None:
+        itinerary_dt = getattr(itinerary, "timestep_dt_h", None)
+        if itinerary_dt is not None and len(itinerary_dt) > 0:
+            t0 = int(getattr(runner.states, "timesteps_completed", 0))
+            dt_vec = np.asarray(itinerary_dt, dtype=float)[t0 : t0 + T]
+        else:
+            dt_vec = np.full(T, float(itinerary.timestep), dtype=float)
+    else:
+        dt_vec = np.asarray(dt_source, dtype=float).reshape(-1)
+
+    if dt_vec.shape != (T,):
+        raise ValueError(f"Expected timestep_dt_h shape {(T,)}, got {dt_vec.shape}.")
+
+    aux_source = getattr(sol, "auxiliary_power", None)
+    if aux_source is None or len(aux_source) == 0:
+        auxiliary_power = _future_auxiliary_power(itinerary, runner.states, T)
+    else:
+        auxiliary_power = np.asarray(aux_source, dtype=float).reshape(-1)
+        if auxiliary_power.shape != (T,):
+            raise ValueError(f"Expected auxiliary_power shape {(T,)}, got {auxiliary_power.shape}.")
+
+    mask_sail = np.asarray(sol.interval_sail_fraction, dtype=float).reshape(-1) > 0.5
+    set_selection_mat = np.asarray(sol.set_selection, dtype=float)
+    interval_port_idx_eval = getattr(sol, "interval_port_idx", None)
+    if interval_port_idx_eval is None:
+        interval_port_idx_eval = _future_interval_port_idx(
+            itinerary,
+            runner.states,
+            T,
+            np.asarray(sol.port_idx, dtype=int),
+        )
+    interval_port_idx_eval = np.asarray(interval_port_idx_eval, dtype=int).reshape(-1)
+    if interval_port_idx_eval.shape != (T,):
+        raise ValueError(
+            f"Expected interval_port_idx shape {(T,)}, got {interval_port_idx_eval.shape}."
+        )
+
+    speed_cmd = np.asarray(sol.speed_mag, dtype=float)
+    uses_two_setpoints = speed_cmd.ndim == 2 and speed_cmd.shape[1] == 2
+
+    def _set_at_node(k):
+        return int(np.argmax(set_selection_mat[k, :]))
+
+    set_speed_limit_mps = ship_speed_limit_matrix(
+        runner.map,
+        itinerary,
+        runner.states,
+        ship,
+        T,
+    )
+
+    def _node_speed_limit(k, t):
+        k = int(np.clip(k, 0, set_selection_mat.shape[0] - 1))
+        return float(set_selection_mat[k, :] @ set_speed_limit_mps[:, t])
+
+    def _endpoint_speed_limit(t):
+        return min(_node_speed_limit(t, t), _node_speed_limit(t + 1, t))
+
+    def _add_segment(
+        out,
+        t,
+        dt_h,
+        distance_km,
+        speed_vec,
+        h_cmd,
+        mid_pos,
+        mid_offset_h,
+        label="",
+        speed_limit_mps=np.inf,
+    ):
+        if dt_h <= eps:
+            return
+        out[t].append({
+            "set": _set_at_node(t),
+            "dt_h": float(dt_h),
+            "distance_km": float(distance_km),
+            "speed_vec": np.asarray(speed_vec, dtype=float),
+            "h_cmd": int(h_cmd),
+            "mid_pos": np.asarray(mid_pos, dtype=float),
+            "mid_offset_h": float(mid_offset_h),
+            "label": str(label),
+            "speed_limit_mps": float(speed_limit_mps),
+        })
+
+    def _add_zero_motion_segments(out, t, pos, label):
+        if uses_two_setpoints:
+            half_dt = 0.5 * float(dt_vec[t])
+            for h_cmd, mid_off in ((0, 0.25 * dt_vec[t]), (1, 0.75 * dt_vec[t])):
+                _add_segment(
+                    out,
+                    t,
+                    half_dt,
+                    0.0,
+                    np.zeros(2),
+                    h_cmd,
+                    pos,
+                    mid_off,
+                    label,
+                )
+        else:
+            _add_segment(
+                out,
+                t,
+                dt_vec[t],
+                0.0,
+                np.zeros(2),
+                0,
+                pos,
+                0.5 * dt_vec[t],
+                label,
+            )
+
+    segments_by_t = [[] for _ in range(T)]
+
+    if getattr(sol, "path_distance", None) is not None:
+        path_distance = np.asarray(sol.path_distance, dtype=float).reshape(-1)
+        waypoints = np.asarray(sol.fixed_path_waypoints, dtype=float)
+        path_set_ids = np.asarray(sol.path_set_ids, dtype=int).reshape(-1)
+        segment_vecs = waypoints[1:] - waypoints[:-1]
+        segment_lengths = np.linalg.norm(segment_vecs, axis=1)
+        D_breaks = np.concatenate([[0.0], np.cumsum(segment_lengths)])
+
+        for t in range(T):
+            d_start = float(path_distance[t])
+            d_end = float(path_distance[t + 1])
+            total_d = max(0.0, d_end - d_start)
+            timestep_limit = path_interval_speed_limit_mps(
+                D_breaks,
+                path_set_ids,
+                set_speed_limit_mps,
+                t,
+                d_start,
+                d_end,
+                default_limit_mps=float(ship.info.max_speed),
+                touch_tol_km=SPEED_LIMIT_TOUCH_TOL_KM,
+            )
+
+            if (not mask_sail[t]) or total_d <= eps:
+                _add_zero_motion_segments(
+                    segments_by_t,
+                    t,
+                    P[t, :],
+                    "port" if not mask_sail[t] else "zero",
+                )
+                continue
+
+            if uses_two_setpoints:
+                v0_cmd = float(max(0.0, speed_cmd[t, 0]))
+                d0_cmd = v0_cmd * (0.5 * dt_vec[t]) * 3600.0 / 1000.0
+                d_mid = min(d_end, d_start + d0_cmd)
+                if d_mid <= d_start + eps or d_mid >= d_end - eps:
+                    d_mid = 0.5 * (d_start + d_end)
+
+                pieces = [
+                    (d_start, d_mid, 0, 0.5 * dt_vec[t], 0.25 * dt_vec[t]),
+                    (d_mid, d_end, 1, 0.5 * dt_vec[t], 0.75 * dt_vec[t]),
+                ]
+                for a_d, b_d, h_cmd, dt_seg_h, mid_off in pieces:
+                    dist = max(0.0, b_d - a_d)
+                    if dist <= eps:
+                        continue
+                    pa = xy_from_path_distance(waypoints, a_d)
+                    pb = xy_from_path_distance(waypoints, b_d)
+                    direction, _ = safe_unit(pb - pa, eps=eps)
+                    speed_mps = float(max(0.0, speed_cmd[t, h_cmd]))
+                    mid_pos = xy_from_path_distance(waypoints, 0.5 * (a_d + b_d))
+                    _add_segment(
+                        segments_by_t,
+                        t,
+                        dt_seg_h,
+                        dist,
+                        speed_mps * direction,
+                        h_cmd,
+                        mid_pos,
+                        mid_off,
+                        "path_TH",
+                        speed_limit_mps=timestep_limit,
+                    )
+            else:
+                speed_mps = total_d / dt_vec[t] * 1000.0 / 3600.0
+                split_points = [d_start]
+                for b in D_breaks[1:-1]:
+                    if d_start + eps < b < d_end - eps:
+                        split_points.append(float(b))
+                split_points.append(d_end)
+
+                tau_h = 0.0
+                for a_d, b_d in zip(split_points[:-1], split_points[1:]):
+                    dist = max(0.0, b_d - a_d)
+                    if dist <= eps:
+                        continue
+                    pa = xy_from_path_distance(waypoints, a_d)
+                    pb = xy_from_path_distance(waypoints, b_d)
+                    direction, _ = safe_unit(pb - pa, eps=eps)
+                    dt_seg_h = dt_vec[t] * dist / max(total_d, eps)
+                    mid_pos = xy_from_path_distance(waypoints, 0.5 * (a_d + b_d))
+                    _add_segment(
+                        segments_by_t,
+                        t,
+                        dt_seg_h,
+                        dist,
+                        speed_mps * direction,
+                        0,
+                        mid_pos,
+                        tau_h + 0.5 * dt_seg_h,
+                        "path_T",
+                        speed_limit_mps=timestep_limit,
+                    )
+                    tau_h += dt_seg_h
+
+    elif getattr(sol, "crossing_point", None) is not None:
+        Q = np.asarray(sol.crossing_point, dtype=float)
+
+        for t in range(T):
+            if not mask_sail[t]:
+                _add_zero_motion_segments(segments_by_t, t, P[t, :], "port")
+                continue
+
+            pieces_geom = [(P[t, :], Q[t, :]), (Q[t, :], P[t + 1, :])]
+            dists = [float(np.linalg.norm(b - a)) for a, b in pieces_geom]
+            total_d = dists[0] + dists[1]
+            if total_d <= eps:
+                _add_zero_motion_segments(segments_by_t, t, P[t, :], "zero")
+                continue
+
+            if uses_two_setpoints:
+                for h_cmd, (a, b), dist in [(0, pieces_geom[0], dists[0]), (1, pieces_geom[1], dists[1])]:
+                    if dist <= eps:
+                        continue
+                    dt_seg_h = 0.5 * dt_vec[t]
+                    speed_vec = ((b - a) / dt_seg_h) * 1000.0 / 3600.0
+                    mid_off = (0.25 if h_cmd == 0 else 0.75) * dt_vec[t]
+                    _add_segment(
+                        segments_by_t,
+                        t,
+                        dt_seg_h,
+                        dist,
+                        speed_vec,
+                        h_cmd,
+                        0.5 * (a + b),
+                        mid_off,
+                        "q_TH",
+                        speed_limit_mps=_node_speed_limit(t + h_cmd, t),
+                    )
+            else:
+                speed_mps = total_d / dt_vec[t] * 1000.0 / 3600.0
+                timestep_limit = _endpoint_speed_limit(t)
+                tau_h = 0.0
+                for h_geom, ((a, b), dist) in enumerate(zip(pieces_geom, dists)):
+                    if dist <= eps:
+                        continue
+                    direction, _ = safe_unit(b - a, eps=eps)
+                    dt_seg_h = dt_vec[t] * dist / max(total_d, eps)
+                    _add_segment(
+                        segments_by_t,
+                        t,
+                        dt_seg_h,
+                        dist,
+                        speed_mps * direction,
+                        0,
+                        0.5 * (a + b),
+                        tau_h + 0.5 * dt_seg_h,
+                        f"q_T_{h_geom}",
+                        speed_limit_mps=timestep_limit,
+                    )
+                    tau_h += dt_seg_h
+    else:
+        for t in range(T):
+            if not mask_sail[t]:
+                _add_zero_motion_segments(segments_by_t, t, P[t, :], "port")
+                continue
+
+            vec = P[t + 1, :] - P[t, :]
+            direction, total_d = safe_unit(vec, eps=eps)
+            if total_d <= eps:
+                _add_zero_motion_segments(segments_by_t, t, P[t, :], "zero")
+                continue
+
+            if uses_two_setpoints:
+                pmid = 0.5 * (P[t, :] + P[t + 1, :])
+                for h_cmd, a, b, mid_off in [
+                    (0, P[t, :], pmid, 0.25 * dt_vec[t]),
+                    (1, pmid, P[t + 1, :], 0.75 * dt_vec[t]),
+                ]:
+                    dist = float(np.linalg.norm(b - a))
+                    _add_segment(
+                        segments_by_t,
+                        t,
+                        0.5 * dt_vec[t],
+                        dist,
+                        float(max(0.0, speed_cmd[t, h_cmd])) * direction,
+                        h_cmd,
+                        0.5 * (a + b),
+                        mid_off,
+                        "straight_TH",
+                        speed_limit_mps=_node_speed_limit(t + h_cmd, t),
+                    )
+            else:
+                speed_mps = total_d / dt_vec[t] * 1000.0 / 3600.0
+                dt_seg_h = dt_vec[t]
+                _add_segment(
+                    segments_by_t,
+                    t,
+                    dt_seg_h,
+                    total_d,
+                    speed_mps * direction,
+                    0,
+                    0.5 * (P[t, :] + P[t + 1, :]),
+                    0.5 * dt_seg_h,
+                    "straight_T",
+                    speed_limit_mps=_endpoint_speed_limit(t),
+                )
+
+    return {
+        "P": P,
+        "T": T,
+        "dt_vec": dt_vec,
+        "auxiliary_power": auxiliary_power,
+        "mask_sail": mask_sail,
+        "interval_port_idx": interval_port_idx_eval,
+        "speed_cmd": speed_cmd,
+        "uses_two_setpoints": uses_two_setpoints,
+        "set_speed_limit_mps": set_speed_limit_mps,
+        "segments_by_t": segments_by_t,
+    }
+
+
 def compute_non_convex_cost_all_timesteps_nc_interpolated(
     runner,
     eps=1e-9,
     verbose=False,
     nc_sources=None,
-    redispatch_energy=False,
-    energy_solver=None,
 ):
     """
     Evaluate a solution with raw NetCDF weather interpolated at each segment midpoint.
@@ -1293,7 +1643,6 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         solar_power_available=solar_power_available,
         solar_curtailment=solar_curtailment,
         first_stage_optimizer=first_stage_optimizer,
-        power_management_optimizer="RuleBasedSetpointRestoration",
         gen_startup=gen_startup_out,
         gen_shutdown=gen_shutdown_out,
         generator_transition_cost=generator_transition_cost,
@@ -1333,159 +1682,27 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
             fit_context,
         )
 
-    if not redispatch_energy:
-        source_label = first_stage_optimizer or type(runner).__name__
-        for key, rec in active_validation_warnings.items():
-            if not log.validation_warning_is_reportable(key, rec):
-                continue
-            log.warning(
-                "[EMS WARNING] %s: %s count=%s, max_delta=%.6g MW",
-                source_label,
-                rec["message"],
-                rec["count"],
-                rec["max_amount"],
-            )
-        for key, rec in active_validation_errors.items():
-            if key == "propulsion_infeasible":
-                _log_propulsion_infeasible_error(source_label, rec)
-                continue
-            log.error(
-                "[EMS ERROR] %s: %s count=%s, max_shortfall=%.6g MW",
-                source_label,
-                rec["message"],
-                rec["count"],
-                rec["max_amount"],
-            )
-
-    if redispatch_energy:
-        route_validation_warnings = _copy_validation_map(
-            getattr(non_conv_sol, "route_validation_warnings", {}) or {}
+    source_label = first_stage_optimizer or type(runner).__name__
+    for key, rec in active_validation_warnings.items():
+        if not log.validation_warning_is_reportable(key, rec):
+            continue
+        log.warning(
+            "[EMS WARNING] %s: %s count=%s, max_delta=%.6g MW",
+            source_label,
+            rec["message"],
+            rec["count"],
+            rec["max_amount"],
         )
-        route_validation_errors = _copy_validation_map(
-            getattr(non_conv_sol, "route_validation_errors", {}) or {}
+    for key, rec in active_validation_errors.items():
+        if key == "propulsion_infeasible":
+            _log_propulsion_infeasible_error(source_label, rec)
+            continue
+        log.error(
+            "[EMS ERROR] %s: %s count=%s, max_shortfall=%.6g MW",
+            source_label,
+            rec["message"],
+            rec["count"],
+            rec["max_amount"],
         )
-        pre_redispatch_ems_validation_warnings = _copy_validation_map(
-            getattr(non_conv_sol, "ems_validation_warnings", {}) or {}
-        )
-        pre_redispatch_ems_validation_errors = _copy_validation_map(
-            getattr(non_conv_sol, "ems_validation_errors", {}) or {}
-        )
-
-        def _finalize_energy_failure(
-            status,
-            failure_reason,
-            *,
-            ems_validation_errors=None,
-            solve_time=None,
-        ):
-            non_conv_sol.power_management_optimizer = "EnergyOnlyOptimizer"
-            non_conv_sol.power_management_solver_status = str(status or "failed")
-            non_conv_sol.energy_solve_time = solve_time
-            non_conv_sol.estimated_cost = None
-            non_conv_sol.failure_reason = failure_reason
-            non_conv_sol.route_validation_warnings = route_validation_warnings
-            non_conv_sol.route_validation_errors = route_validation_errors
-            non_conv_sol.ems_validation_warnings = {}
-            non_conv_sol.ems_validation_errors = _copy_validation_map(
-                ems_validation_errors or {}
-            )
-            non_conv_sol.pre_redispatch_ems_validation_warnings = (
-                pre_redispatch_ems_validation_warnings
-            )
-            non_conv_sol.pre_redispatch_ems_validation_errors = (
-                pre_redispatch_ems_validation_errors
-            )
-            non_conv_sol.validation_warnings = _copy_validation_map(route_validation_warnings)
-            non_conv_sol.validation_errors = _merge_validation_maps(
-                route_validation_errors,
-                non_conv_sol.ems_validation_errors,
-            )
-            non_conv_sol.is_valid = False
-            return non_conv_sol
-
-        prop_power_values = np.asarray(non_conv_sol.prop_power, dtype=float)
-        route_propulsion_infeasible = (
-            "propulsion_infeasible" in route_validation_errors
-            or not np.all(np.isfinite(prop_power_values))
-        )
-        if route_propulsion_infeasible:
-            route_validation_errors.setdefault(
-                "propulsion_infeasible",
-                {
-                    "message": "Exact propulsion model could not provide finite feasible power for evaluated speed/resistance.",
-                    "count": 1,
-                    "max_amount": 0.0,
-                },
-            )
-            _log_propulsion_infeasible_error(
-                first_stage_optimizer or type(runner).__name__,
-                route_validation_errors["propulsion_infeasible"],
-            )
-            non_conv_sol = _finalize_energy_failure(
-                "not_run_route_infeasible",
-                "energy_redispatch_skipped:propulsion_infeasible",
-            )
-            return n_all, non_conv_sol, segment_dt_h, best_pitch
-
-        energy_optimizer = EnergyOnlyOptimizer(
-            generator_models=generator_models,
-            itinerary=itinerary,
-            states=runner.states,
-            ship=ship,
-            source_optimizer_name=first_stage_optimizer,
-        )
-        solve_kwargs = {
-            "evaluated_solution": non_conv_sol,
-            "solar_power_available": solar_power_available,
-            "verbose": verbose,
-        }
-        if energy_solver is not None:
-            solve_kwargs["solver"] = energy_solver
-
-        try:
-            ok = energy_optimizer.optimize(**solve_kwargs)
-        except Exception as exc:
-            status = f"exception:{type(exc).__name__}"
-            energy_optimizer.power_management_solver_status = status
-            ok = 0
-            log.error(
-                "Energy-only redispatch raised %s: %s",
-                type(exc).__name__,
-                exc,
-            )
-        if not ok:
-            status = (
-                getattr(energy_optimizer, "power_management_solver_status", None)
-                or "failed"
-            )
-            redispatch_errors = {
-                "energy_redispatch_failed": {
-                    "message": "Energy-only redispatch failed; route evaluation was retained as invalid.",
-                    "count": 1,
-                    "max_amount": 0.0,
-                }
-            }
-            non_conv_sol = _finalize_energy_failure(
-                status,
-                f"energy_redispatch_failed:{status}",
-                ems_validation_errors=redispatch_errors,
-                solve_time=getattr(energy_optimizer, "energy_solve_time", None),
-            )
-            return n_all, non_conv_sol, segment_dt_h, best_pitch
-
-        non_conv_sol = energy_optimizer.sol
-        non_conv_sol.route_validation_warnings = route_validation_warnings
-        non_conv_sol.route_validation_errors = route_validation_errors
-        non_conv_sol.ems_validation_warnings = {}
-        non_conv_sol.ems_validation_errors = {}
-        non_conv_sol.pre_redispatch_ems_validation_warnings = (
-            pre_redispatch_ems_validation_warnings
-        )
-        non_conv_sol.pre_redispatch_ems_validation_errors = (
-            pre_redispatch_ems_validation_errors
-        )
-        non_conv_sol.validation_warnings = _copy_validation_map(route_validation_warnings)
-        non_conv_sol.validation_errors = _copy_validation_map(route_validation_errors)
-        non_conv_sol.is_valid = len(route_validation_errors) == 0
 
     return n_all, non_conv_sol, segment_dt_h, best_pitch

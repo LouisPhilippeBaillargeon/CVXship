@@ -1,0 +1,87 @@
+{
+  "artifact": "weather_overlay.npz",
+  "averaging": "time_weighted_itinerary_midpoints_on_native_weather_grids",
+  "datasets": {
+    "currents": {
+      "kind": "vector",
+      "label": "Average current speed",
+      "units": "m/s"
+    },
+    "irradiance": {
+      "kind": "scalar",
+      "label": "Average irradiance",
+      "units": "W/m^2"
+    },
+    "wind": {
+      "kind": "vector",
+      "label": "Average wind speed",
+      "units": "m/s"
+    }
+  },
+  "itinerary": {
+    "nb_timesteps": 17,
+    "query_times": [
+      "2025-06-01T01:00:00",
+      "2025-06-01T03:00:00",
+      "2025-06-01T05:00:00",
+      "2025-06-01T07:00:00",
+      "2025-06-01T09:00:00",
+      "2025-06-01T11:00:00",
+      "2025-06-01T13:00:00",
+      "2025-06-01T15:00:00",
+      "2025-06-01T17:00:00",
+      "2025-06-01T19:00:00",
+      "2025-06-01T21:00:00",
+      "2025-06-01T23:00:00",
+      "2025-06-02T01:00:00",
+      "2025-06-02T03:00:00",
+      "2025-06-02T05:00:00",
+      "2025-06-02T07:00:00",
+      "2025-06-02T09:00:00"
+    ],
+    "time_weights_h": [
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0
+    ]
+  },
+  "map_params": {
+    "resolution_km": 1.0,
+    "span_km_east": 500.0,
+    "span_km_north": 500.0,
+    "sw_lat": 43.5,
+    "sw_lon": -64.0
+  },
+  "version": 1,
+  "weather_files": {
+    "atmo": {
+      "mtime_ns": 1779393808374627900,
+      "path": "C:\\Documents\\CVXship\\weather_data\\atmo_hal_ge_2025_06_01_to_2025_06_02.nc",
+      "size": 1196684
+    },
+    "currents": {
+      "mtime_ns": 1779393808361691800,
+      "path": "C:\\Documents\\CVXship\\weather_data\\currents_hal_ge_2025_06_01_to_2025_06_02.nc",
+      "size": 9226245
+    },
+    "sun": {
+      "mtime_ns": 1779393808361691800,
+      "path": "C:\\Documents\\CVXship\\weather_data\\sun_hal_ge_2025_06_01_to_2025_06_02.nc",
+      "size": 277353
+    }
+  }
+}

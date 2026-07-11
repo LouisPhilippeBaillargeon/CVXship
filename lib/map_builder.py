@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 import numpy as np
 import pandas as pd
@@ -18,6 +19,7 @@ from matplotlib.widgets import Button
 from matplotlib.gridspec import GridSpec
 
 from lib.load_params import MapInfo, Ship
+from lib.utils import dx_dy_km
 from lib import logging_utils as log
 
 
@@ -424,6 +426,23 @@ def status(ax, text):
     ax.set_title(text, fontsize=10)
 
 
+def itinerary_port_coordinates(map_info: MapInfo, itinerary) -> list[dict]:
+    map_shell = SimpleNamespace(info=map_info)
+    ports = []
+    for idx, transit in enumerate(getattr(itinerary, "transits", []) or []):
+        lat = float(getattr(transit, "lat"))
+        lon = float(getattr(transit, "lon"))
+        x, y, _ = dx_dy_km(map_shell, lat, lon)
+        ports.append({
+            "name": getattr(transit, "city", None) or f"Port {idx + 1}",
+            "x": x,
+            "y": y,
+            "lat": lat,
+            "lon": lon,
+        })
+    return ports
+
+
 # ======================================================================
 # Set editor
 # ======================================================================
@@ -436,6 +455,8 @@ class SetEditor:
         pixel_extent=None,
         corners_path=None,
         sets_path=None,
+        port_coordinates=None,
+        weather_overlay=None,
         cmap="Greys",
         origin="lower",
     ):
@@ -447,6 +468,13 @@ class SetEditor:
         self.artifact_callback = artifact_callback
         self.corners_path = Path(corners_path)
         self.sets_path = Path(sets_path)
+        self.port_coordinates = self._normalize_port_coordinates(port_coordinates)
+        self.port_artists = []
+        self.weather_overlay = weather_overlay or {}
+        self.weather_overlay_mode = "off"
+        self.weather_artists = {}
+        self.weather_mappables = {}
+        self.weather_colorbar = None
 
         self.corners = []
         self.sets = []
@@ -456,11 +484,13 @@ class SetEditor:
         self.selected_shared = []
         self.dragging_corner = None
 
-        self.fig = plt.figure(figsize=(9, 7))
-        gs = GridSpec(nrows=2, ncols=1, height_ratios=[1.0, 0.12], figure=self.fig)
+        has_weather_overlay = bool(self.weather_overlay)
+        self.fig = plt.figure(figsize=(10, 7.6 if has_weather_overlay else 7))
+        control_height = 0.20 if has_weather_overlay else 0.12
+        gs = GridSpec(nrows=2, ncols=1, height_ratios=[1.0, control_height], figure=self.fig)
 
         self.ax = self.fig.add_subplot(gs[0])
-        self.ax.imshow(
+        self.nav_artist = self.ax.imshow(
             self.nav,
             cmap=cmap,
             origin=origin,
@@ -471,10 +501,13 @@ class SetEditor:
         self.ax.set_xlabel("X (km)")
         self.ax.set_ylabel("Y (km)")
         status(self.ax, "Click 'New Set'. Drag corners. 'Save All' exports CSVs and artifacts.")
+        self._create_port_coordinate_artists()
+        self._create_weather_overlay_artists()
 
         controls = self.fig.add_subplot(gs[1])
         controls.axis("off")
-        sub = gs[1].subgridspec(1, 8, wspace=0.02)
+        control_rows = 2 if has_weather_overlay else 1
+        sub = gs[1].subgridspec(control_rows, 8, wspace=0.02, hspace=0.18)
 
         ax_new = self.fig.add_subplot(sub[0, 0])
         ax_next = self.fig.add_subplot(sub[0, 1])
@@ -503,10 +536,220 @@ class SetEditor:
         self.btn_import.on_clicked(self.on_import)
         self.btn_done.on_clicked(self.on_done)
 
+        if has_weather_overlay:
+            ax_weather_off = self.fig.add_subplot(sub[1, 0])
+            ax_weather_currents = self.fig.add_subplot(sub[1, 1])
+            ax_weather_wind = self.fig.add_subplot(sub[1, 2])
+            ax_weather_irradiance = self.fig.add_subplot(sub[1, 3])
+
+            self.btn_weather_off = Button(ax_weather_off, "Weather Off")
+            self.btn_weather_currents = Button(ax_weather_currents, "Currents")
+            self.btn_weather_wind = Button(ax_weather_wind, "Wind")
+            self.btn_weather_irradiance = Button(ax_weather_irradiance, "Irradiance")
+
+            self.btn_weather_off.on_clicked(lambda event: self.set_weather_overlay_mode("off"))
+            self.btn_weather_currents.on_clicked(lambda event: self.set_weather_overlay_mode("currents"))
+            self.btn_weather_wind.on_clicked(lambda event: self.set_weather_overlay_mode("wind"))
+            self.btn_weather_irradiance.on_clicked(lambda event: self.set_weather_overlay_mode("irradiance"))
+
         self.fig.canvas.mpl_connect("pick_event", self.on_pick)
         self.fig.canvas.mpl_connect("button_press_event", self.on_click)
         self.fig.canvas.mpl_connect("button_release_event", self.on_release)
         self.fig.canvas.mpl_connect("motion_notify_event", self.on_motion)
+
+    @staticmethod
+    def _normalize_port_coordinates(port_coordinates) -> list[dict]:
+        def optional_float(value):
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        normalized = []
+        for idx, port in enumerate(port_coordinates or []):
+            if isinstance(port, dict):
+                name = port.get("name") or port.get("city") or f"Port {idx + 1}"
+                x = port.get("x", port.get("x_km"))
+                y = port.get("y", port.get("y_km"))
+                lat = port.get("lat")
+                lon = port.get("lon")
+            else:
+                name = getattr(port, "name", None) or getattr(port, "city", None) or f"Port {idx + 1}"
+                x = getattr(port, "x", getattr(port, "x_km", None))
+                y = getattr(port, "y", getattr(port, "y_km", None))
+                lat = getattr(port, "lat", None)
+                lon = getattr(port, "lon", None)
+
+            if x is None or y is None:
+                continue
+
+            try:
+                x = float(x)
+                y = float(y)
+            except (TypeError, ValueError):
+                continue
+
+            if not np.isfinite(x) or not np.isfinite(y):
+                continue
+
+            normalized.append({
+                "name": str(name),
+                "x": x,
+                "y": y,
+                "lat": optional_float(lat),
+                "lon": optional_float(lon),
+            })
+
+        return normalized
+
+    def _create_port_coordinate_artists(self):
+        if not self.port_coordinates:
+            return
+
+        xs = [port["x"] for port in self.port_coordinates]
+        ys = [port["y"] for port in self.port_coordinates]
+        marker = self.ax.scatter(
+            xs,
+            ys,
+            marker="X",
+            s=100,
+            c="tab:red",
+            edgecolors="white",
+            linewidths=1.2,
+            zorder=4.8,
+            label="Ports",
+        )
+        marker.set_picker(False)
+        self.port_artists.append(marker)
+
+        for port in self.port_coordinates:
+            label = f"{port['name']}\nx={port['x']:.1f}, y={port['y']:.1f} km"
+            text = self.ax.annotate(
+                label,
+                xy=(port["x"], port["y"]),
+                xytext=(7, 7),
+                textcoords="offset points",
+                fontsize=8,
+                color="tab:red",
+                ha="left",
+                va="bottom",
+                bbox={
+                    "boxstyle": "round,pad=0.2",
+                    "fc": "white",
+                    "ec": "none",
+                    "alpha": 0.72,
+                },
+                zorder=4.9,
+            )
+            text.set_picker(False)
+            self.port_artists.append(text)
+
+    def _weather_arrow_length(self) -> float:
+        if self.pixel_extent is not None and len(self.pixel_extent) == 4:
+            span_x = abs(float(self.pixel_extent[1]) - float(self.pixel_extent[0]))
+            span_y = abs(float(self.pixel_extent[3]) - float(self.pixel_extent[2]))
+        else:
+            span_y, span_x = np.asarray(self.nav).shape[:2]
+        return max(span_x, span_y, 1.0) * 0.035
+
+    @staticmethod
+    def _weather_display_indices(dataset: dict, max_points: int) -> np.ndarray:
+        x = np.asarray(dataset.get("x", []), dtype=float)
+        n_points = x.size
+        if n_points <= max_points:
+            return np.arange(n_points)
+        stride = int(np.ceil(n_points / max_points))
+        return np.arange(0, n_points, stride, dtype=int)
+
+    def _create_weather_overlay_artists(self):
+        if not self.weather_overlay:
+            return
+
+        arrow_len = self._weather_arrow_length()
+        for name, dataset in self.weather_overlay.items():
+            x = np.asarray(dataset.get("x", []), dtype=float)
+            y = np.asarray(dataset.get("y", []), dtype=float)
+            magnitude = np.asarray(dataset.get("magnitude", []), dtype=float)
+            if x.size == 0 or y.size != x.size or magnitude.size != x.size:
+                continue
+
+            kind = dataset.get("kind", "scalar")
+            if kind == "vector":
+                idx = self._weather_display_indices(dataset, max_points=350)
+                direction_x = np.asarray(dataset.get("direction_x", []), dtype=float)
+                direction_y = np.asarray(dataset.get("direction_y", []), dtype=float)
+                if direction_x.size != x.size or direction_y.size != x.size:
+                    continue
+                artist = self.ax.quiver(
+                    x[idx],
+                    y[idx],
+                    direction_x[idx] * arrow_len,
+                    direction_y[idx] * arrow_len,
+                    magnitude[idx],
+                    cmap="viridis",
+                    angles="xy",
+                    scale_units="xy",
+                    scale=1.0,
+                    pivot="middle",
+                    width=0.003,
+                    alpha=0.85,
+                    zorder=2.2,
+                )
+            else:
+                idx = self._weather_display_indices(dataset, max_points=900)
+                artist = self.ax.scatter(
+                    x[idx],
+                    y[idx],
+                    c=magnitude[idx],
+                    cmap="plasma",
+                    s=28,
+                    alpha=0.85,
+                    linewidths=0.0,
+                    zorder=2.1,
+                )
+
+            artist.set_visible(False)
+            self.weather_artists[name] = [artist]
+            self.weather_mappables[name] = artist
+
+    def set_weather_overlay_mode(self, mode: str):
+        if mode != "off" and mode not in self.weather_artists:
+            status(self.ax, f"No weather overlay data available for {mode}.")
+            self.fig.canvas.draw_idle()
+            return
+
+        for name, artists in self.weather_artists.items():
+            visible = mode != "off" and name == mode
+            for artist in artists:
+                artist.set_visible(visible)
+
+        if self.weather_colorbar is not None:
+            try:
+                self.weather_colorbar.remove()
+            except Exception:
+                pass
+            self.weather_colorbar = None
+
+        self.weather_overlay_mode = mode
+        if mode == "off":
+            status(self.ax, "Weather overlay hidden.")
+        else:
+            dataset = self.weather_overlay[mode]
+            label = dataset.get("label", mode)
+            units = dataset.get("units", "")
+            colorbar_label = f"{label} ({units})" if units else str(label)
+            self.weather_colorbar = self.fig.colorbar(
+                self.weather_mappables[mode],
+                ax=self.ax,
+                fraction=0.046,
+                pad=0.04,
+            )
+            self.weather_colorbar.set_label(colorbar_label)
+            status(self.ax, f"Showing {colorbar_label}.")
+
+        self.fig.canvas.draw_idle()
 
     def _clear_all(self):
         for z in list(self.sets):
@@ -930,11 +1173,14 @@ class MapBuilder:
     set_adj: Optional[np.ndarray] = None
     transition_ineq_from: Optional[np.ndarray] = None
     transition_ineq_to: Optional[np.ndarray] = None
+    weather_overlay: Optional[dict] = None
 
     depth_grid_path: Path = field(init=False)
     depth_metadata_path: Path = field(init=False)
     navigability_map_path: Path = field(init=False)
     navigability_metadata_path: Path = field(init=False)
+    weather_overlay_path: Path = field(init=False)
+    weather_overlay_metadata_path: Path = field(init=False)
     map_params_path: Path = field(init=False)
     corners_path: Path = field(init=False)
     sets_path: Path = field(init=False)
@@ -953,6 +1199,8 @@ class MapBuilder:
         self.depth_metadata_path = map_dir / "depth_grid.meta.json"
         self.navigability_map_path = map_dir / "navigability_map.npy"
         self.navigability_metadata_path = map_dir / "navigability_map.meta.json"
+        self.weather_overlay_path = map_dir / "weather_overlay.npz"
+        self.weather_overlay_metadata_path = map_dir / "weather_overlay.meta.json"
         self.map_params_path = map_dir / "map_params.csv"
         self.corners_path = map_dir / "corners.csv"
         self.sets_path = map_dir / "sets.csv"
@@ -1183,6 +1431,20 @@ class MapBuilder:
         log.debug("Saved navigability map to %s", out_path)
         return nav
 
+    def build_or_load_weather_overlay(self, itinerary, weather_files, force: bool = False) -> dict:
+        from lib.weather_overlay import build_or_load_weather_overlay
+
+        map_obj = SimpleNamespace(info=self.map_info)
+        self.weather_overlay = build_or_load_weather_overlay(
+            map_obj,
+            itinerary,
+            weather_files,
+            self.weather_overlay_path,
+            self.weather_overlay_metadata_path,
+            force=force,
+        )
+        return self.weather_overlay
+
     def build_set_artifacts(
         self,
         df_corners: Optional[pd.DataFrame] = None,
@@ -1239,19 +1501,29 @@ class MapBuilder:
 
         return lambda_array, adj, trans_from, trans_to
 
-    def launch_set_editor(self, force_nav: bool = False, import_existing: bool = True):
+    def launch_set_editor(
+        self,
+        force_nav: bool = False,
+        import_existing: bool = True,
+        weather_overlay: Optional[dict] = None,
+        itinerary=None,
+    ):
         nav = self.build_or_load_navigability(force=force_nav)
 
         x_extent = float(self.map_info.span_km_east)
         y_extent = float(self.map_info.span_km_north)
 
         extent = [0.0, x_extent, 0.0, y_extent]
+        overlay = self.weather_overlay if weather_overlay is None else weather_overlay
+        port_coordinates = itinerary_port_coordinates(self.map_info, itinerary) if itinerary is not None else []
 
         editor = SetEditor(
             nav=nav,
             pixel_extent=extent,
             corners_path=self.corners_path,
             sets_path=self.sets_path,
+            port_coordinates=port_coordinates,
+            weather_overlay=overlay,
             artifact_callback=self.build_set_artifacts,
             origin="lower",
         )
