@@ -77,7 +77,7 @@ def test_records_and_saves_worst_and_best_wind_fit_heatmaps(tmp_path):
     assert best_path.exists()
 
 
-def test_wind_fit_heatmap_subplots_are_titled(tmp_path, monkeypatch):
+def test_wind_fit_heatmap_subplots_have_no_titles(tmp_path, monkeypatch):
     model = _wind_model()
     x, y = np.meshgrid([0.0, 1.0], [0.0, 1.0])
     model._record_worst_fit_heatmap(
@@ -91,9 +91,15 @@ def test_wind_fit_heatmap_subplots_are_titled(tmp_path, monkeypatch):
     )
 
     captured_titles = []
+    captured_axis_labels = []
 
-    def fake_save(fig, path, show=False, *, top=0.9, pad_inches=0.02):
+    def fake_save(fig, path, show=False, *, top=0.9, pad_inches=0.02, font_scale=1.0):
         captured_titles.extend(ax.get_title() for ax in fig.axes if ax.get_title())
+        captured_axis_labels.extend(
+            (ax.get_xlabel(), ax.get_ylabel())
+            for ax in fig.axes
+            if ax.get_xlabel() or ax.get_ylabel()
+        )
         models_module.plt.close(fig)
         return path
 
@@ -101,11 +107,8 @@ def test_wind_fit_heatmap_subplots_are_titled(tmp_path, monkeypatch):
 
     model.plot_worst_fit_heatmaps(directory=tmp_path, filename="worst_wind_fit")
 
-    assert captured_titles == [
-        "True wind resistance",
-        "Fitted wind resistance",
-        "Absolute error",
-    ]
+    assert captured_titles == []
+    assert ("ship speed x [m/s]", "ship speed y [m/s]") in captured_axis_labels
 
 
 def test_wind_fit_report_uses_worst_time_set_values():
@@ -138,6 +141,12 @@ def test_wind_fit_report_uses_worst_time_set_values():
     assert row["worst_abs_error"] == pytest.approx(0.04)
     assert row["average_abs_error"] == pytest.approx(0.025)
     assert row["mean_abs_value"] == pytest.approx(0.8)
+    assert row["min_fit_resistance_mn"] == pytest.approx(0.0)
+    assert row["max_fit_resistance_mn"] == pytest.approx(10.0)
+    assert row["min_fit_prop_power_mw"] == pytest.approx(0.0)
+    assert row["max_fit_prop_power_mw"] == pytest.approx(10.0)
+    assert row["min_fitted_value"] == pytest.approx(-0.76)
+    assert row["max_fitted_value"] == pytest.approx(1.03)
 
 
 def test_wind_fit_heatmap_plot_returns_none_without_record(tmp_path):
@@ -205,7 +214,7 @@ def test_propulsion_power_fit_heatmaps_pdf(tmp_path):
     assert path.exists()
 
 
-def test_propulsion_power_fit_heatmap_subplots_are_titled(tmp_path, monkeypatch):
+def test_propulsion_power_fit_heatmap_subplots_have_no_titles(tmp_path, monkeypatch):
     model = object.__new__(PropulsionModel)
     model.mask_fit = np.array([[True, False], [True, True]])
     model.P_real = np.array([[1.0, 2.0], [3.0, 4.0]])
@@ -216,9 +225,15 @@ def test_propulsion_power_fit_heatmap_subplots_are_titled(tmp_path, monkeypatch)
     model.max_ua = 3.0
 
     captured_titles = []
+    captured_axis_labels = []
 
-    def fake_save(fig, path, show=False, *, top=0.9, pad_inches=0.02):
+    def fake_save(fig, path, show=False, *, top=0.9, pad_inches=0.02, font_scale=1.0):
         captured_titles.extend(ax.get_title() for ax in fig.axes if ax.get_title())
+        captured_axis_labels.extend(
+            (ax.get_xlabel(), ax.get_ylabel())
+            for ax in fig.axes
+            if ax.get_xlabel() or ax.get_ylabel()
+        )
         models_module.plt.close(fig)
         return path
 
@@ -226,11 +241,8 @@ def test_propulsion_power_fit_heatmap_subplots_are_titled(tmp_path, monkeypatch)
 
     model.plot_power_fit_heatmaps_pdf(directory=tmp_path, filename="propulsion_fit")
 
-    assert captured_titles == [
-        "True B-series power",
-        "Fitted convex power",
-        "Absolute error",
-    ]
+    assert captured_titles == []
+    assert ("resistance per propeller [MN]", "advance speed [m/s]") in captured_axis_labels
 
 
 def test_propulsion_fit_report_uses_power_fit_domain():
@@ -254,6 +266,12 @@ def test_propulsion_fit_report_uses_power_fit_domain():
     assert row["worst_abs_error"] == pytest.approx(0.4)
     assert row["average_abs_error"] == pytest.approx((0.1 + 0.3 + 0.4) / 3.0)
     assert row["mean_abs_value"] == pytest.approx((1.0 + 3.0 + 4.0) / 3.0)
+    assert row["min_fit_resistance_mn"] == pytest.approx(0.0)
+    assert row["max_fit_resistance_mn"] == pytest.approx(10.0)
+    assert row["min_fit_prop_power_mw"] == pytest.approx(0.0)
+    assert row["max_fit_prop_power_mw"] == pytest.approx(10.0)
+    assert row["min_fitted_value"] == pytest.approx(1.1)
+    assert row["max_fitted_value"] == pytest.approx(4.4)
 
 
 def test_propulsion_feasibility_classification_pdf(tmp_path):

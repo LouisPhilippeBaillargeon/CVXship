@@ -1,5 +1,5 @@
 name = "halifax-grande-entree"
-description = "Halifax to Grande-Entree route case."
+description = "Halifax to Grande-Entree normal route case."
 
 [run]
 dimensions = "both"
@@ -12,8 +12,41 @@ ordered_sets = true
 [cache]
 scope = "case"
 
+[fit_range]
+lower_speed_factor = 0.90
+upper_speed_factor = 1.15
+lower_res_factor = 0.7
+upper_res_factor = 1.2
+lower_prop_factor = 0.7
+upper_prop_factor = 1.2
+
 [outputs]
 save_plots = true
 show_plots = false
 save_solutions = true
 save_console_log = true
+
+[[scenario]]
+name = "jan01"
+departure_date = "2025-01-01"
+weather_variant = "jan01"
+
+[[scenario]]
+name = "mar01"
+departure_date = "2025-03-01"
+weather_variant = "mar01"
+
+[[scenario]]
+name = "jul01"
+departure_date = "2025-07-01"
+weather_variant = "jul01"
+
+[[scenario]]
+name = "sep01"
+departure_date = "2025-09-01"
+weather_variant = "sep01"
+
+[[scenario]]
+name = "nov01"
+departure_date = "2025-11-01"
+weather_variant = "nov01"

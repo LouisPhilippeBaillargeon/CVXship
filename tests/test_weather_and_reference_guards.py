@@ -24,6 +24,22 @@ def test_weather_paths_must_come_from_weather_toml(tmp_path):
         resolve_weather_files_from_toml(tmp_path)
 
 
+def test_weather_variant_paths_can_be_selected_from_weather_toml(tmp_path):
+    (tmp_path / "weather.toml").write_text(
+        "[variants.jan01.files]\n"
+        'currents = "jan/currents.nc"\n'
+        'atmo = "jan/atmo.nc"\n'
+        'sun = "jan/sun.nc"\n',
+        encoding="utf-8",
+    )
+
+    files = resolve_weather_files_from_toml(tmp_path, variant="jan01")
+
+    assert files["currents"] == (tmp_path / "jan" / "currents.nc").resolve()
+    assert files["atmo"] == (tmp_path / "jan" / "atmo.nc").resolve()
+    assert files["sun"] == (tmp_path / "jan" / "sun.nc").resolve()
+
+
 def _write_weather_nc(path, time_name, times):
     ds = xr.Dataset(
         {

@@ -14,9 +14,14 @@ from lib.load_params import Ship, Generator
 from lib.paths import B_SERIES_CQ, B_SERIES_CT, PLOTS
 from lib.utils import bisection
 from lib.plotting import (
+    MIN_PDF_PAD_INCHES,
     set_ieee_plot_style,
     _finalize_axis,
     _save_and_maybe_show,
+    _scale_figure_text,
+    _strip_plot_titles,
+    normalize_plot_text_size,
+    plot_font_scale,
 )
 from lib import logging_utils as log
 from lib.logging_utils import solve_with_logging
@@ -75,19 +80,70 @@ def _fit_report_count(values):
     return int(np.sum(np.isfinite(arr)))
 
 
-def _fit_report_metrics(true_values, abs_errors):
+def _fit_report_minmax(values):
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return float("nan"), float("nan")
+    return float(np.nanmin(arr)), float(np.nanmax(arr))
+
+
+def _fit_report_index_value(values, index):
+    if values is None:
+        return float("nan")
+    try:
+        value = np.asarray(values, dtype=float)[index]
+    except (IndexError, TypeError, ValueError):
+        return float("nan")
+    return float(value) if np.isfinite(value) else float("nan")
+
+
+def _fit_range_report_fields(fit_range):
+    if fit_range is None:
+        return {
+            "min_fit_speed_mps": float("nan"),
+            "max_fit_speed_mps": float("nan"),
+            "min_fit_resistance_mn": float("nan"),
+            "max_fit_resistance_mn": float("nan"),
+            "min_fit_prop_power_mw": float("nan"),
+            "max_fit_prop_power_mw": float("nan"),
+        }
+    return {
+        "min_fit_speed_mps": float(fit_range.min_speed),
+        "max_fit_speed_mps": float(fit_range.max_speed),
+        "min_fit_resistance_mn": float(fit_range.min_resistance),
+        "max_fit_resistance_mn": float(fit_range.max_resistance),
+        "min_fit_prop_power_mw": float(fit_range.min_prop_power),
+        "max_fit_prop_power_mw": float(fit_range.max_prop_power),
+    }
+
+
+def _fit_report_metrics(true_values, abs_errors, fitted_values=None):
     true_values = np.asarray(true_values, dtype=float)
     abs_errors = np.asarray(abs_errors, dtype=float)
     valid = np.isfinite(true_values) & np.isfinite(abs_errors)
+    if fitted_values is not None:
+        fitted_values = np.asarray(fitted_values, dtype=float)
+        if fitted_values.shape == true_values.shape:
+            valid &= np.isfinite(fitted_values)
+        else:
+            fitted_values = None
     true_values = true_values[valid]
     abs_errors = abs_errors[valid]
+    if fitted_values is not None:
+        fitted_values = fitted_values[valid]
     mean_abs_value = _finite_summary(np.abs(true_values), np.mean)
     average_abs_error = _finite_summary(abs_errors, np.mean)
     worst_abs_error = _finite_summary(abs_errors, np.max)
+    min_fitted_value, max_fitted_value = _fit_report_minmax(
+        [] if fitted_values is None else fitted_values
+    )
     return {
         "worst_abs_error": worst_abs_error,
         "average_abs_error": average_abs_error,
         "mean_abs_value": mean_abs_value,
+        "min_fitted_value": min_fitted_value,
+        "max_fitted_value": max_fitted_value,
         "worst_abs_error_pct_of_mean_abs_value": _fit_report_ratio_pct(
             worst_abs_error,
             mean_abs_value,
@@ -124,11 +180,22 @@ def _log_fit_abs_error_summary(name, mean_abs_errors, max_abs_errors, unit, mean
     )
 
 
-def _save_tight_pdf(fig, path, show: bool = False, *, top: float = 0.9, pad_inches: float = 0.02):
-    path = Path(path)
+def _save_tight_pdf(
+    fig,
+    path,
+    show: bool = False,
+    *,
+    top: float = 0.9,
+    pad_inches: float = MIN_PDF_PAD_INCHES,
+    font_scale: float = 1.0,
+):
+    path = Path(path).with_suffix(".pdf")
     path.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, top), pad=0.02)
-    fig.savefig(path, format="pdf", bbox_inches="tight", pad_inches=pad_inches)
+    _scale_figure_text(fig, font_scale=font_scale)
+    _strip_plot_titles(fig)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, top), pad=0.4)
+    save_pad_inches = max(float(pad_inches), MIN_PDF_PAD_INCHES)
+    fig.savefig(path, format="pdf", bbox_inches="tight", pad_inches=save_pad_inches)
     log.debug("[SAVED] %s", path)
 
     if show:
@@ -398,7 +465,7 @@ class CalmWaterModel:
         Fcalm = 0.5*C*self.ship.hull.total_wet_area*self.ship.info.rho_water*np.square(speed)/1000000
         return Fcalm
 
-    def naive_average_speed(self) -> float:
+    def constant_speed_baseline_average_speed(self) -> float:
         """
         Return the midpoint of the operating speed range used as the nominal
         speed for single-C calm-water comparisons.
@@ -412,18 +479,18 @@ class CalmWaterModel:
 
         if v_max <= v_min:
             raise ValueError(
-                f"Cannot compute naive average speed because max speed "
+                f"Cannot compute constant-speed baseline average speed because max speed "
                 f"{v_max} is not greater than min speed {v_min}."
             )
 
         return 0.5 * (v_min + v_max)
 
-    def compute_naive_nominal_C_resistance(self, speed, nominal_speed: float | None = None):
+    def compute_constant_speed_baseline_nominal_C_resistance(self, speed, nominal_speed: float | None = None):
         """
-        Evaluate C once at the naive nominal speed and reuse it for resistance.
+        Evaluate C once at the constant-speed baseline nominal speed and reuse it.
         """
         if nominal_speed is None:
-            nominal_speed = self.naive_average_speed()
+            nominal_speed = self.constant_speed_baseline_average_speed()
 
         C_nominal = self.compute_C(float(nominal_speed))
         scalar_input = np.isscalar(speed)
@@ -439,6 +506,15 @@ class CalmWaterModel:
         if scalar_input:
             return float(resistance)
         return resistance
+
+    def naive_average_speed(self) -> float:
+        return self.constant_speed_baseline_average_speed()
+
+    def compute_naive_nominal_C_resistance(self, speed, nominal_speed: float | None = None):
+        return self.compute_constant_speed_baseline_nominal_C_resistance(
+            speed,
+            nominal_speed=nominal_speed,
+        )
 
     def fit_constant_C(self, nb_points: int = 100) -> float:
         """
@@ -561,7 +637,7 @@ class CalmWaterModel:
         subfolder: str | None = None,
         output_root: str | None = None,
         text_size: str = "default",
-        file_format: str = "png",
+        file_format: str = "pdf",
         pad_inches: float = 0.1,
     ):
         """
@@ -570,7 +646,7 @@ class CalmWaterModel:
         Plots:
         - C(v)
         - True resistance
-        - Naive nominal-speed C quadratic approximation
+        - Constant-speed baseline nominal-C quadratic approximation
         - Convex polynomial approximation (if res_coeffs is available)
 
         All figures are saved through the plotting.py utilities.
@@ -590,16 +666,14 @@ class CalmWaterModel:
             Use "default" for IEEE-sized text, or "big" for presentation-sized
             text matching the previous enlarged plot style.
         file_format : str
-            Output file extension passed to matplotlib, e.g. "png" or "pdf".
+            Deprecated; plots are always saved as compact PDF files.
         pad_inches : float
             Padding around tight saved figures.
         """
         if nb_points < 2:
             raise ValueError(f"nb_points must be >= 2, got {nb_points}.")
-        if text_size not in {"default", "big"}:
-            raise ValueError(f"text_size must be 'default' or 'big', got {text_size!r}.")
-
-        font_scale = 2.0 if text_size == "big" else 1.0
+        text_size = normalize_plot_text_size(text_size)
+        font_scale = plot_font_scale(text_size)
 
         # ---------------------------------
         # Fit models if needed
@@ -631,7 +705,7 @@ class CalmWaterModel:
 
         rho = self.ship.info.rho_water
         A_hull = self.ship.hull.total_wet_area
-        nominal_speed = self.naive_average_speed()
+        nominal_speed = self.constant_speed_baseline_average_speed()
         C_nominal = self.compute_C(nominal_speed)
 
         C_values = []
@@ -798,6 +872,7 @@ class BaseWindModel:
             metrics = _fit_report_metrics(
                 diag.get("true_resistance", []),
                 diag.get("abs_error", []),
+                diag.get("convex_resistance", []),
             )
             return {
                 "model": model_name,
@@ -805,8 +880,7 @@ class BaseWindModel:
                 "unit": "MN",
                 "scope": "worst_time_set",
                 "fit_subset": diag.get("combination", ""),
-                "min_fit_speed_mps": float(self.fit_range.min_speed),
-                "max_fit_speed_mps": float(self.fit_range.max_speed),
+                **_fit_range_report_fields(self.fit_range),
                 **metrics,
             }
 
@@ -831,11 +905,18 @@ class BaseWindModel:
             "unit": "MN",
             "scope": "worst_time_set",
             "fit_subset": _wind_fit_index_label(worst_index),
-            "min_fit_speed_mps": float(self.fit_range.min_speed),
-            "max_fit_speed_mps": float(self.fit_range.max_speed),
+            **_fit_range_report_fields(self.fit_range),
             "worst_abs_error": worst_abs_error,
             "average_abs_error": average_abs_error,
             "mean_abs_value": mean_abs_value,
+            "min_fitted_value": _fit_report_index_value(
+                getattr(self, "min_convex_resistance", None),
+                worst_index,
+            ),
+            "max_fitted_value": _fit_report_index_value(
+                getattr(self, "max_convex_resistance", None),
+                worst_index,
+            ),
             "worst_abs_error_pct_of_mean_abs_value": _fit_report_ratio_pct(
                 worst_abs_error,
                 mean_abs_value,
@@ -907,6 +988,7 @@ class BaseWindModel:
         show: bool = False,
         directory=None,
         filename: str | None = None,
+        text_size: str = "default",
     ):
         diag = getattr(self, attr, None)
         if diag is None:
@@ -914,6 +996,7 @@ class BaseWindModel:
             return None
 
         set_ieee_plot_style()
+        font_scale = plot_font_scale(text_size)
         fig, axes = plt.subplots(1, 3, figsize=(11.5, 3.6))
         panels = [
             (diag["true_resistance"], "True wind resistance"),
@@ -928,7 +1011,6 @@ class BaseWindModel:
             fig.colorbar(pcm, ax=ax, label="MN")
             ax.set_xlabel("ship speed x [m/s]")
             ax.set_ylabel("ship speed y [m/s]")
-            ax.set_title(title)
             ax.set_aspect("equal", adjustable="box")
 
         if filename is None:
@@ -939,13 +1021,20 @@ class BaseWindModel:
             filename = f"wind_fit_{label}_abs_error_{model_slug}"
 
         output_dir = Path(directory or PLOTS)
-        return _save_tight_pdf(fig, output_dir / f"{filename}.pdf", show, top=1.0)
+        return _save_tight_pdf(
+            fig,
+            output_dir / f"{filename}.pdf",
+            show,
+            top=1.0,
+            font_scale=font_scale,
+        )
 
     def plot_worst_fit_heatmaps(
         self,
         show: bool = False,
         directory=None,
         filename: str | None = None,
+        text_size: str = "default",
     ):
         return self._plot_fit_heatmaps(
             "worst_fit_heatmap",
@@ -953,6 +1042,7 @@ class BaseWindModel:
             show=show,
             directory=directory,
             filename=filename,
+            text_size=text_size,
         )
 
     def plot_best_fit_heatmaps(
@@ -960,6 +1050,7 @@ class BaseWindModel:
         show: bool = False,
         directory=None,
         filename: str | None = None,
+        text_size: str = "default",
     ):
         return self._plot_fit_heatmaps(
             "best_fit_heatmap",
@@ -967,6 +1058,7 @@ class BaseWindModel:
             show=show,
             directory=directory,
             filename=filename,
+            text_size=text_size,
         )
 
     def _fit_line_record(
@@ -1018,6 +1110,7 @@ class BaseWindModel:
         show: bool = False,
         directory=None,
         filename: str | None = None,
+        text_size: str = "default",
     ):
         diag = getattr(self, attr, None)
         if diag is None:
@@ -1025,6 +1118,7 @@ class BaseWindModel:
             return None
 
         set_ieee_plot_style()
+        font_scale = plot_font_scale(text_size)
         fig, ax = plt.subplots(figsize=(5.2, 3.4))
         ax.plot(diag["speed"], diag["true_resistance"], label="True wind resistance")
         ax.plot(
@@ -1045,13 +1139,20 @@ class BaseWindModel:
             filename = f"wind_fit_{label}_abs_error_{model_slug}"
 
         output_dir = Path(directory or PLOTS)
-        return _save_tight_pdf(fig, output_dir / f"{filename}.pdf", show, top=1.0)
+        return _save_tight_pdf(
+            fig,
+            output_dir / f"{filename}.pdf",
+            show,
+            top=1.0,
+            font_scale=font_scale,
+        )
 
     def plot_worst_fit_lineplot(
         self,
         show: bool = False,
         directory=None,
         filename: str | None = None,
+        text_size: str = "default",
     ):
         return self._plot_fit_lineplot(
             "worst_fit_lineplot",
@@ -1059,6 +1160,7 @@ class BaseWindModel:
             show=show,
             directory=directory,
             filename=filename,
+            text_size=text_size,
         )
 
     def plot_best_fit_lineplot(
@@ -1066,6 +1168,7 @@ class BaseWindModel:
         show: bool = False,
         directory=None,
         filename: str | None = None,
+        text_size: str = "default",
     ):
         return self._plot_fit_lineplot(
             "best_fit_lineplot",
@@ -1073,6 +1176,7 @@ class BaseWindModel:
             show=show,
             directory=directory,
             filename=filename,
+            text_size=text_size,
         )
 
 
@@ -1230,8 +1334,6 @@ class WindModel2D(BaseWindModel):
             ax.set_xlabel("vx [m/s]", fontsize=14, labelpad=12)
             ax.set_ylabel("vy [m/s]", fontsize=14, labelpad=12)
             ax.set_zlabel("Resistance[MN]", fontsize=14, labelpad=12)
-
-            ax.set_title("True vs Fitted Resistance", fontsize=16, pad=20)
 
             # Bigger tick labels
             ax.tick_params(axis='both', which='major', labelsize=12)
@@ -1937,7 +2039,6 @@ class WindModelPathAligned2D(BaseWindModel):
                 fig.colorbar(pcm, ax=ax, label="MN")
                 ax.set_xlabel("ship speed x [m/s]")
                 ax.set_ylabel("ship speed y [m/s]")
-                ax.set_title(f"{title} - segment {worst['s']}, timestep {worst['t']}")
                 ax.set_aspect("equal", adjustable="box")
                 fig.tight_layout()
                 plt.show()
@@ -2070,7 +2171,6 @@ class PropulsionModel:
             ax.set_xlabel("Speed [m/s]")
             ax.set_ylabel("Thrust [MN]")
             ax.set_zlabel("Power [MW]")
-            ax.set_title("Real B-series Power Surface")
             plt.tight_layout()
             plt.show()
 
@@ -2416,9 +2516,12 @@ class PropulsionModel:
         if not np.any(mask):
             return None
 
+        real_power = np.asarray(self.P_real, dtype=float)[mask]
+        fitted_power = np.asarray(self.P_fit, dtype=float)[mask]
         metrics = _fit_report_metrics(
-            np.asarray(self.P_real, dtype=float)[mask],
-            np.abs(np.asarray(self.P_fit, dtype=float)[mask] - np.asarray(self.P_real, dtype=float)[mask]),
+            real_power,
+            np.abs(fitted_power - real_power),
+            fitted_power,
         )
         return {
             "model": model_name or type(self).__name__,
@@ -2426,8 +2529,7 @@ class PropulsionModel:
             "unit": "MW",
             "scope": "fit_range",
             "fit_subset": "power_fit_domain",
-            "min_fit_speed_mps": float(self.fit_range.min_speed),
-            "max_fit_speed_mps": float(self.fit_range.max_speed),
+            **_fit_range_report_fields(self.fit_range),
             **metrics,
         }
 
@@ -2435,7 +2537,12 @@ class PropulsionModel:
     #=======================================Plots===================================================
     from matplotlib.patches import Patch
 
-    def plot_power_surface_speed_resistance(self, show: bool = False, directory=None):
+    def plot_power_surface_speed_resistance(
+        self,
+        show: bool = False,
+        directory=None,
+        text_size: str = "default",
+    ):
         """
         Plot REAL and FITTED power as separate 2D heatmaps.
         Figure size automatically adapts to large labels/titles.
@@ -2446,6 +2553,9 @@ class PropulsionModel:
         if self.mask_fit is None:
             raise ValueError("mask_fit is None. Run fit_convex_model() first.")
 
+        text_size = normalize_plot_text_size(text_size)
+        big_text = text_size == "big"
+        set_ieee_plot_style()
         mask = np.asarray(self.mask_fit, dtype=bool)
 
         # Hide points outside the domain used for the power fit:
@@ -2460,8 +2570,7 @@ class PropulsionModel:
 
         for title, Z in plots:
 
-            # Bigger adaptive figure
-            fig, ax = plt.subplots(figsize=(14, 10))
+            fig, ax = plt.subplots(figsize=(14, 10) if big_text else (4.0, 3.0))
 
             heat = ax.imshow(
                 Z,
@@ -2482,47 +2591,35 @@ class PropulsionModel:
                 pad=0.02
             )
 
-            cbar.set_label(
-                "Power [MW]",
-                fontsize=24,
-                labelpad=20
-            )
-
-            cbar.ax.tick_params(labelsize=18)
-
-            ax.set_xlabel(
-                "Resistance [MN]",
-                fontsize=28,
-                labelpad=20
-            )
-
-            ax.set_ylabel(
-                "Advance Speed [m/s]",
-                fontsize=28,
-                labelpad=20
-            )
-
-            ax.set_title(
-                f"{title} (power-fit domain)",
-                fontsize=24,
-                pad=25
-            )
-
-            ax.tick_params(
-                axis='both',
-                labelsize=20
-            )
+            if big_text:
+                cbar.set_label("Power [MW]", fontsize=24, labelpad=20)
+                cbar.ax.tick_params(labelsize=18)
+                ax.set_xlabel("Resistance [MN]", fontsize=28, labelpad=20)
+                ax.set_ylabel("Advance Speed [m/s]", fontsize=28, labelpad=20)
+                ax.tick_params(axis='both', labelsize=20)
+            else:
+                cbar.set_label("Power [MW]")
+                ax.set_xlabel("Resistance [MN]")
+                ax.set_ylabel("Advance Speed [m/s]")
 
             filename = title.lower().replace(" ", "_").replace("-", "_")
             _save_and_maybe_show(fig, filename, show, directory=directory or PLOTS)
 
-    def plot_power_error_heatmap(self, show: bool = False, directory=None):
+    def plot_power_error_heatmap(
+        self,
+        show: bool = False,
+        directory=None,
+        text_size: str = "default",
+    ):
         """
         Show a 2D heatmap of error P_fit - P_real.
         """
+        text_size = normalize_plot_text_size(text_size)
+        big_text = text_size == "big"
+        set_ieee_plot_style()
         error = (self.P_fit - self.P_real) * self.mask_fit
 
-        fig, ax = plt.subplots(figsize=(10, 6))
+        fig, ax = plt.subplots(figsize=(10, 6) if big_text else (4.0, 3.0))
 
         heat = ax.imshow(
             error,
@@ -2533,14 +2630,16 @@ class PropulsionModel:
         )
 
         cbar = fig.colorbar(heat, ax=ax)
-        cbar.set_label("error [MW]", fontsize=30)
-        cbar.ax.tick_params(labelsize=14)
-
-        ax.set_xlabel("Resistance [MN]", fontsize=30)
-        ax.set_ylabel("Advance speed [m/s]", fontsize=30)
-        ax.set_title("Power Fit Error Heatmap", fontsize=30)
-
-        ax.tick_params(axis='both', labelsize=20)
+        if big_text:
+            cbar.set_label("error [MW]", fontsize=30)
+            cbar.ax.tick_params(labelsize=14)
+            ax.set_xlabel("Resistance [MN]", fontsize=30)
+            ax.set_ylabel("Advance speed [m/s]", fontsize=30)
+            ax.tick_params(axis='both', labelsize=20)
+        else:
+            cbar.set_label("error [MW]")
+            ax.set_xlabel("Resistance [MN]")
+            ax.set_ylabel("Advance speed [m/s]")
 
         fig.tight_layout()
         _save_and_maybe_show(fig, "power_fit_error_heatmap", show, directory=directory or PLOTS)
@@ -2550,11 +2649,13 @@ class PropulsionModel:
         show: bool = False,
         directory=None,
         filename: str = "propulsion_power_fit_heatmaps",
+        text_size: str = "default",
     ):
         if self.mask_fit is None or self.P_real is None or self.P_fit is None:
             raise ValueError("Missing power fit data. Run fit_convex_model() first.")
 
         set_ieee_plot_style()
+        font_scale = plot_font_scale(text_size)
         mask = np.asarray(self.mask_fit, dtype=bool)
         true_power = np.where(mask, self.P_real, np.nan)
         fitted_power = np.where(mask, self.P_fit, np.nan)
@@ -2579,16 +2680,22 @@ class PropulsionModel:
             fig.colorbar(pcm, ax=ax, label=unit)
             ax.set_xlabel("resistance per propeller [MN]")
             ax.set_ylabel("advance speed [m/s]")
-            ax.set_title(title)
 
         output_dir = Path(directory or PLOTS)
-        return _save_tight_pdf(fig, output_dir / f"{filename}.pdf", show, top=1.0)
+        return _save_tight_pdf(
+            fig,
+            output_dir / f"{filename}.pdf",
+            show,
+            top=1.0,
+            font_scale=font_scale,
+        )
 
     def plot_feasibility_classification_pdf(
         self,
         show: bool = False,
         directory=None,
         filename: str = "propulsion_feasibility_classification",
+        text_size: str = "default",
     ):
         """
         Plot sampled feasible and infeasible propulsion grid points over the
@@ -2601,6 +2708,7 @@ class PropulsionModel:
         Th, S, mask, ua_vals, thrust_vals = self._mesh()
 
         set_ieee_plot_style()
+        font_scale = plot_font_scale(text_size)
         fig, ax = plt.subplots(figsize=(4.0, 3.0))
 
         infeasible = ~mask
@@ -2656,7 +2764,13 @@ class PropulsionModel:
         ax.legend(loc="best", frameon=False)
 
         output_dir = Path(directory or PLOTS)
-        return _save_tight_pdf(fig, output_dir / f"{filename}.pdf", show, top=1.0)
+        return _save_tight_pdf(
+            fig,
+            output_dir / f"{filename}.pdf",
+            show,
+            top=1.0,
+            font_scale=font_scale,
+        )
 
     def _require_fit_data(self):
         if self.mask_fit is None or self.ua_vals is None or self.thrust_vals is None:
@@ -2712,6 +2826,7 @@ class PropulsionModel:
         show_fit_domain: bool = True,
         show: bool = False,
         directory=None,
+        text_size: str = "default",
     ):
         """
         Visualize the physical propulsion feasibility mask over (speed, thrust).
@@ -2719,6 +2834,8 @@ class PropulsionModel:
         and the smaller power-fit domain used by the power heatmaps.
         """
         self.ensure_fit_grid()
+        set_ieee_plot_style()
+        font_scale = plot_font_scale(text_size)
 
         Th, S, mask, ua_vals, thrust_vals = self._mesh()
 
@@ -2734,7 +2851,6 @@ class PropulsionModel:
         )
         ax.set_xlabel("Thrust (MN)")
         ax.set_ylabel("Advance speed ua (m/s)")
-        ax.set_title("Physical feasibility mask (1 = feasible)")
         fig.colorbar(im, ax=ax, label="physically feasible")
 
         legend_handles = []
@@ -2783,16 +2899,24 @@ class PropulsionModel:
             ax.legend(handles=legend_handles)
 
         fig.tight_layout()
-        _save_and_maybe_show(fig, "propulsion_feasibility_mask", show, directory=directory or PLOTS)
+        _save_and_maybe_show(
+            fig,
+            "propulsion_feasibility_mask",
+            show,
+            directory=directory or PLOTS,
+            font_scale=font_scale,
+        )
 
     # ------------------------
     # 2) Fitted power surface (feasible only)
     # ------------------------
-    def plot_power_fit_surface(self, show: bool = False):
+    def plot_power_fit_surface(self, show: bool = False, text_size: str = "default"):
         """
         3D surface plot of fitted power P_fit(thrust, speed) on feasible points only.
         """
         self._require_fit_data()
+        set_ieee_plot_style()
+        font_scale = plot_font_scale(text_size)
         Th, S, mask, ua_vals, thrust_vals = self._mesh()
         P_fit = self._power_fit_on_grid()
 
@@ -2808,7 +2932,7 @@ class PropulsionModel:
         ax.set_xlabel("Thrust (MN)")
         ax.set_ylabel("Advance speed ua (m/s)")
         ax.set_zlabel("Fitted power (MW)")
-        ax.set_title("Fitted convex power surface (feasible region)")
+        _scale_figure_text(fig, font_scale=font_scale)
         plt.tight_layout()
         if show:
             plt.show()
@@ -2818,11 +2942,18 @@ class PropulsionModel:
     # ------------------------
     # 3) Fitted power contour map
     # ------------------------
-    def plot_power_fit_contours(self, levels: int = 20, show: bool = False):
+    def plot_power_fit_contours(
+        self,
+        levels: int = 20,
+        show: bool = False,
+        text_size: str = "default",
+    ):
         """
         Contour map of fitted power over (speed, thrust), feasible region only.
         """
         self._require_fit_data()
+        set_ieee_plot_style()
+        font_scale = plot_font_scale(text_size)
         Th, S, mask, ua_vals, thrust_vals = self._mesh()
         P_fit = self._power_fit_on_grid()
 
@@ -2830,8 +2961,8 @@ class PropulsionModel:
         cs = plt.contourf(Th, S, P_fit, levels=levels)
         plt.xlabel("Thrust (MN)")
         plt.ylabel("Advance speed ua (m/s)")
-        plt.title("Fitted power contours (MW) on feasible region")
         plt.colorbar(cs, label="MW")
+        _scale_figure_text(fig, font_scale=font_scale)
         plt.tight_layout()
         if show:
             plt.show()
@@ -2891,7 +3022,6 @@ class GeneratorModel:
                 linewidth=2,
             )
 
-            ax.set_title("Generator Fuel Consumption Model", fontsize=14)
             ax.set_xlabel("Generator power output [MW]", fontsize=12)
             ax.set_ylabel("Fuel consumption [kg/h]", fontsize=12)
             ax.grid(True, linestyle="--", alpha=0.5)

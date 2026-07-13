@@ -64,6 +64,13 @@ def _parse_args(argv=None):
         default="default",
         help="Use default IEEE text sizing, or 'big' to keep the presentation-sized text.",
     )
+    parser.add_argument(
+        "--BIG",
+        dest="text_size",
+        action="store_const",
+        const="big",
+        help="Alias for --text-size big.",
+    )
     return parser.parse_args(argv)
 
 
@@ -148,18 +155,18 @@ def main(argv=None) -> int:
         pad_inches=PLOT_PAD_INCHES,
     )
 
-    nominal_speed = calm_model.naive_average_speed()
+    nominal_speed = calm_model.constant_speed_baseline_average_speed()
     speeds = np.linspace(MIN_SPEED_MPS, MAX_SPEED_MPS, args.nb_points)
     true_resistance = np.asarray([calm_model.compute_resistance(v) for v in speeds])
     convex_resistance = _convex_resistance(calm_model, speeds)
-    evaluated_c_resistance = calm_model.compute_naive_nominal_C_resistance(
+    evaluated_c_resistance = calm_model.compute_constant_speed_baseline_nominal_C_resistance(
         speeds,
         nominal_speed=nominal_speed,
     )
 
     print(f"Saved calm-water comparison {PLOT_FILE_FORMAT.upper()} plots to: {output_root}")
     print(f"Fixed speed range: {MIN_SPEED_MPS:.1f}-{MAX_SPEED_MPS:.1f} m/s")
-    print(f"Naive nominal speed: {nominal_speed:.2f} m/s")
+    print(f"Constant-speed baseline nominal speed: {nominal_speed:.2f} m/s")
     print(f"Text size: {args.text_size}")
     print(f"Fit errors over {args.nb_points} sampled speeds:")
     _print_error_summary(

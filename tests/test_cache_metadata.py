@@ -48,3 +48,72 @@ def test_case_cache_scope_uses_case_directory_name(tmp_path, monkeypatch):
     assert ctx_a.cache_dir.name == "sept-iles-gaspe"
     assert ctx_b.cache_dir.name == "sept-iles-gaspe_speed_limit"
     assert ctx_a.cache_dir != ctx_b.cache_dir
+
+
+def test_load_case_fit_range_options_reads_case_toml(tmp_path):
+    case_dir = tmp_path / "case"
+    case_dir.mkdir()
+    (case_dir / "case.toml").write_text(
+        "[fit_range]\n"
+        "lower_speed_factor = 0.75\n"
+        "upper_speed_factor = 1.05\n",
+        encoding="utf-8",
+    )
+
+    assert experiment.load_case_fit_range_options(case_dir) == {
+        "lower_speed_factor": 0.75,
+        "upper_speed_factor": 1.05,
+    }
+
+
+def test_load_case_scenarios_defaults_to_all_and_applies_run_filter(tmp_path):
+    case_dir = tmp_path / "case"
+    case_dir.mkdir()
+    (case_dir / "case.toml").write_text(
+        "[run]\n"
+        'scenarios = ["mar01"]\n'
+        "\n"
+        "[[scenario]]\n"
+        'name = "jan01"\n'
+        'departure_date = "2025-01-01"\n'
+        "\n"
+        "[[scenario]]\n"
+        'name = "mar01"\n'
+        'departure_date = "2025-03-01"\n'
+        'weather_variant = "march_weather"\n',
+        encoding="utf-8",
+    )
+
+    scenarios = experiment.load_case_scenarios(case_dir)
+
+    assert scenarios == [
+        {
+            "name": "mar01",
+            "departure_date": "2025-03-01",
+            "weather_variant": "march_weather",
+        }
+    ]
+    assert [scenario["name"] for scenario in experiment.load_case_scenarios(
+        case_dir,
+        apply_run_filter=False,
+    )] == ["jan01", "mar01"]
+
+
+def test_load_case_scenarios_uses_all_when_no_filter_is_defined(tmp_path):
+    case_dir = tmp_path / "case"
+    case_dir.mkdir()
+    (case_dir / "case.toml").write_text(
+        "[[scenario]]\n"
+        'name = "jan01"\n'
+        'departure_date = "2025-01-01"\n'
+        "\n"
+        "[[scenario]]\n"
+        'name = "mar01"\n'
+        'departure_date = "2025-03-01"\n',
+        encoding="utf-8",
+    )
+
+    assert [scenario["name"] for scenario in experiment.load_case_scenarios(case_dir)] == [
+        "jan01",
+        "mar01",
+    ]

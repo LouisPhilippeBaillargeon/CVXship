@@ -134,7 +134,7 @@ def test_calm_water_model_initialization_does_not_fit():
         model.require_convex_fit("test")
 
 
-def test_naive_nominal_c_resistance_uses_fit_range_midpoint(monkeypatch):
+def test_constant_speed_baseline_nominal_c_resistance_uses_fit_range_midpoint(monkeypatch):
     model = CalmWaterModel(ship=_ship(), fit_range=_fit_range())
     calls = []
 
@@ -145,7 +145,7 @@ def test_naive_nominal_c_resistance_uses_fit_range_midpoint(monkeypatch):
     monkeypatch.setattr(CalmWaterModel, "compute_C", fake_compute_c)
 
     speeds = np.array([2.0, 4.0, 6.0])
-    resistance = model.compute_naive_nominal_C_resistance(speeds)
+    resistance = model.compute_constant_speed_baseline_nominal_C_resistance(speeds)
 
     expected = (
         0.5

@@ -1,4 +1,29 @@
 [files]
-currents = "../../weather_data/WestEnd-Southport/currents.nc"
+currents = "../../weather_data/WestEnd-Southport/currents_01_01.nc"
+atmo = "../../weather_data/WestEnd-Southport/atmo.nc"
+sun = "../../weather_data/WestEnd-Southport/sun.nc"
+
+[variants.jan01.files]
+currents = "../../weather_data/WestEnd-Southport/currents_01_01.nc"
+atmo = "../../weather_data/WestEnd-Southport/atmo.nc"
+sun = "../../weather_data/WestEnd-Southport/sun.nc"
+
+[variants.mar01.files]
+currents = "../../weather_data/WestEnd-Southport/currents_01_03.nc"
+atmo = "../../weather_data/WestEnd-Southport/atmo.nc"
+sun = "../../weather_data/WestEnd-Southport/sun.nc"
+
+[variants.jul01.files]
+currents = "../../weather_data/WestEnd-Southport/currents_01_07.nc"
+atmo = "../../weather_data/WestEnd-Southport/atmo.nc"
+sun = "../../weather_data/WestEnd-Southport/sun.nc"
+
+[variants.sep01.files]
+currents = "../../weather_data/WestEnd-Southport/currents_01_09.nc"
+atmo = "../../weather_data/WestEnd-Southport/atmo.nc"
+sun = "../../weather_data/WestEnd-Southport/sun.nc"
+
+[variants.nov01.files]
+currents = "../../weather_data/WestEnd-Southport/currents_01_11.nc"
 atmo = "../../weather_data/WestEnd-Southport/atmo.nc"
 sun = "../../weather_data/WestEnd-Southport/sun.nc"

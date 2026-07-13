@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 
 from lib.load_params import load_map
+from lib.optimizer_names import canonicalize_optimizer_label
 from lib.paths import RESULTS
 from lib.plotting import plot_solutions
 
@@ -65,6 +66,14 @@ def _parse_args(argv=None):
         "--show-plots",
         action="store_true",
         help="Display plots interactively after saving them.",
+    )
+    parser.add_argument(
+        "--BIG",
+        dest="text_size",
+        action="store_const",
+        const="big",
+        default="default",
+        help="Use the previous presentation-sized plot text instead of IEEE-sized text.",
     )
     parser.add_argument(
         "--no-map",
@@ -176,6 +185,11 @@ def _row_value(row: dict[str, Any], key: str, default: Any = "") -> Any:
     return value
 
 
+def _row_label(row: dict[str, Any], default: Any = "") -> str:
+    raw = _row_value(row, "label", _row_value(row, "key", default))
+    return canonicalize_optimizer_label(raw)
+
+
 def _row_float_label(row: dict[str, Any], key: str, *, width: int | None = None) -> str:
     value = _row_value(row, key, None)
     try:
@@ -217,7 +231,7 @@ def _format_indexed_result_table(rows: list[dict[str, Any]]) -> list[str]:
     ]
 
     for index, row in enumerate(rows, start=1):
-        label = str(_row_value(row, "label", _row_value(row, "key", "")))[:36]
+        label = _row_label(row)[:36]
         validity = "valid" if _row_is_valid(row) else "invalid"
         solver_status = str(_row_value(row, "solver_status", "") or "n/a")[:18]
         warning_count = _row_int(row, "validation_warning_count")
@@ -316,7 +330,7 @@ def _path_from_summary_value(raw: str) -> Path:
 def _solution_path_for_row(run_dir: Path, row: dict[str, Any]) -> Path:
     raw = str(_row_value(row, "solution_file", "") or "").strip()
     if not raw:
-        label = _row_value(row, "label", _row_value(row, "key", "<unknown>"))
+        label = _row_label(row, "<unknown>")
         raise FileNotFoundError(f"Solution {label!r} has no saved solution_file.")
 
     path = _path_from_summary_value(raw)
@@ -342,9 +356,7 @@ def _load_selected_solutions(
         with open(solution_path, "rb") as f:
             solutions.append(pickle.load(f))
 
-        labels.append(
-            str(_row_value(row, "label", _row_value(row, "key", solution_path.stem)))
-        )
+        labels.append(_row_label(row, solution_path.stem))
 
     return solutions, labels
 
@@ -393,6 +405,7 @@ def main(argv=None) -> int:
         subfolder=subfolder,
         map=map_obj,
         output_root=output_root,
+        text_size=args.text_size,
     )
     print(f"[PLOT] Wrote plots to: {output_dir}")
     return 0

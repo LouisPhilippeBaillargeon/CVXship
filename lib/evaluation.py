@@ -500,7 +500,13 @@ def build_evaluation_segment_records(
         )
 
     speed_cmd = np.asarray(sol.speed_mag, dtype=float)
-    uses_two_setpoints = speed_cmd.ndim == 2 and speed_cmd.shape[1] == 2
+    source_segment_dt = getattr(sol, "segment_dt_h", None)
+    has_segmented_commands = source_segment_dt is not None and speed_cmd.ndim == 2
+    uses_two_setpoints = (
+        speed_cmd.ndim == 2
+        and speed_cmd.shape[1] == 2
+        and not has_segmented_commands
+    )
 
     def _set_at_node(k):
         return int(np.argmax(set_selection_mat[k, :]))
@@ -863,23 +869,39 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         )
 
     speed_cmd = np.asarray(sol.speed_mag, dtype=float)
-    uses_two_setpoints = speed_cmd.ndim == 2 and speed_cmd.shape[1] == 2
+    source_segment_dt = getattr(sol, "segment_dt_h", None)
+    has_segmented_commands = source_segment_dt is not None and speed_cmd.ndim == 2
+    uses_two_setpoints = (
+        speed_cmd.ndim == 2
+        and speed_cmd.shape[1] == 2
+        and not has_segmented_commands
+    )
 
     def _as_T_or_TH(x, name):
         arr = np.asarray(x, dtype=float)
         if arr.shape == (T,):
             return arr, "T"
+        if has_segmented_commands and arr.ndim == 2 and arr.shape[0] == T:
+            return arr, "TSEG"
         if arr.shape == (T, 2):
             return arr, "TH"
-        raise ValueError(f"sol.{name} must have shape {(T,)} or {(T, 2)}, got {arr.shape}")
+        expected = f"{(T,)} or {(T, 2)}"
+        if has_segmented_commands:
+            expected += f" or {(T, 'H')}"
+        raise ValueError(f"sol.{name} must have shape {expected}, got {arr.shape}")
 
     def _as_NT_or_NTH(x, name):
         arr = np.asarray(x, dtype=float)
         if arr.shape == (nb_gen, T):
             return arr, "NT"
+        if has_segmented_commands and arr.ndim == 3 and arr.shape[:2] == (nb_gen, T):
+            return arr, "NSEG"
         if arr.shape == (nb_gen, T, 2):
             return arr, "NTH"
-        raise ValueError(f"sol.{name} must have shape {(nb_gen, T)} or {(nb_gen, T, 2)}, got {arr.shape}")
+        expected = f"{(nb_gen, T)} or {(nb_gen, T, 2)}"
+        if has_segmented_commands:
+            expected += f" or {(nb_gen, T, 'H')}"
+        raise ValueError(f"sol.{name} must have shape {expected}, got {arr.shape}")
 
     gen_cmd, gen_kind = _as_NT_or_NTH(sol.generation_power, "generation_power")
     gen_on_cmd, gen_on_kind = _as_NT_or_NTH(sol.gen_on, "gen_on")
@@ -908,11 +930,19 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         gen_shutdown_out = np.asarray(gen_shutdown_out, dtype=float)
         generator_transition_cost = float(generator_transition_cost)
 
-    def _pick_T(arr, kind, t, h_cmd):
-        return float(arr[t]) if kind == "T" else float(arr[t, h_cmd])
+    def _pick_T(arr, kind, t, h_cmd, h_seg):
+        if kind == "T":
+            return float(arr[t])
+        if kind == "TSEG":
+            return float(arr[t, h_seg])
+        return float(arr[t, h_cmd])
 
-    def _pick_NT(arr, kind, t, h_cmd):
-        return np.asarray(arr[:, t], dtype=float) if kind == "NT" else np.asarray(arr[:, t, h_cmd], dtype=float)
+    def _pick_NT(arr, kind, t, h_cmd, h_seg):
+        if kind == "NT":
+            return np.asarray(arr[:, t], dtype=float)
+        if kind == "NSEG":
+            return np.asarray(arr[:, t, h_seg], dtype=float)
+        return np.asarray(arr[:, t, h_cmd], dtype=float)
 
     def _set_at_node(k):
         return int(np.argmax(set_selection_mat[k, :]))
@@ -1199,6 +1229,28 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
 
     Hmax = max(max(len(x), 1) for x in segments_by_t)
 
+    def _validate_segment_command_slots(arr, kind, name):
+        if kind == "TSEG" and arr.shape[1] < Hmax:
+            raise ValueError(
+                f"sol.{name} has {arr.shape[1]} segment command slots, "
+                f"but evaluator geometry requires {Hmax}."
+            )
+        if kind == "NSEG" and arr.shape[2] < Hmax:
+            raise ValueError(
+                f"sol.{name} has {arr.shape[2]} segment command slots, "
+                f"but evaluator geometry requires {Hmax}."
+            )
+
+    for _arr, _kind, _name in (
+        (gen_cmd, gen_kind, "generation_power"),
+        (gen_on_cmd, gen_on_kind, "gen_on"),
+        (shore_cmd, shore_kind, "shore_power"),
+        (shore_cost_cmd, shore_cost_kind, "shore_power_cost"),
+        (batt_ch_cmd, batt_ch_kind, "battery_charge"),
+        (batt_dis_cmd, batt_dis_kind, "battery_discharge"),
+    ):
+        _validate_segment_command_slots(_arr, _kind, _name)
+
     segment_dt_h = np.zeros((T, Hmax))
     step_distance = np.zeros((T, Hmax))
     ship_speed = np.zeros((T, 2, Hmax))
@@ -1286,13 +1338,13 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
                     "Ship speed exceeded an active set speed limit.",
                     speed_mag[t, h] - legal_speed_limit,
                 )
-            shore_power[t, h] = _pick_T(shore_cmd, shore_kind, t, h_cmd)
-            shore_power_cost[t, h] = _pick_T(shore_cost_cmd, shore_cost_kind, t, h_cmd)
-            battery_charge[t, h] = _pick_T(batt_ch_cmd, batt_ch_kind, t, h_cmd)
-            battery_discharge[t, h] = _pick_T(batt_dis_cmd, batt_dis_kind, t, h_cmd)
+            shore_power[t, h] = _pick_T(shore_cmd, shore_kind, t, h_cmd, h)
+            shore_power_cost[t, h] = _pick_T(shore_cost_cmd, shore_cost_kind, t, h_cmd, h)
+            battery_charge[t, h] = _pick_T(batt_ch_cmd, batt_ch_kind, t, h_cmd, h)
+            battery_discharge[t, h] = _pick_T(batt_dis_cmd, batt_dis_kind, t, h_cmd, h)
 
-            gen_sched = _pick_NT(gen_cmd, gen_kind, t, h_cmd)
-            gen_on = _pick_NT(gen_on_cmd, gen_on_kind, t, h_cmd)
+            gen_sched = _pick_NT(gen_cmd, gen_kind, t, h_cmd, h)
+            gen_on = _pick_NT(gen_on_cmd, gen_on_kind, t, h_cmd, h)
 
             qtime = query_time_for_segment(itinerary, runner.states, t, segment_record["mid_offset_h"])
             w = interpolated_weather_at(nc_sources, runner.map, segment_record["mid_pos"], qtime)
@@ -1424,7 +1476,7 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         if segment_dt_h[t, h] > eps
     ]
 
-    def _recompute_soc_trace():
+    def _recompute_soc_trace(record_errors=True):
         soc = float(np.clip(getattr(runner.states, "soc", 0.0), 0.0, battery_capacity))
         soc_by_t = np.zeros(T + 1, dtype=float)
         before = {}
@@ -1445,20 +1497,22 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
                     - dt_local * float(battery_discharge[tt, hh]) / battery_discharge_eff
                 )
                 if soc_next < -eps:
-                    _record_message(
-                        ems_validation_errors,
-                        "battery_soc_below_min",
-                        "Battery SOC fell below its minimum bound after rule-based redispatch.",
-                        soc_next,
-                    )
+                    if record_errors:
+                        _record_message(
+                            ems_validation_errors,
+                            "battery_soc_below_min",
+                            "Battery SOC fell below its minimum bound after rule-based redispatch.",
+                            soc_next,
+                        )
                     soc = soc_next
                 elif soc_next > battery_capacity + eps:
-                    _record_message(
-                        ems_validation_errors,
-                        "battery_soc_above_max",
-                        "Battery SOC exceeded its maximum bound after rule-based redispatch.",
-                        soc_next - battery_capacity,
-                    )
+                    if record_errors:
+                        _record_message(
+                            ems_validation_errors,
+                            "battery_soc_above_max",
+                            "Battery SOC exceeded its maximum bound after rule-based redispatch.",
+                            soc_next - battery_capacity,
+                        )
                     soc = soc_next
                 else:
                     soc = float(np.clip(soc_next, 0.0, battery_capacity))
@@ -1468,9 +1522,117 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
 
         return soc_by_t, before, after
 
+    def _refresh_segment_cost(tt, hh):
+        gp = generation_power[:, tt, hh]
+        gen_on_actual = gen_on_all[:, tt, hh]
+        gc = (a0 * gp**2 + b0 * gp + c0 * gen_on_actual) * float(itinerary.fuel_price)
+        gen_costs[:, tt, hh] = gc
+        _, shore_unit_cost = _shore_command_limit(tt)
+        shore_power_cost[tt, hh] = shore_power[tt, hh] * shore_unit_cost
+        total_cost_all[tt, hh] = segment_dt_h[tt, hh] * (
+            float(np.sum(gc)) + shore_power_cost[tt, hh]
+        )
+
+    def _generator_increase_headroom(tt, hh):
+        if nb_gen <= 0:
+            return 0.0
+        gen_allowed = gen_on_all[:, tt, hh] > 0.5
+        headroom = np.where(
+            gen_allowed,
+            np.maximum(gen_max_power - generation_power[:, tt, hh], 0.0),
+            0.0,
+        )
+        return float(np.sum(headroom))
+
+    def _supply_increase_headroom(tt, hh):
+        shore_limit, _ = _shore_command_limit(tt)
+        shore_headroom = max(0.0, shore_limit - float(shore_power[tt, hh]))
+        return shore_headroom + _generator_increase_headroom(tt, hh)
+
+    def _increase_supply_for_terminal_soc(tt, hh, requested_delta):
+        requested_delta = max(0.0, float(requested_delta))
+        if requested_delta <= eps:
+            return 0.0, 0.0, 0.0
+
+        shore_limit, _ = _shore_command_limit(tt)
+        shore_delta = min(
+            requested_delta,
+            max(0.0, shore_limit - float(shore_power[tt, hh])),
+        )
+        remaining = requested_delta - shore_delta
+        gen_delta = 0.0
+
+        if remaining > eps and nb_gen > 0:
+            gen_allowed = gen_on_all[:, tt, hh] > 0.5
+            P_g_min_eff = np.where(gen_allowed, gen_min_power, 0.0)
+            P_g_max_eff = np.where(gen_allowed, gen_max_power, 0.0)
+            adjusted_generation, missing = redistribute_generator_adjustment(
+                generation_power[:, tt, hh],
+                remaining,
+                "increase",
+                P_g_min_eff,
+                P_g_max_eff,
+                gen_allowed,
+                gen_max_power,
+                eps=eps,
+            )
+            gen_delta = remaining - missing
+            generation_power[:, tt, hh] = adjusted_generation
+
+        actual_delta = shore_delta + gen_delta
+        if actual_delta > eps:
+            shore_power[tt, hh] += shore_delta
+            _refresh_segment_cost(tt, hh)
+        return actual_delta, shore_delta, gen_delta
+
+    record_index_by_segment = {
+        record: index
+        for index, record in enumerate(real_segment_records)
+    }
+
+    def _future_soc_gain_limits(record_index):
+        attenuation = 1.0
+        final_attenuation = 1.0
+        max_local_gain = np.inf
+
+        for future_index in range(record_index, len(real_segment_records)):
+            future_t, future_h = real_segment_records[future_index]
+            if future_index > record_index:
+                attenuation *= battery_leak ** float(segment_dt_h[future_t, future_h])
+            future_soc = float(soc_after.get((future_t, future_h), battery_capacity))
+            if attenuation > eps:
+                max_local_gain = min(
+                    max_local_gain,
+                    max(0.0, battery_capacity - future_soc) / attenuation,
+                )
+            final_attenuation = attenuation
+
+        if not np.isfinite(max_local_gain):
+            max_local_gain = 0.0
+        return max_local_gain, final_attenuation
+
+    def _terminal_delta_limit(tt, hh, local_gain_per_mw, missing_soc):
+        record_index = record_index_by_segment.get((tt, hh))
+        if record_index is None or local_gain_per_mw <= eps:
+            return 0.0
+
+        max_local_gain, final_attenuation = _future_soc_gain_limits(record_index)
+        final_gain_per_mw = local_gain_per_mw * final_attenuation
+        if final_gain_per_mw <= eps:
+            return 0.0
+
+        return max(
+            0.0,
+            min(
+                max_local_gain / local_gain_per_mw,
+                max(0.0, missing_soc) / final_gain_per_mw,
+            ),
+        )
+
     SOC_eval, _soc_before, soc_after = _recompute_soc_trace()
 
     target_soc = float(getattr(itinerary, "soc_f", 0.0))
+    terminal_soc_upper_warning_mwh = 0.01
     if target_soc > battery_capacity + eps:
         _record_message(
             ems_validation_errors,
@@ -1482,76 +1644,93 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         for rec_t, rec_h in reversed(real_segment_records):
             if SOC_eval[-1] >= target_soc - eps:
                 break
-            if mask_sail[rec_t]:
-                continue
 
             dt_local = float(segment_dt_h[rec_t, rec_h])
             if dt_local <= eps:
                 continue
 
-            shore_limit, shore_unit_cost = _shore_command_limit(rec_t)
-            charge_headroom = battery_max_charge - float(battery_charge[rec_t, rec_h])
-            shore_headroom = shore_limit - float(shore_power[rec_t, rec_h])
-            soc_headroom = (
-                battery_capacity - float(soc_after.get((rec_t, rec_h), battery_capacity))
-            ) / (battery_charge_eff * dt_local)
-            max_delta = max(
-                0.0,
-                min(charge_headroom, shore_headroom, soc_headroom),
+            missing_soc = target_soc - float(SOC_eval[-1])
+            discharge_delta_limit = _terminal_delta_limit(
+                rec_t,
+                rec_h,
+                dt_local / battery_discharge_eff,
+                missing_soc,
             )
-            if max_delta <= eps:
-                continue
-
-            final_gain_per_mw = (
-                dt_local
-                * battery_charge_eff
+            discharge_delta = min(
+                float(battery_discharge[rec_t, rec_h]),
+                _supply_increase_headroom(rec_t, rec_h),
+                discharge_delta_limit,
             )
-            if final_gain_per_mw <= eps:
-                continue
+            if discharge_delta > eps:
+                supply_delta, shore_delta, gen_delta = _increase_supply_for_terminal_soc(
+                    rec_t,
+                    rec_h,
+                    discharge_delta,
+                )
+                discharge_delta = min(discharge_delta, supply_delta)
+                if discharge_delta > eps:
+                    battery_discharge[rec_t, rec_h] -= discharge_delta
+                    _refresh_segment_cost(rec_t, rec_h)
+                    SOC_eval, _soc_before, soc_after = _recompute_soc_trace(record_errors=False)
+                    _record_message(
+                        ems_validation_warnings,
+                        "terminal_soc_restored_by_replacing_battery_discharge",
+                        "Battery discharge was reduced and replaced with shore power or already-on generator headroom to restore terminal SOC.",
+                        discharge_delta,
+                    )
+                    if SOC_eval[-1] >= target_soc - eps:
+                        break
 
             missing_soc = target_soc - float(SOC_eval[-1])
-            delta_charge = min(max_delta, missing_soc / final_gain_per_mw)
+            charge_headroom = battery_max_charge - float(battery_charge[rec_t, rec_h])
+            charge_delta_limit = _terminal_delta_limit(
+                rec_t,
+                rec_h,
+                battery_charge_eff * dt_local,
+                missing_soc,
+            )
+            delta_charge = min(
+                max(0.0, charge_headroom),
+                _supply_increase_headroom(rec_t, rec_h),
+                charge_delta_limit,
+            )
             if delta_charge <= eps:
                 continue
 
-            old_charge = float(battery_charge[rec_t, rec_h])
-            old_shore = float(shore_power[rec_t, rec_h])
-            old_shore_cost = float(shore_power_cost[rec_t, rec_h])
-            old_total_cost = float(total_cost_all[rec_t, rec_h])
-            old_final_soc = float(SOC_eval[-1])
-
-            battery_charge[rec_t, rec_h] = old_charge + delta_charge
-            shore_power[rec_t, rec_h] = old_shore + delta_charge
-            shore_power_cost[rec_t, rec_h] = shore_power[rec_t, rec_h] * shore_unit_cost
-            total_cost_all[rec_t, rec_h] = dt_local * (
-                float(np.sum(gen_costs[:, rec_t, rec_h]))
-                + shore_power_cost[rec_t, rec_h]
+            supply_delta, shore_delta, gen_delta = _increase_supply_for_terminal_soc(
+                rec_t,
+                rec_h,
+                delta_charge,
             )
-
-            SOC_eval, _soc_before, soc_after = _recompute_soc_trace()
-            actual_gain = float(SOC_eval[-1]) - old_final_soc
-            if actual_gain <= eps:
-                battery_charge[rec_t, rec_h] = old_charge
-                shore_power[rec_t, rec_h] = old_shore
-                shore_power_cost[rec_t, rec_h] = old_shore_cost
-                total_cost_all[rec_t, rec_h] = old_total_cost
-                SOC_eval, _soc_before, soc_after = _recompute_soc_trace()
+            delta_charge = min(delta_charge, supply_delta)
+            if delta_charge <= eps:
                 continue
 
+            battery_charge[rec_t, rec_h] += delta_charge
+            _refresh_segment_cost(rec_t, rec_h)
+            SOC_eval, _soc_before, soc_after = _recompute_soc_trace(record_errors=False)
             _record_message(
                 ems_validation_warnings,
-                "terminal_soc_restored_with_port_shore",
-                "Shore charging was increased at port to restore terminal SOC.",
+                "terminal_soc_restored_by_extra_battery_charge",
+                "Battery charge was increased using shore power or already-on generator headroom to restore terminal SOC.",
                 delta_charge,
             )
 
+        SOC_eval, _soc_before, soc_after = _recompute_soc_trace()
         if SOC_eval[-1] < target_soc - eps:
             _record_message(
                 ems_validation_errors,
                 "terminal_soc_shortfall",
-                "Terminal SOC target could not be restored with available port shore power.",
+                "Terminal SOC target could not be restored with available shore power or already-on generator headroom.",
                 target_soc - float(SOC_eval[-1]),
             )
+    if SOC_eval[-1] > target_soc + terminal_soc_upper_warning_mwh:
+        _record_message(
+            ems_validation_warnings,
+            "terminal_soc_above_minimum",
+            "Final SOC exceeded the minimum terminal SOC target by more than 0.01 MWh.",
+            float(SOC_eval[-1]) - target_soc,
+        )
 
     for t in range(T):
         n_real = len(segments_by_t[t])
@@ -1647,6 +1826,7 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         gen_shutdown=gen_shutdown_out,
         generator_transition_cost=generator_transition_cost,
         generator_unit_commitment=source_generator_unit_commitment,
+        zone_membership_binary_count=getattr(sol, "zone_membership_binary_count", None),
         solver_status=getattr(sol, "solver_status", None),
         failure_reason=failure_reason,
         is_valid=len(active_validation_errors) == 0,
@@ -1686,12 +1866,14 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
     for key, rec in active_validation_warnings.items():
         if not log.validation_warning_is_reportable(key, rec):
             continue
+        amount_unit = "MWh" if key == "terminal_soc_above_minimum" else "MW"
         log.warning(
-            "[EMS WARNING] %s: %s count=%s, max_delta=%.6g MW",
+            "[EMS WARNING] %s: %s count=%s, max_delta=%.6g %s",
             source_label,
             rec["message"],
             rec["count"],
             rec["max_amount"],
+            amount_unit,
         )
     for key, rec in active_validation_errors.items():
         if key == "propulsion_infeasible":

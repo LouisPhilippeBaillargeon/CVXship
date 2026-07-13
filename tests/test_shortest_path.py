@@ -13,7 +13,7 @@ from lib.optimizers import (
 from lib.utils import build_constant_speed_path_reference, dx_dy_km
 
 
-CASE_DIR = Path("cases/sept-iles-gaspe")
+CASE_DIR = Path("cases/sept-ile-grosse-ile")
 HALIFAX_GRANDE_ENTREE_CASE_DIR = Path("cases/halifax-grande-entree")
 
 
@@ -41,8 +41,8 @@ class ShortestPathTests(unittest.TestCase):
 
         sol = path.compute(end_pos)
 
-        self.assertEqual(sol.set_sequence, [0, 1, 2, 3])
-        self.assertAlmostEqual(sol.total_distance, 206.1636121564717, places=6)
+        self.assertEqual(sol.set_sequence, [4, 0, 5, 6, 7, 8])
+        self.assertAlmostEqual(sol.total_distance, 402.44803502508984, places=6)
         self.assertEqual(len(sol.set_sequence), sol.waypoints.shape[0] - 1)
         self.assertTrue(np.all(np.linalg.norm(np.diff(sol.waypoints, axis=0), axis=1) > 0.0))
 
@@ -64,9 +64,9 @@ class ShortestPathTests(unittest.TestCase):
         )
         sol = path.compute(end_pos)
 
-        self.assertEqual(bfs_seq, [0, 4, 3])
+        self.assertEqual(bfs_seq, [4, 0, 1, 2, 8])
         self.assertLess(sol.total_distance, bfs_sol.total_distance)
-        self.assertEqual(map_obj.nb_sets, 5)
+        self.assertEqual(map_obj.nb_sets, 9)
 
     def test_shortest_path_output_feeds_constant_speed_reference(self):
         map_obj, itinerary, states, path, end_pos = self._sept_iles_gaspe_path()
@@ -86,7 +86,7 @@ class ShortestPathTests(unittest.TestCase):
         self.assertEqual(ref["path_distance"].shape[0], itinerary.nb_timesteps + 1)
         self.assertAlmostEqual(ref["total_distance_km"], sol.total_distance, places=6)
 
-    def test_ordered_sets_use_route_sequence_when_node_samples_skip_short_set(self):
+    def test_ordered_sets_use_current_halifax_route_sequence(self):
         map_obj = load_map(HALIFAX_GRANDE_ENTREE_CASE_DIR)
         itinerary = load_itinerary(map_obj, HALIFAX_GRANDE_ENTREE_CASE_DIR)
         states = load_states(map_obj, itinerary)
@@ -117,24 +117,16 @@ class ShortestPathTests(unittest.TestCase):
         sampled_order = _ordered_ids_from_solution(ref["set_selection"])
         ordered_ids, source = _ordered_ids_for_free_set_optimizer(sol.set_sequence)
 
-        self.assertEqual(sol.set_sequence, [0, 1, 2, 3, 4, 5, 6])
-        self.assertEqual(sampled_order, [0, 1, 2, 3, 5, 6])
+        self.assertEqual(sol.set_sequence, [0, 1, 2, 3, 4])
+        self.assertEqual(sampled_order, [0, 1, 2, 3, 4])
         self.assertEqual(source, "route")
         self.assertEqual(ordered_ids, sol.set_sequence)
 
-        with self.assertRaisesRegex(ValueError, "set 3 cannot transition to set 5"):
-            _validate_ordered_set_adjacency(
-                sampled_order,
-                map_obj.set_adj,
-                current_set=0,
-                destination_set=6,
-                optimizer_name="test",
-            )
         _validate_ordered_set_adjacency(
             ordered_ids,
             map_obj.set_adj,
             current_set=0,
-            destination_set=6,
+            destination_set=4,
             optimizer_name="test",
         )
 

@@ -3,6 +3,8 @@ from types import SimpleNamespace
 import numpy as np
 
 from lib.plotting import (
+    _overlap_group_positions,
+    _overlap_line_kwargs,
     _plot_generator_xy,
     _plot_series_xy,
     _plot_set_index_xy,
@@ -83,3 +85,24 @@ def test_soc_and_set_index_use_timestep_boundaries():
     np.testing.assert_allclose(soc, [100.0, 95.0, 90.0])
     np.testing.assert_allclose(x_set, [0.0, 2.0, 3.0])
     np.testing.assert_allclose(set_idx, [0.0, 1.0, 2.0])
+
+
+def test_identical_plot_curves_get_distinct_dot_phases():
+    curve = (
+        np.array([0.0, 1.0, np.nan, 2.0]),
+        np.array([10.0, 11.0, np.nan, 12.0]),
+    )
+    positions = _overlap_group_positions(
+        [
+            curve,
+            (curve[0].copy(), curve[1].copy()),
+            (np.array([0.0, 1.0, 2.0]), np.array([10.0, 11.0, 13.0])),
+            None,
+        ]
+    )
+
+    assert positions == [(2, 0), (2, 1), (1, 0), (1, 0)]
+    assert (
+        _overlap_line_kwargs(*positions[0])["linestyle"]
+        != _overlap_line_kwargs(*positions[1])["linestyle"]
+    )

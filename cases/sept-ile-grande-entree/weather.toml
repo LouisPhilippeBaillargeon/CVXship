@@ -1,4 +1,0 @@
-[files]
-currents = "../../weather_data/sept-ile-grande-entree/currents_7ile_ge.nc"
-atmo = "../../weather_data/sept-ile-grande-entree/atmo_7ile_ge.nc"
-sun = "../../weather_data/sept-ile-grande-entree/sun_7ile_ge.nc"

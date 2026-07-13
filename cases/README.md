@@ -15,6 +15,53 @@ Run a case with:
 python optimize.py --case cases/sept-iles-gaspe
 ```
 
+Cases can define multiple experiment scenarios in `case.toml`. When scenarios
+are present, `python optimize.py --case <case>` runs every scenario by default
+unless `[run].scenarios` names a smaller default set:
+
+```toml
+[run]
+scenarios = ["jan01", "mar01"]  # optional; omit to run all [[scenario]] entries
+
+[[scenario]]
+name = "jan01"
+departure_date = "2025-01-01"
+weather_variant = "jan01"
+
+[[scenario]]
+name = "mar01"
+departure_date = "2025-03-01"
+weather_variant = "mar01"
+```
+
+Weather variants stay in `weather.toml`:
+
+```toml
+[variants.jan01.files]
+currents = "../../weather_data/hal_ge/jan01/currents.nc"
+atmo = "../../weather_data/hal_ge/jan01/atmo.nc"
+sun = "../../weather_data/hal_ge/jan01/sun.nc"
+```
+
+For scenario-driven dates, `itinerary.toml` may use a schedule template instead
+of hard-coded transit datetimes:
+
+```toml
+[schedule]
+departure_time = "06:00"
+sail_time_h = 30
+origin_port_time_h = 3
+destination_port_time_h = 3
+```
+
+Run or resume scenario batches with:
+
+```powershell
+python optimize.py --case cases/halifax-grande-entree
+python optimize.py --resume-batch results/batches/<batch_id>
+python optimize.py --case cases/halifax-grande-entree --optimizer jopse_d --variant jan01
+```
+
 Use the 52North WeatherRoutingTool path generator instead of the local
 shortest path with:
 
@@ -28,6 +75,19 @@ The same can be set in `case.toml` under `[run]`:
 path_generator = "wrt"      # default: "shortest"
 wrt_algorithm = "isofuel"   # or "genetic"
 wrt_source_dir = "C:/path/to/WeatherRoutingTool"
+```
+
+The SPaCS-derived model fit range can be expanded or tightened per case in
+`case.toml`:
+
+```toml
+[fit_range]
+lower_speed_factor = 0.85
+upper_speed_factor = 1.1
+lower_res_factor = 0.7
+upper_res_factor = 1.2
+lower_prop_factor = 0.7
+upper_prop_factor = 1.2
 ```
 
 If WeatherRoutingTool is already importable in Python, `wrt_source_dir` is not

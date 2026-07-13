@@ -1,0 +1,117 @@
+# ============================
+# SHIP GENERAL INFO
+# max_speed     : Maximal ship speed (m/s)
+# rho_water     : Water density (kg/m^3)
+# rho_air       : Air density (kg/m^3)
+# min_depth     : Minimum navigable water depth (m)
+# ============================
+[info]
+max_speed       = 10
+rho_water       = 1025
+rho_air         = 1.224
+min_depth       = 15.525
+
+# ============================
+# HULL
+# B             : Beam length (m)
+# LWL           : Length at waterline (m)
+# CB            : Block coefficient (-)
+# T             : Draught at midship (m)
+# AL_air        : Side projected area above water (m^2)
+# AF_air        : Front projected area above water (m^2)
+# total_wet_area: Wetted hull area (m^2)
+# CDt           : Blendermann wind coefficient
+# CDlAF_bow     : Blendermann wind coefficient
+# CDlAF_stern   : Blendermann wind coefficient
+# delta         : Blendermann wind coefficient
+# ============================
+[hull]
+B               = 25.4
+LWL             = 175.0
+CB              = 0.572
+T               = 9.5
+AL_air          = 3700
+AF_air          = 750
+total_wet_area  = 4927.6
+CDt             = 0.9
+CDlAF_bow       = 0.55
+CDlAF_stern     = 0.55
+delta           = 0.4
+
+# ============================
+# PROPULSION
+# D             : Screw diameter (m)
+# pitch         : Screw pitch (m) 5.4 used to be alright
+# AE_AO         : Blade-area ratio
+# nb_blades     : Blades per propellers
+# nb_propellers : Propellers per ship
+# max_n         : Maximum rotational speed (turns/sec)
+# min_pow       : Minimum propulsion power (MW)
+# max_pow       : Maximum propulsion power per propeller (MW)
+# wake_fraction : Water relative speed is slower on the stern than on the bow due to the hull wake. This is the fraction of relative speed reduced due to this effect, assumed constant.
+# ============================
+[propulsion]
+D               = 5.0
+min_pitch       = 3.96
+max_pitch       = 3.96
+AE_AO           = 0.62
+nb_blades       = 6
+nb_propellers   = 2
+max_n           = 2.05
+min_pow         = 0.0
+max_pow         = 3.0
+wake_fraction   = 0.16
+# ============================
+# BATTERY
+# capacity      : (MWh)
+# max_charge_pow: (MW)
+# max_discharge_pow: (MW)
+# discharge_eff : (/1)
+# charge_eff    : (/1)
+# leak          : (/1)
+# ============================
+[battery]
+capacity        = 3
+max_charge_pow  = 2.1
+max_discharge_pow= 2.1
+discharge_eff   = 0.95
+charge_eff      = 0.95
+leak            = 0.999958
+
+# ============================
+# SOLAR PANELS
+# area          : (m^2)
+# efficiency    : (/1)
+# ============================
+[solarPanels]
+area            = 1500
+efficiency      = 0.24
+
+# ============================
+# GENERATORS
+# min_power     : minimum generator output while on (MW)
+# max_power     : maximum generator output while on (MW)
+# fuel_*        : fuel consumption rate coefficients (kg/h) for
+#                 fuel_quadratic * power^2 + fuel_linear * power + fuel_intercept
+# startup_cost  : one-time startup cost ($)
+# shutdown_cost : one-time shutdown cost ($)
+# ============================
+[[generators]]
+name            = "Gen1"
+min_power       = 0.0
+max_power       = 2.8
+fuel_intercept  = 17.64196958
+fuel_linear     = 159.86844715
+fuel_quadratic  = 7.74852695
+startup_cost    = 100.0
+shutdown_cost   = 0.0
+
+[[generators]]
+name            = "Gen2"
+min_power       = 0.0
+max_power       = 2.8
+fuel_intercept  = 17.64196958
+fuel_linear     = 159.86844715
+fuel_quadratic  = 7.74852695
+startup_cost    = 100.0
+shutdown_cost   = 0.0

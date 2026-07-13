@@ -1,0 +1,9 @@
+[files]
+currents = "../../weather_data/2024_avr_jun/copernicus_marine_forecast.nc"
+atmo = "../../weather_data/2024_avr_jun/data_stream-oper_stepType-instant.nc"
+sun = "../../weather_data/2024_avr_jun/data_stream-oper_stepType-accum.nc"
+
+[variants.jun01.files]
+currents = "../../weather_data/2024_avr_jun/copernicus_marine_forecast.nc"
+atmo = "../../weather_data/2024_avr_jun/data_stream-oper_stepType-instant.nc"
+sun = "../../weather_data/2024_avr_jun/data_stream-oper_stepType-accum.nc"

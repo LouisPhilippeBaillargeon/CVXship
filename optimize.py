@@ -6,16 +6,41 @@ import atexit
 import csv
 import hashlib
 import json
+import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 from lib.load_params import load_config
 from lib.models import FitRange, PropulsionModel, BaseWindModel, WindModel1D, WindModelTransition1D, WindModel2D, WindModelPathAligned2D, GeneratorModel, CalmWaterModel, save_obj, load_obj
-from lib.plotting import plot_solutions, plot_sets_and_points
-from lib.optimizers import JPDSE, NaiveController, FPJSE, ShortestPath, WeatherRoutingToolPath, SavedPath, JPCSE, FR_O
-from lib.greedy import GreedyController
+from lib.plotting import normalize_plot_text_size, plot_solutions, plot_sets_and_points
+from lib.optimizers import (
+    FixedPathSpaceTimeSpeedEnergyOptimizer,
+    FixedPathTrajectoryIndexedSpeedEnergyOptimizer,
+    JointPathContinuousSpeedEnergyOptimizer,
+    JointPathDiscreteSpeedEnergyOptimizer,
+    ShortestPath,
+    ShortestPathConstantSpeedController,
+    WeatherRoutingToolPath,
+    SavedPath,
+)
+from lib.greedy import GreedyEnergyDispatchController
+from lib.optimizer_names import (
+    ALL_OPTIMIZERS,
+    FIPSE_ST,
+    FIPSE_TI,
+    GREEDY,
+    JOPSE_C_DEPARTURE,
+    JOPSE_C_TRANSITION,
+    JOPSE_D,
+    SELECTABLE_OPTIMIZER_IDS,
+    SPACS,
+    normalize_optimizer_id,
+    optimizer_choice_text,
+    optimizer_display_label,
+)
 from lib.utils import point_in_sets, dx_dy_km, classify_timesteps, _assert_finite
 from lib.evaluation import compute_non_convex_cost_all_timesteps_nc_interpolated
 from lib.weather_interpolation import build_transition_weather_inputs, prepare_nc_interp_source
@@ -25,48 +50,50 @@ from lib.experiment import (
     complete_run_results,
     create_run_context,
     load_case_cache_options,
+    load_case_fit_range_options,
     load_case_output_options,
     load_case_run_options,
+    load_case_scenarios,
     mark_failed_if_running,
     save_solution_record,
     solution_solver_status,
     update_manifest,
     write_run_summary_files,
 )
+from lib.paths import RESULTS
 
 new_weather = True
 new_ship = True
 dimensions = "both"  # "1D", "2D" or "both"
 solver_verbose = True
 unit_commitment = False
-run_jpcse_transit_wind = False
+run_jopse_c_transition_weather = False
 
-OPTIMIZER_ALL = "all"
-OPTIMIZER_CHOICES = (
-    "FR_O",
-    "FPJSE",
-    "JPDSE",
-    "JPCSE_departure_wind",
-    "JPCSE_transit_wind",
-)
-
-
-def _optimizer_lookup_key(value):
-    return "".join(ch for ch in str(value).lower() if ch.isalnum())
-
-
-OPTIMIZER_ALIASES = {
-    _optimizer_lookup_key(name): name
-    for name in OPTIMIZER_CHOICES
+FIT_RANGE_FACTOR_DEFAULTS = {
+    "lower_speed_factor": 0.85,
+    "upper_speed_factor": 1.1,
+    "lower_res_factor": 0.7,
+    "upper_res_factor": 1.2,
+    "lower_prop_factor": 0.7,
+    "upper_prop_factor": 1.2,
 }
-OPTIMIZER_ALIASES.update(
-    {
-        "all": OPTIMIZER_ALL,
-        "jpcse": "JPCSE_departure_wind",
-        "jpcsedeparture": "JPCSE_departure_wind",
-        "jpcsetransit": "JPCSE_transit_wind",
-    }
-)
+
+FIT_RANGE_FACTOR_ALIASES = {
+    "lower_speed_scaler": "lower_speed_factor",
+    "upper_speed_scaler": "upper_speed_factor",
+    "lower_res_scaler": "lower_res_factor",
+    "upper_res_scaler": "upper_res_factor",
+    "lower_resistance_factor": "lower_res_factor",
+    "upper_resistance_factor": "upper_res_factor",
+    "lower_resistance_scaler": "lower_res_factor",
+    "upper_resistance_scaler": "upper_res_factor",
+    "lower_prop_scaler": "lower_prop_factor",
+    "upper_prop_scaler": "upper_prop_factor",
+    "lower_prop_power_factor": "lower_prop_factor",
+    "upper_prop_power_factor": "upper_prop_factor",
+    "lower_prop_power_scaler": "lower_prop_factor",
+    "upper_prop_power_scaler": "upper_prop_factor",
+}
 
 FIT_ERROR_REPORT_COLUMNS = (
     "model",
@@ -76,6 +103,12 @@ FIT_ERROR_REPORT_COLUMNS = (
     "fit_subset",
     "min_fit_speed_mps",
     "max_fit_speed_mps",
+    "min_fit_resistance_mn",
+    "max_fit_resistance_mn",
+    "min_fit_prop_power_mw",
+    "max_fit_prop_power_mw",
+    "min_fitted_value",
+    "max_fitted_value",
     "worst_abs_error",
     "average_abs_error",
     "mean_abs_value",
@@ -89,19 +122,23 @@ def _normalize_optimizer_selection(value):
     if value in (None, ""):
         return None
 
-    key = _optimizer_lookup_key(value)
-    if key in OPTIMIZER_ALIASES:
-        optimizer = OPTIMIZER_ALIASES[key]
-        return None if optimizer == OPTIMIZER_ALL else optimizer
+    try:
+        optimizer = normalize_optimizer_id(
+            value,
+            allowed_ids=SELECTABLE_OPTIMIZER_IDS,
+            allow_all=True,
+        )
+    except ValueError as exc:
+        choices = optimizer_choice_text()
+        raise ValueError(f"optimizer must be one of: {choices}") from exc
 
-    choices = ", ".join(OPTIMIZER_CHOICES)
-    raise ValueError(f"optimizer must be one of: {choices}")
+    return None if optimizer == ALL_OPTIMIZERS else optimizer
 
 
 def _optimizer_arg(value):
     try:
-        if _optimizer_lookup_key(value) == "all":
-            return OPTIMIZER_ALL
+        if normalize_optimizer_id(value, allow_all=True) == ALL_OPTIMIZERS:
+            return ALL_OPTIMIZERS
         return _normalize_optimizer_selection(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
@@ -111,8 +148,10 @@ def _parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Run a CVXship optimization case and store configs/results in a run folder."
     )
-    parser.add_argument("--case", type=Path, required=True, help="Case directory containing ship/map/itinerary/weather TOMLs.")
+    parser.add_argument("--case", type=Path, default=None, help="Case directory containing ship/map/itinerary/weather TOMLs.")
+    parser.add_argument("--resume-batch", type=Path, default=None, help="Resume a previous scenario batch directory.")
     parser.add_argument("--name", help="Optional run name used in the result folder.")
+    parser.add_argument("--variant", help="Scenario or weather variant name to run.")
     parser.add_argument("--dimensions", choices=["1D", "2D", "both"], default=None)
     parser.add_argument("--new-ship", dest="new_ship", action="store_true", default=None)
     parser.add_argument("--reuse-ship", dest="new_ship", action="store_false")
@@ -128,7 +167,10 @@ def _parse_args(argv=None):
         dest="optimizer",
         type=_optimizer_arg,
         default=None,
-        help="Run one optimizer after shared baselines/preflight. Use 'all' to run the default set.",
+        help=(
+            "Run one optimizer after shared baselines/preflight. "
+            f"Choices: {optimizer_choice_text()}."
+        ),
     )
     parser.add_argument("--path-generator", choices=["shortest", "wrt", "saved"], default=None)
     parser.add_argument("--path-solution-json", type=Path, default=None)
@@ -145,11 +187,26 @@ def _parse_args(argv=None):
     parser.add_argument("--save-plots", dest="save_plots", action="store_true")
     parser.add_argument("--no-show-plots", dest="show_plots", action="store_false", default=None)
     parser.add_argument("--show-plots", dest="show_plots", action="store_true")
+    parser.add_argument(
+        "--BIG",
+        dest="plot_text_size",
+        action="store_const",
+        const="big",
+        default=None,
+        help="Use the previous presentation-sized plot text instead of IEEE-sized text.",
+    )
     parser.add_argument("--no-save-solutions", dest="save_solutions", action="store_false", default=None)
     parser.add_argument("--save-solutions", dest="save_solutions", action="store_true")
     parser.add_argument("--no-console-log", dest="save_console_log", action="store_false", default=None)
     parser.add_argument("--console-log", dest="save_console_log", action="store_true")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.resume_batch is None and args.case is None:
+        parser.error("--case is required unless --resume-batch is used.")
+    if args.resume_batch is not None and args.case is not None:
+        parser.error("--resume-batch cannot be combined with --case.")
+    if args.resume_batch is not None and args.variant is not None:
+        parser.error("--resume-batch cannot be combined with --variant.")
+    return args
 
 
 def _option(cli_value, toml_options, key, default):
@@ -165,6 +222,38 @@ def _run_bool_option(toml_options, keys, default):
         if key in toml_options:
             return bool(toml_options[key])
     return bool(default)
+
+
+def _fit_range_factor_options(toml_options):
+    factors = dict(FIT_RANGE_FACTOR_DEFAULTS)
+    seen = {}
+
+    for raw_key, raw_value in dict(toml_options or {}).items():
+        key = FIT_RANGE_FACTOR_ALIASES.get(raw_key, raw_key)
+        if key not in FIT_RANGE_FACTOR_DEFAULTS:
+            allowed = ", ".join(sorted(FIT_RANGE_FACTOR_DEFAULTS))
+            raise ValueError(f"Unknown [fit_range] option {raw_key!r}. Use one of: {allowed}.")
+        if key in seen:
+            raise ValueError(
+                f"Duplicate [fit_range] option for {key!r}: "
+                f"{seen[key]!r} and {raw_key!r}."
+            )
+
+        try:
+            factor = float(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"[fit_range].{raw_key} must be numeric, got {raw_value!r}.") from exc
+        if not np.isfinite(factor):
+            raise ValueError(f"[fit_range].{raw_key} must be finite, got {raw_value!r}.")
+        if factor < 0.0:
+            raise ValueError(f"[fit_range].{raw_key} must be nonnegative, got {factor}.")
+        if key.startswith("upper_") and factor <= 0.0:
+            raise ValueError(f"[fit_range].{raw_key} must be greater than zero, got {factor}.")
+
+        factors[key] = factor
+        seen[key] = raw_key
+
+    return factors
 
 
 def _path_option(value, base_dir=None):
@@ -185,6 +274,11 @@ def _failed_optimizer_summary(optimizer, first_stage_optimizer):
     return SimpleNamespace(
         estimated_cost=None,
         solve_time=getattr(optimizer, "solve_time", None),
+        zone_membership_binary_count=getattr(
+            optimizer,
+            "zone_membership_binary_count",
+            None,
+        ),
         first_stage_optimizer=first_stage_optimizer,
         is_valid=False,
         solver_status=solver_status or "",
@@ -241,19 +335,33 @@ def _row_float_label(row, key, *, width=None, suffix=""):
     return f"{text:>{width}s}"
 
 
+def _row_int_label(row, key, *, width=None):
+    value = _row_value(row, key, None)
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        text = "n/a"
+    else:
+        text = str(number)
+    if width is None:
+        return text
+    return f"{text:>{width}s}"
+
+
 def _format_result_table(summary_rows):
     rows = list(summary_rows or [])
     if not rows:
         return ["[RESULTS] No solution summaries were written."]
 
+    header = (
+        f"{'solution':<36s} {'cost':>14s} {'solve_s':>10s} "
+        f"{'zone_bins':>9s} {'valid':>8s} {'solver':>18s} "
+        f"{'warns':>7s} {'errors':>7s}"
+    )
     lines = [
         "[RESULTS] Run result table",
-        (
-            f"{'solution':<36s} {'cost':>14s} {'solve_s':>10s} "
-            f"{'valid':>8s} {'solver':>18s} "
-            f"{'warns':>7s} {'errors':>7s}"
-        ),
-        "-" * 107,
+        header,
+        "-" * len(header),
     ]
     for row in rows:
         label = str(_row_value(row, "label", _row_value(row, "key", "")))[:36]
@@ -272,6 +380,7 @@ def _format_result_table(summary_rows):
             f"{label:<36s} "
             f"{_row_float_label(row, 'estimated_cost', width=14)} "
             f"{_row_float_label(row, 'solve_time', width=10)} "
+            f"{_row_int_label(row, 'zone_membership_binary_count', width=9)} "
             f"{validity:>8s} "
             f"{solver_status:>18s} "
             f"{warning_text:>7s} "
@@ -469,11 +578,309 @@ def _write_fit_error_report(run_context, model_records):
     return report_path
 
 
+def _batch_slug(value):
+    text = str(value or "batch").strip().lower()
+    out = []
+    for ch in text:
+        out.append(ch if ch.isalnum() or ch in "._-" else "_")
+    text = "".join(out).strip("._-")
+    return text or "batch"
+
+
+def _selected_scenarios(case_dir, variant):
+    scenarios = load_case_scenarios(
+        case_dir,
+        apply_run_filter=variant in (None, ""),
+    )
+    if variant in (None, ""):
+        return scenarios
+
+    variant = str(variant)
+    if not scenarios:
+        return [{"name": variant, "weather_variant": variant}]
+
+    exact = [scenario for scenario in scenarios if str(scenario.get("name")) == variant]
+    if exact:
+        return [dict(exact[0])]
+
+    by_weather = [
+        scenario
+        for scenario in scenarios
+        if str(scenario.get("weather_variant", scenario.get("name"))) == variant
+    ]
+    if len(by_weather) == 1:
+        return [dict(by_weather[0])]
+    if len(by_weather) > 1:
+        names = ", ".join(str(s["name"]) for s in by_weather)
+        raise ValueError(
+            f"--variant {variant!r} matches multiple scenarios by weather_variant: {names}. "
+            "Use the scenario name instead."
+        )
+
+    available = ", ".join(str(s["name"]) for s in scenarios)
+    raise ValueError(f"Unknown scenario variant {variant!r}. Available scenarios: {available}.")
+
+
+def _active_weather_variant(active_scenario, cli_variant):
+    if active_scenario is not None:
+        return active_scenario.get("weather_variant") or active_scenario.get("name")
+    if cli_variant not in (None, ""):
+        return str(cli_variant)
+    return None
+
+
+def _resolve_optimizer_plan(args, run_toml_options):
+    resolved_dimensions = str(_option(args.dimensions, run_toml_options, "dimensions", dimensions))
+    if resolved_dimensions not in {"1D", "2D", "both"}:
+        raise ValueError("dimensions must be one of: 1D, 2D, both")
+
+    selected_optimizer = _normalize_optimizer_selection(
+        _option(args.optimizer, run_toml_options, "optimizer", None)
+    )
+    transition_weather = _run_bool_option(
+        run_toml_options,
+        ("run_jopse_c_transition_weather", "run_jpcse_transit_wind"),
+        run_jopse_c_transition_weather,
+    )
+    if selected_optimizer is not None:
+        if selected_optimizer in {FIPSE_TI, FIPSE_ST}:
+            resolved_dimensions = "1D"
+        elif selected_optimizer == JOPSE_D:
+            resolved_dimensions = "2D"
+        else:
+            resolved_dimensions = "both"
+        transition_weather = selected_optimizer == JOPSE_C_TRANSITION
+
+    return selected_optimizer, resolved_dimensions, transition_weather
+
+
+def _expected_optimizer_keys(args, run_toml_options):
+    selected_optimizer, resolved_dimensions, transition_weather = _resolve_optimizer_plan(
+        args,
+        run_toml_options,
+    )
+    keys = [SPACS, GREEDY, FIPSE_TI]
+    if selected_optimizer is not None:
+        if selected_optimizer not in keys:
+            keys.append(selected_optimizer)
+        return keys
+
+    if resolved_dimensions in ("1D", "both"):
+        keys.append(FIPSE_ST)
+    if resolved_dimensions in ("2D", "both"):
+        keys.append(JOPSE_D)
+    if resolved_dimensions == "both":
+        if transition_weather:
+            keys.append(JOPSE_C_TRANSITION)
+        keys.append(JOPSE_C_DEPARTURE)
+    return keys
+
+
+def _summary_rows_from_csv(path):
+    if not path.exists():
+        return []
+    with path.open("r", newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def _completed_keys_for_run(run_dir):
+    return {
+        str(row.get("key") or "")
+        for row in _summary_rows_from_csv(Path(run_dir) / "summary.csv")
+        if row.get("key")
+    }
+
+
+def _read_json(path):
+    with Path(path).open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _write_json(path, payload):
+    with Path(path).open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, default=str)
+        f.write("\n")
+
+
+def _update_batch_scenario(manifest_path, scenario_name, updates):
+    manifest_path = Path(manifest_path)
+    manifest = _read_json(manifest_path)
+    scenarios = manifest.setdefault("scenarios", {})
+    record = scenarios.setdefault(str(scenario_name), {"name": str(scenario_name)})
+    record.update(updates)
+    _write_json(manifest_path, manifest)
+
+
+def _unique_batch_dir(name):
+    base = RESULTS / "batches"
+    base.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    slug = _batch_slug(name)
+    candidate = base / f"{timestamp}_{slug}"
+    i = 2
+    while candidate.exists():
+        candidate = base / f"{timestamp}_{slug}_{i}"
+        i += 1
+    candidate.mkdir(parents=True)
+    return candidate
+
+
+def _child_args_for_variant(original_args, variant):
+    args = list(original_args)
+    if "--variant" not in args:
+        args.extend(["--variant", str(variant)])
+    return args
+
+
+def _run_child(args, *, manifest_path, scenario_name, resume_run_dir=None):
+    env = os.environ.copy()
+    env["CVXSHIP_SINGLE_RUN"] = "1"
+    env["CVXSHIP_BATCH_MANIFEST"] = str(manifest_path)
+    env["CVXSHIP_BATCH_SCENARIO"] = str(scenario_name)
+    if resume_run_dir is not None:
+        env["CVXSHIP_RESUME_RUN_DIR"] = str(resume_run_dir)
+
+    cmd = [sys.executable, str(Path(__file__).resolve()), *args]
+    return subprocess.run(cmd, cwd=Path(__file__).resolve().parent, env=env).returncode
+
+
+def _batch_record_is_complete(record):
+    expected = set(record.get("expected_optimizers") or [])
+    run_dir = record.get("run_dir")
+    if not expected or not run_dir:
+        return record.get("status") == "completed"
+    completed = _completed_keys_for_run(run_dir)
+    return expected.issubset(completed)
+
+
+def _run_case_batch(args, scenarios):
+    run_toml_options = load_case_run_options(args.case)
+    expected = _expected_optimizer_keys(args, run_toml_options)
+    batch_dir = _unique_batch_dir(args.name or Path(args.case).name)
+    manifest_path = batch_dir / "manifest.json"
+    original_args = list(sys.argv[1:])
+    scenario_records = {}
+    for scenario in scenarios:
+        name = str(scenario["name"])
+        scenario_records[name] = {
+            "name": name,
+            "status": "pending",
+            "scenario": scenario,
+            "weather_variant": scenario.get("weather_variant", name),
+            "expected_optimizers": expected,
+        }
+
+    _write_json(
+        manifest_path,
+        {
+            "schema": 1,
+            "status": "running",
+            "case_dir": str(Path(args.case).resolve()),
+            "original_args": original_args,
+            "scenario_order": [str(s["name"]) for s in scenarios],
+            "scenarios": scenario_records,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        },
+    )
+
+    log.progress("[BATCH] Starting scenario batch: %s", batch_dir)
+    failures = 0
+    for scenario in scenarios:
+        name = str(scenario["name"])
+        _update_batch_scenario(manifest_path, name, {"status": "running"})
+        child_args = _child_args_for_variant(original_args, name)
+        code = _run_child(child_args, manifest_path=manifest_path, scenario_name=name)
+        record = _read_json(manifest_path)["scenarios"][name]
+        if code == 0 and _batch_record_is_complete(record):
+            _update_batch_scenario(manifest_path, name, {"status": "completed"})
+            log.progress("[BATCH] Completed scenario %s", name)
+        else:
+            failures += 1
+            _update_batch_scenario(
+                manifest_path,
+                name,
+                {"status": "failed", "returncode": code},
+            )
+            log.error("[BATCH] Scenario %s failed with return code %s", name, code)
+
+    manifest = _read_json(manifest_path)
+    manifest["status"] = "failed" if failures else "completed"
+    manifest["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    _write_json(manifest_path, manifest)
+    log.progress("[BATCH] Batch manifest: %s", manifest_path)
+    return 1 if failures else 0
+
+
+def _resume_batch(batch_path):
+    batch_path = Path(batch_path).resolve()
+    manifest_path = batch_path / "manifest.json" if batch_path.is_dir() else batch_path
+    manifest = _read_json(manifest_path)
+    original_args = list(manifest.get("original_args") or [])
+    scenario_order = list(manifest.get("scenario_order") or manifest.get("scenarios", {}).keys())
+    scenarios = manifest.get("scenarios", {})
+
+    log.progress("[BATCH] Resuming scenario batch: %s", manifest_path.parent)
+    failures = 0
+    for name in scenario_order:
+        record = scenarios[str(name)]
+        if _batch_record_is_complete(record):
+            _update_batch_scenario(manifest_path, name, {"status": "completed"})
+            log.progress("[BATCH] Skipping completed scenario %s", name)
+            continue
+
+        run_dir = record.get("run_dir")
+        _update_batch_scenario(manifest_path, name, {"status": "running"})
+        child_args = _child_args_for_variant(original_args, name)
+        code = _run_child(
+            child_args,
+            manifest_path=manifest_path,
+            scenario_name=name,
+            resume_run_dir=run_dir if run_dir else None,
+        )
+        updated = _read_json(manifest_path)["scenarios"][str(name)]
+        if code == 0 and _batch_record_is_complete(updated):
+            _update_batch_scenario(manifest_path, name, {"status": "completed"})
+            log.progress("[BATCH] Completed scenario %s", name)
+        else:
+            failures += 1
+            _update_batch_scenario(
+                manifest_path,
+                name,
+                {"status": "failed", "returncode": code},
+            )
+            log.error("[BATCH] Scenario %s failed with return code %s", name, code)
+
+    manifest = _read_json(manifest_path)
+    all_completed = all(
+        _batch_record_is_complete(record)
+        for record in manifest.get("scenarios", {}).values()
+    )
+    manifest["status"] = "completed" if all_completed and not failures else "failed"
+    manifest["resumed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    _write_json(manifest_path, manifest)
+    return 1 if failures else 0
+
+
 if __name__ == "__main__":
     args = _parse_args()
+    if args.resume_batch is not None:
+        sys.exit(_resume_batch(args.resume_batch))
+
+    selected_scenarios = _selected_scenarios(args.case, args.variant)
+    if (
+        len(selected_scenarios) > 1
+        and os.environ.get("CVXSHIP_SINGLE_RUN") != "1"
+    ):
+        sys.exit(_run_case_batch(args, selected_scenarios))
+
+    active_scenario = selected_scenarios[0] if selected_scenarios else None
+    active_weather_variant = _active_weather_variant(active_scenario, args.variant)
+    resume_run_dir = os.environ.get("CVXSHIP_RESUME_RUN_DIR")
+
     run_toml_options = load_case_run_options(args.case)
     output_toml_options = load_case_output_options(args.case)
     cache_toml_options = load_case_cache_options(args.case)
+    fit_range_toml_options = load_case_fit_range_options(args.case)
 
     new_weather = bool(_option(args.new_weather, run_toml_options, "new_weather", new_weather))
     new_ship = bool(_option(args.new_ship, run_toml_options, "new_ship", new_ship))
@@ -485,19 +892,19 @@ if __name__ == "__main__":
     )
     solver_verbose = bool(_option(args.solver_verbose, run_toml_options, "solver_verbose", solver_verbose))
     unit_commitment = bool(_option(args.unit_commitment, run_toml_options, "unit_commitment", unit_commitment))
-    run_jpcse_transit_wind = _run_bool_option(
+    run_jopse_c_transition_weather = _run_bool_option(
         run_toml_options,
-        ("run_jpcse_transit_wind",),
-        run_jpcse_transit_wind,
+        ("run_jopse_c_transition_weather", "run_jpcse_transit_wind"),
+        run_jopse_c_transition_weather,
     )
     if selected_optimizer is not None:
-        if selected_optimizer in {"FR_O", "FPJSE"}:
+        if selected_optimizer in {FIPSE_TI, FIPSE_ST}:
             dimensions = "1D"
-        elif selected_optimizer == "JPDSE":
+        elif selected_optimizer == JOPSE_D:
             dimensions = "2D"
         else:
             dimensions = "both"
-        run_jpcse_transit_wind = selected_optimizer == "JPCSE_transit_wind"
+        run_jopse_c_transition_weather = selected_optimizer == JOPSE_C_TRANSITION
     ordered_sets = _run_bool_option(
         run_toml_options,
         ("ordered_sets",),
@@ -560,20 +967,27 @@ if __name__ == "__main__":
         raise ValueError("path_generator='saved' requires --path-solution-json or [run].path_solution_json.")
     save_plots = bool(_option(args.save_plots, output_toml_options, "save_plots", True))
     show_plots = bool(_option(args.show_plots, output_toml_options, "show_plots", False))
+    plot_text_size = normalize_plot_text_size(
+        _option(args.plot_text_size, output_toml_options, "plot_text_size", "default")
+    )
     save_solutions = bool(_option(args.save_solutions, output_toml_options, "save_solutions", True))
     save_console_log = bool(_option(args.save_console_log, output_toml_options, "save_console_log", True))
     cache_scope = str(_option(args.cache_scope, cache_toml_options, "scope", "case"))
+    fit_range_factors = _fit_range_factor_options(fit_range_toml_options)
 
     run_options = {
         "case": args.case,
         "name": args.name,
+        "variant": args.variant,
+        "scenario": active_scenario,
+        "weather_variant": active_weather_variant,
         "dimensions": dimensions,
         "new_ship": new_ship,
         "new_weather": new_weather,
         "solver_verbose": solver_verbose,
         "unit_commitment": unit_commitment,
         "optimizer": selected_optimizer,
-        "run_jpcse_transit_wind": run_jpcse_transit_wind,
+        "run_jopse_c_transition_weather": run_jopse_c_transition_weather,
         "ordered_sets": ordered_sets,
         "path_generator": path_generator,
         "path_solution_json": str(path_solution_json) if path_solution_json is not None else None,
@@ -586,16 +1000,37 @@ if __name__ == "__main__":
         "wrt_use_depth_constraint": wrt_use_depth_constraint,
         "save_plots": save_plots,
         "show_plots": show_plots,
+        "plot_text_size": plot_text_size,
         "save_solutions": save_solutions,
         "save_console_log": save_console_log,
         "cache_scope": cache_scope,
+        "fit_range_factors": fit_range_factors,
+        "resume_run_dir": str(resume_run_dir) if resume_run_dir is not None else None,
     }
     run_context = create_run_context(
         case_dir=args.case,
         run_name=args.name,
         options=run_options,
         cache_scope=cache_scope,
+        scenario=active_scenario,
+        weather_variant=active_weather_variant,
+        resume_run_dir=resume_run_dir,
     )
+    batch_manifest_path = os.environ.get("CVXSHIP_BATCH_MANIFEST")
+    batch_scenario_name = os.environ.get("CVXSHIP_BATCH_SCENARIO")
+    if batch_manifest_path and batch_scenario_name:
+        _update_batch_scenario(
+            batch_manifest_path,
+            batch_scenario_name,
+            {
+                "status": "running",
+                "run_id": run_context.run_id,
+                "run_dir": str(run_context.run_dir),
+                "scenario": active_scenario,
+                "weather_variant": active_weather_variant,
+                "expected_optimizers": _expected_optimizer_keys(args, run_toml_options),
+            },
+        )
     atexit.register(mark_failed_if_running, run_context)
     log.configure_run_logging(
         debug_log_path=run_context.debug_log_path,
@@ -611,7 +1046,7 @@ if __name__ == "__main__":
     log.progress("[RUN] cache=%s", run_context.cache_dir)
 
     WIND_MODEL_1D = run_context.cache_path("wind_model_1d")
-    if run_jpcse_transit_wind:
+    if run_jopse_c_transition_weather:
         WIND_MODEL_TRANSITION_1D = run_context.cache_path("wind_model_transition_1d")
     WIND_MODEL_2D = run_context.cache_path("wind_model_2d")
     WIND_MODEL_PATH_ALIGNED_2D = run_context.cache_path("wind_model_path_aligned_2d")
@@ -623,6 +1058,7 @@ if __name__ == "__main__":
             return None
         plot_kwargs["output_root"] = run_context.plots_dir
         plot_kwargs.setdefault("show", show_plots)
+        plot_kwargs.setdefault("text_size", plot_text_size)
         return plot_solutions(*plot_args, **plot_kwargs)
 
     def maybe_plot_sets_and_points(*plot_args, **plot_kwargs):
@@ -630,6 +1066,7 @@ if __name__ == "__main__":
             return None
         plot_kwargs["output_root"] = run_context.plots_dir
         plot_kwargs.setdefault("show", show_plots)
+        plot_kwargs.setdefault("text_size", plot_text_size)
         return plot_sets_and_points(*plot_args, **plot_kwargs)
 
     fit_plots_dir = run_context.plots_dir / "fits"
@@ -644,6 +1081,7 @@ if __name__ == "__main__":
             show=show_plots,
             directory=fit_plots_dir,
             filename=filename,
+            text_size=plot_text_size,
         )
 
     all_solution_comparison_dir = "all_sol_compared"
@@ -652,14 +1090,35 @@ if __name__ == "__main__":
         return f"relaxation_quality/{optimizer_name}"
 
     solution_records = []
-    summary_rows = []
+    resume_mode = resume_run_dir is not None
+    summary_rows = (
+        _summary_rows_from_csv(run_context.run_dir / "summary.csv")
+        if resume_mode
+        else []
+    )
+    completed_solution_keys = {
+        str(row.get("key") or "")
+        for row in summary_rows
+        if row.get("key")
+    }
+    if summary_rows:
+        log.progress(
+            "[RUN] Loaded %d existing solution summary rows for resume",
+            len(summary_rows),
+        )
 
     def should_run_optimizer(optimizer_name):
         return selected_optimizer is None or selected_optimizer == optimizer_name
 
+    def optimizer_is_done(optimizer_name):
+        return resume_mode and optimizer_name in completed_solution_keys
+
     def save_evaluated_solutions(*records):
         new_rows = []
         for key, label, sol in records:
+            if optimizer_is_done(key):
+                log.progress("[RUN] Skipping saved %s result already present in summary", label)
+                continue
             row = save_solution_record(
                 run_context,
                 key,
@@ -671,6 +1130,7 @@ if __name__ == "__main__":
                 continue
             solution_records.append((key, label, sol))
             summary_rows.append(row)
+            completed_solution_keys.add(key)
             new_rows.append(row)
 
         if new_rows:
@@ -689,6 +1149,7 @@ if __name__ == "__main__":
     map, itinerary, states, ship, weather = load_config(
         case_dir=run_context.case_dir,
         weather_files=run_context.weather_files,
+        scenario=active_scenario,
     )
     log.progress("[RUN] Preparing weather interpolation")
     nc_sources = prepare_nc_interp_source(
@@ -787,10 +1248,18 @@ if __name__ == "__main__":
     )
 
     # ============================================================
-    # 2) Compute naive
+    # 2) Compute SPaCS baseline
     # ============================================================
-    log.progress("[RUN] Starting naive controller baseline")
-    naive = NaiveController(
+    spacs_label = optimizer_display_label(SPACS)
+    greedy_label = optimizer_display_label(GREEDY)
+    fipse_ti_label = optimizer_display_label(FIPSE_TI)
+    fipse_st_label = optimizer_display_label(FIPSE_ST)
+    jopse_d_label = optimizer_display_label(JOPSE_D)
+    jopse_c_departure_label = optimizer_display_label(JOPSE_C_DEPARTURE)
+    jopse_c_transition_label = optimizer_display_label(JOPSE_C_TRANSITION)
+
+    log.progress("[RUN] Starting %s baseline", spacs_label)
+    spacs = ShortestPathConstantSpeedController(
         map=map,
         itinerary=itinerary,
         states=states,
@@ -799,31 +1268,32 @@ if __name__ == "__main__":
         path_sol=path.sol,
         course_angles=course_angles,
     )
-    naive.compute()
-    naive.wind_model = base_wind_model
-    naive.propulsion_model = propulsion_model_initial
-    naive.generator_models = generatorModels
-    naive.calm_model = calm_model_initial
+    spacs.compute()
+    spacs.wind_model = base_wind_model
+    spacs.propulsion_model = propulsion_model_initial
+    spacs.generator_models = generatorModels
+    spacs.calm_model = calm_model_initial
 
-    _, naive_fit_sol, _, _ = compute_non_convex_cost_all_timesteps_nc_interpolated(
-        naive,
+    _, spacs_fit_sol, _, _ = compute_non_convex_cost_all_timesteps_nc_interpolated(
+        spacs,
         verbose=solver_verbose,
         nc_sources=nc_sources,
     )
+    if not getattr(spacs_fit_sol, "is_valid", True):
+        validation_errors = getattr(spacs_fit_sol, "validation_errors", {}) or {}
+        raise RuntimeError(
+            f"{spacs_label} evaluated solution is invalid; refusing to build fit range. "
+            f"validation_errors={validation_errors}"
+        )
     # ============================================================
-    # 3) Build real fit range from evaluated naive
+    # 3) Build real fit range from evaluated SPaCS
     # ============================================================
     fit_range = FitRange.from_solution(
-        naive_fit_sol,
+        spacs_fit_sol,
         ship=ship,
-        lower_speed_factor = 0.85,
-        upper_speed_factor = 1.1,
-        lower_res_factor = 0.7,
-        upper_res_factor = 1.2,
-        lower_prop_factor = 0.7,
-        upper_prop_factor = 1.2,
+        **fit_range_factors,
     )
-    log.debug("Fit range from evaluated naive: %s", fit_range)
+    log.debug("Fit range from evaluated %s: %s", spacs_label, fit_range)
     cache_case_inputs = _case_input_fingerprint(run_context)
     cache_weather_files = _weather_file_fingerprint(run_context)
     calm_model_metadata = _cache_metadata(
@@ -866,7 +1336,7 @@ if __name__ == "__main__":
         ordered_sets=True,
         fit_plot_diagnostics_schema=1,
     )
-    if run_jpcse_transit_wind:
+    if run_jopse_c_transition_weather:
         wind_model_transition_1d_metadata = _cache_metadata(
             run_context,
             fit_range,
@@ -909,6 +1379,7 @@ if __name__ == "__main__":
             fit_if_needed=True,
             show=show_plots,
             output_root=fit_plots_dir,
+            text_size=plot_text_size,
             file_format="pdf",
             pad_inches=0.02,
         )
@@ -916,6 +1387,7 @@ if __name__ == "__main__":
             propulsion_model.plot_power_fit_heatmaps_pdf(
                 show=show_plots,
                 directory=fit_plots_dir,
+                text_size=plot_text_size,
             )
         except ValueError as exc:
             log.debug("Skipping propulsion power fit PDF: %s", exc)
@@ -923,6 +1395,7 @@ if __name__ == "__main__":
             propulsion_model.plot_feasibility_classification_pdf(
                 show=show_plots,
                 directory=fit_plots_dir,
+                text_size=plot_text_size,
             )
         except ValueError as exc:
             log.debug("Skipping propulsion feasibility classification PDF: %s", exc)
@@ -940,10 +1413,10 @@ if __name__ == "__main__":
             )
             save_obj(WIND_MODEL_1D, wind_model_1D, metadata=wind_model_1d_metadata)
 
-        naive.wind_model = base_wind_model
-        naive.propulsion_model = propulsion_model
-        naive.generator_models = generatorModels
-        naive.calm_model = calm_model
+        spacs.wind_model = base_wind_model
+        spacs.propulsion_model = propulsion_model
+        spacs.generator_models = generatorModels
+        spacs.calm_model = calm_model
 
         if dimensions == "2D" or dimensions == "both":
             if ordered_sets:
@@ -968,7 +1441,7 @@ if __name__ == "__main__":
                 )
                 save_obj(WIND_MODEL_2D, set_wind_model_2D, metadata=wind_model_2d_metadata)
 
-        if dimensions == "both" and run_jpcse_transit_wind:
+        if dimensions == "both" and run_jopse_c_transition_weather:
             transition_weather = build_transition_weather_inputs(
                 nc_sources,
                 map,
@@ -1009,7 +1482,7 @@ if __name__ == "__main__":
                 )
             else:
                 set_wind_model_2D = load_obj(WIND_MODEL_2D, expected_metadata=wind_model_2d_metadata)
-        if dimensions == "both" and run_jpcse_transit_wind:
+        if dimensions == "both" and run_jopse_c_transition_weather:
             wind_model_transition_1D = load_obj(
                 WIND_MODEL_TRANSITION_1D,
                 expected_metadata=wind_model_transition_1d_metadata,
@@ -1043,7 +1516,7 @@ if __name__ == "__main__":
             f"wind_fit_best_abs_error_{wind_fit_suffix}",
         )
 
-    if dimensions == "both" and run_jpcse_transit_wind:
+    if dimensions == "both" and run_jopse_c_transition_weather:
         maybe_plot_wind_fit(
             wind_model_transition_1D,
             "worst",
@@ -1067,14 +1540,14 @@ if __name__ == "__main__":
                 set_wind_model_2D,
             )
         )
-    if dimensions == "both" and run_jpcse_transit_wind:
+    if dimensions == "both" and run_jopse_c_transition_weather:
         fit_report_models.append(("WindModelTransition1D", wind_model_transition_1D))
     _write_fit_error_report(run_context, fit_report_models)
 
-    naive.wind_model = base_wind_model
-    naive.propulsion_model = propulsion_model
-    naive.generator_models = generatorModels
-    naive.calm_model = calm_model
+    spacs.wind_model = base_wind_model
+    spacs.propulsion_model = propulsion_model
+    spacs.generator_models = generatorModels
+    spacs.calm_model = calm_model
 
     if path.sol is None:
         raise RuntimeError(f"{path_generator} path generator did not produce a solution.")
@@ -1101,100 +1574,119 @@ if __name__ == "__main__":
         )
         return result
 
-    _, naive_eval_sol, _, _ = evaluate_solution(
-        naive,
-        "Naive Controller",
-    )
-    save_evaluated_solutions(
-        ("naive", "Naive Controller", naive_eval_sol),
-    )
+    if optimizer_is_done(SPACS):
+        log.progress("[RUN] Skipping %s evaluated result already present in summary", spacs_label)
+    else:
+        _, spacs_eval_sol, _, _ = evaluate_solution(
+            spacs,
+            spacs_label,
+        )
+        save_evaluated_solutions(
+            (SPACS, spacs_label, spacs_eval_sol),
+        )
 
-    maybe_plot_solutions(
-        [naive.sol, naive_eval_sol],
-        ["Naive estimated solution", "Naive evaluated solution"],
-        benchmark_label="Naive evaluated solution",
-        show=False,
-        subfolder=relaxation_quality_dir("naive"),
-        map=naive.map,
-    )
+        maybe_plot_solutions(
+            [spacs.sol, spacs_eval_sol],
+            [f"{spacs_label} estimated solution", f"{spacs_label} evaluated solution"],
+            benchmark_label=f"{spacs_label} evaluated solution",
+            show=False,
+            subfolder=relaxation_quality_dir(SPACS),
+            map=spacs.map,
+        )
 
-    greedy = GreedyController(
-        map=map,
-        itinerary=itinerary,
-        states=states,
-        weather=weather,
-        ship=ship,
-        path_sol=path.sol,
-        course_angles=course_angles,
-    )
-    greedy.wind_model = base_wind_model
-    greedy.propulsion_model = propulsion_model
-    greedy.generator_models = generatorModels
-    greedy.calm_model = calm_model
-    greedy.nc_sources = nc_sources
-    log.progress("[RUN] Starting greedy controller benchmark")
-    greedy.compute()
-    save_evaluated_solutions(
-        ("greedy", "Greedy Controller", greedy.sol),
-    )
-    maybe_plot_solutions(
-        [naive_eval_sol, greedy.sol],
-        ["Naive evaluated solution", "Greedy Controller"],
-        benchmark_label="Naive evaluated solution",
-        show=False,
-        subfolder=relaxation_quality_dir("greedy"),
-        map=map,
-    )
+    if optimizer_is_done(GREEDY):
+        log.progress("[RUN] Skipping %s result already present in summary", greedy_label)
+    else:
+        greedy = GreedyEnergyDispatchController(
+            map=map,
+            itinerary=itinerary,
+            states=states,
+            weather=weather,
+            ship=ship,
+            path_sol=path.sol,
+            course_angles=course_angles,
+        )
+        greedy.wind_model = base_wind_model
+        greedy.propulsion_model = propulsion_model
+        greedy.generator_models = generatorModels
+        greedy.calm_model = calm_model
+        greedy.nc_sources = nc_sources
+        log.progress("[RUN] Starting %s benchmark", greedy_label)
+        greedy.compute()
+        _, greedy_eval_sol, _, _ = evaluate_solution(
+            greedy,
+            greedy_label,
+        )
+        save_evaluated_solutions(
+            (GREEDY, greedy_label, greedy_eval_sol),
+        )
+        maybe_plot_solutions(
+            [greedy.sol, greedy_eval_sol],
+            [f"{greedy_label} direct dispatch", f"{greedy_label} evaluated solution"],
+            benchmark_label=f"{greedy_label} evaluated solution",
+            show=False,
+            subfolder=relaxation_quality_dir(GREEDY),
+            map=map,
+        )
 
     # ============================================================
-    # FR_O continuous fixed-path preflight.
+    # FiPSE-TI continuous fixed-path preflight.
     # Run before any binary formulation so fixed-path issues fail fast.
     # ============================================================
-    fr_o_runner = FR_O(
-        wind_model=wind_model_1D,
-        propulsion_model=propulsion_model,
-        calm_model=calm_model,
-        generator_models=generatorModels,
-        map=map,
-        itinerary=itinerary,
-        states=states,
-        weather=weather,
-        ship=ship,
-        ref_speed=ref_speed,
-        waypoints=path.sol.waypoints,
-        path_set_ids=path.sol.set_sequence,
-    )
-    fr_o_runner.nc_sources = nc_sources
-    log.progress("[RUN] Starting FR_O preflight optimization")
-    fr_o_ok = fr_o_runner.optimize(
-        unit_commitment=False,
-        verbose=solver_verbose,
-    )
-    if not fr_o_ok:
-        log.error(
-            "[ABORT] FR_O preflight failed before binary optimizers could run; "
-            f"reason={getattr(fr_o_runner, 'failure_reason', 'unknown')}."
+    if optimizer_is_done(FIPSE_TI):
+        log.progress("[RUN] Skipping %s result already present in summary", fipse_ti_label)
+    else:
+        fipse_ti_runner = FixedPathTrajectoryIndexedSpeedEnergyOptimizer(
+            wind_model=wind_model_1D,
+            propulsion_model=propulsion_model,
+            calm_model=calm_model,
+            generator_models=generatorModels,
+            map=map,
+            itinerary=itinerary,
+            states=states,
+            weather=weather,
+            ship=ship,
+            ref_speed=ref_speed,
+            waypoints=path.sol.waypoints,
+            path_set_ids=path.sol.set_sequence,
         )
-        sys.exit(1)
+        fipse_ti_runner.nc_sources = nc_sources
+        log.progress("[RUN] Starting %s preflight optimization", fipse_ti_label)
+        fipse_ti_ok = fipse_ti_runner.optimize(
+            unit_commitment=False,
+            verbose=solver_verbose,
+        )
+        if not fipse_ti_ok:
+            log.error(
+                "[ABORT] %s preflight failed before binary optimizers could run; "
+                "reason=%s.",
+                fipse_ti_label,
+                getattr(fipse_ti_runner, "failure_reason", "unknown"),
+            )
+            sys.exit(1)
 
-    _, FR_O_eval_sol, _, _ = evaluate_solution(
-        fr_o_runner,
-        "FR_O",
-    )
-    save_evaluated_solutions(
-        ("fr_o", "FR_O", FR_O_eval_sol),
-    )
-    maybe_plot_solutions(
-        [fr_o_runner.sol, FR_O_eval_sol],
-        ["Convex FR_O solution", "FR_O evaluated solution"],
-        benchmark_label="FR_O evaluated solution",
-        show=False,
-        subfolder=relaxation_quality_dir("FR_O"),
-        map=fr_o_runner.map,
-    )
+        _, fipse_ti_eval_sol, _, _ = evaluate_solution(
+            fipse_ti_runner,
+            fipse_ti_label,
+        )
+        save_evaluated_solutions(
+            (FIPSE_TI, fipse_ti_label, fipse_ti_eval_sol),
+        )
+        maybe_plot_solutions(
+            [fipse_ti_runner.sol, fipse_ti_eval_sol],
+            [f"Convex {fipse_ti_label} solution", f"{fipse_ti_label} evaluated solution"],
+            benchmark_label=f"{fipse_ti_label} evaluated solution",
+            show=False,
+            subfolder=relaxation_quality_dir(FIPSE_TI),
+            map=fipse_ti_runner.map,
+        )
 
-    if (dimensions == "1D" or dimensions == "both") and should_run_optimizer("FPJSE"):
-        optimizer = FPJSE(
+    if (
+        (dimensions == "1D" or dimensions == "both")
+        and should_run_optimizer(FIPSE_ST)
+        and not optimizer_is_done(FIPSE_ST)
+    ):
+        optimizer = FixedPathSpaceTimeSpeedEnergyOptimizer(
             wind_model          = wind_model_1D,
             propulsion_model    = propulsion_model,
             calm_model          = calm_model,
@@ -1210,44 +1702,48 @@ if __name__ == "__main__":
         )
         optimizer.nc_sources = nc_sources
 
-        log.progress("[RUN] Starting FPJSE optimization")
+        log.progress("[RUN] Starting %s optimization", fipse_st_label)
         ok = optimizer.optimize(
             unit_commitment     = unit_commitment,
             restrict_to_base    = False,
             min_timestep        = False,
-            base_solution       = naive.sol,
+            base_solution       = spacs.sol,
             base_set_radius = 1,
             verbose             = solver_verbose,
         )
         if ok:
-            log.debug("FPJSE optimization succeeded.")
-            _, FPJSE_eval_sol, _, _ = evaluate_solution(
+            log.debug("%s optimization succeeded.", fipse_st_label)
+            _, fipse_st_eval_sol, _, _ = evaluate_solution(
                 optimizer,
-                "FPJSE",
+                fipse_st_label,
             )
             save_evaluated_solutions(
-                ("fpjse", "FPJSE", FPJSE_eval_sol),
+                (FIPSE_ST, fipse_st_label, fipse_st_eval_sol),
             )
             maybe_plot_solutions(
-                [optimizer.sol, FPJSE_eval_sol],
-                ["Convex FPJSE solution", "FPJSE evaluated solution"],
-                benchmark_label="FPJSE evaluated solution",
+                [optimizer.sol, fipse_st_eval_sol],
+                [f"Convex {fipse_st_label} solution", f"{fipse_st_label} evaluated solution"],
+                benchmark_label=f"{fipse_st_label} evaluated solution",
                 show=False,
-                subfolder=relaxation_quality_dir("FPJSE"),
+                subfolder=relaxation_quality_dir(FIPSE_ST),
                 map=optimizer.map,
             )
         else:
-            log.error("FPJSE optimization failed.")
-            FPJSE_eval_sol = _failed_optimizer_summary(optimizer, "FPJSE")
+            log.error("%s optimization failed.", fipse_st_label)
+            fipse_st_eval_sol = _failed_optimizer_summary(optimizer, fipse_st_label)
             save_evaluated_solutions(
-                ("fpjse", "FPJSE", FPJSE_eval_sol),
+                (FIPSE_ST, fipse_st_label, fipse_st_eval_sol),
             )
 
         if dimensions == "1D":
             print_debug_report()
 
-    if (dimensions == "2D" or dimensions == "both") and should_run_optimizer("JPDSE"):
-        optimizer = JPDSE(
+    if (
+        (dimensions == "2D" or dimensions == "both")
+        and should_run_optimizer(JOPSE_D)
+        and not optimizer_is_done(JOPSE_D)
+    ):
+        optimizer = JointPathDiscreteSpeedEnergyOptimizer(
             wind_model          = set_wind_model_2D,
             propulsion_model    = propulsion_model,
             calm_model          = calm_model,
@@ -1264,50 +1760,50 @@ if __name__ == "__main__":
         # Plot current position and destination
         init_pos = np.array([optimizer.states.current_x_pos, optimizer.states.current_y_pos])
         optimizer.states.set_selection = point_in_sets(init_pos, optimizer.map.set_ineq)
-        log.progress("[RUN] Starting JPDSE optimization")
+        log.progress("[RUN] Starting %s optimization", jopse_d_label)
         ok = optimizer.optimize(
             unit_commitment=unit_commitment,
             ordered_sets = ordered_sets,
             min_timestep = False,
             enforce_adjacency=True,
             restrict_to_base=False,
-            base_solution=naive.sol,
+            base_solution=spacs.sol,
             base_set_radius=1,
             verbose=solver_verbose,
         )
         if ok:
             maybe_plot_sets_and_points(optimizer.sol.ship_pos, optimizer.map.set_ineq)
-            _, JPDSE_eval_sol, _, _ = evaluate_solution(
+            _, jopse_d_eval_sol, _, _ = evaluate_solution(
                 optimizer,
-                "JPDSE",
+                jopse_d_label,
             )
             save_evaluated_solutions(
-                ("jpdse", "JPDSE", JPDSE_eval_sol),
+                (JOPSE_D, jopse_d_label, jopse_d_eval_sol),
             )
             maybe_plot_solutions(
-                [optimizer.sol, JPDSE_eval_sol],
-                ["Convex JPDSE solution", "JPDSE evaluated solution"],
-                benchmark_label="JPDSE evaluated solution",
+                [optimizer.sol, jopse_d_eval_sol],
+                [f"Convex {jopse_d_label} solution", f"{jopse_d_label} evaluated solution"],
+                benchmark_label=f"{jopse_d_label} evaluated solution",
                 show=False,
-                subfolder=relaxation_quality_dir("JPDSE"),
+                subfolder=relaxation_quality_dir(JOPSE_D),
                 map=optimizer.map,
             )
         else:
-            log.error("JPDSE optimization failed.")
-            JPDSE_eval_sol = _failed_optimizer_summary(optimizer, "JPDSE")
+            log.error("%s optimization failed.", jopse_d_label)
+            jopse_d_eval_sol = _failed_optimizer_summary(optimizer, jopse_d_label)
             save_evaluated_solutions(
-                ("jpdse", "JPDSE", JPDSE_eval_sol),
+                (JOPSE_D, jopse_d_label, jopse_d_eval_sol),
             )
 
         if dimensions == "2D":
             print_debug_report()
 
     if dimensions == "both" and (
-        should_run_optimizer("JPCSE_departure_wind")
-        or should_run_optimizer("JPCSE_transit_wind")
+        (should_run_optimizer(JOPSE_C_DEPARTURE) and not optimizer_is_done(JOPSE_C_DEPARTURE))
+        or (should_run_optimizer(JOPSE_C_TRANSITION) and not optimizer_is_done(JOPSE_C_TRANSITION))
     ):
-        def run_jpcse_variant(key, label, use_transition_wind_model):
-            optimizer = JPCSE(
+        def run_jopse_c_variant(key, label, use_transition_wind_model):
+            optimizer = JointPathContinuousSpeedEnergyOptimizer(
                 wind_model=set_wind_model_2D,
                 wind_model_nd=wind_model_transition_1D if use_transition_wind_model else None,
                 propulsion_model=propulsion_model,
@@ -1334,7 +1830,7 @@ if __name__ == "__main__":
                 min_timestep=False,
                 enforce_adjacency=True,
                 restrict_to_base=False,
-                base_solution=naive.sol,
+                base_solution=spacs.sol,
                 base_set_radius=1,
                 use_transition_wind_model=use_transition_wind_model,
                 verbose=solver_verbose,
@@ -1342,9 +1838,8 @@ if __name__ == "__main__":
             if not ok:
                 log.error("%s optimization failed.", label)
                 failed_sol = _failed_optimizer_summary(optimizer, label)
-                base_key = key.lower()
                 save_evaluated_solutions(
-                    (base_key, label, failed_sol),
+                    (key, label, failed_sol),
                 )
                 return optimizer, failed_sol
 
@@ -1353,9 +1848,8 @@ if __name__ == "__main__":
                 optimizer,
                 label,
             )
-            base_key = key.lower()
             save_evaluated_solutions(
-                (base_key, label, eval_sol),
+                (key, label, eval_sol),
             )
             for name in [
                 "prop_power",
@@ -1377,39 +1871,43 @@ if __name__ == "__main__":
             )
             return optimizer, eval_sol
 
-        jpcse_performance_rows = []
-        if run_jpcse_transit_wind and should_run_optimizer("JPCSE_transit_wind"):
-            jpcse_optimizer, JPCSE_eval_sol = run_jpcse_variant(
-                "JPCSE_transit_wind",
-                "JPCSE_transit_wind",
+        jopse_c_performance_rows = []
+        if (
+            run_jopse_c_transition_weather
+            and should_run_optimizer(JOPSE_C_TRANSITION)
+            and not optimizer_is_done(JOPSE_C_TRANSITION)
+        ):
+            jopse_c_optimizer, jopse_c_transition_eval_sol = run_jopse_c_variant(
+                JOPSE_C_TRANSITION,
+                jopse_c_transition_label,
                 True,
             )
-            jpcse_performance_rows.append(
-                ("JPCSE_transit_wind", jpcse_optimizer, JPCSE_eval_sol)
+            jopse_c_performance_rows.append(
+                (jopse_c_transition_label, jopse_c_optimizer, jopse_c_transition_eval_sol)
             )
-        if should_run_optimizer("JPCSE_departure_wind"):
+        if should_run_optimizer(JOPSE_C_DEPARTURE) and not optimizer_is_done(JOPSE_C_DEPARTURE):
             (
-                jpcse_departure_wind_optimizer,
-                JPCSE_departure_wind_eval_sol,
-            ) = run_jpcse_variant(
-                "JPCSE_departure_wind",
-                "JPCSE_departure_wind",
+                jopse_c_departure_optimizer,
+                jopse_c_departure_eval_sol,
+            ) = run_jopse_c_variant(
+                JOPSE_C_DEPARTURE,
+                jopse_c_departure_label,
                 False,
             )
-            jpcse_performance_rows.append(
+            jopse_c_performance_rows.append(
                 (
-                    "JPCSE_departure_wind",
-                    jpcse_departure_wind_optimizer,
-                    JPCSE_departure_wind_eval_sol,
+                    jopse_c_departure_label,
+                    jopse_c_departure_optimizer,
+                    jopse_c_departure_eval_sol,
                 )
             )
 
-        log.verbose("JPCSE performance comparison")
+        log.verbose("JoPSE-C performance comparison")
         log.verbose(
             "variant                         optimizer_cost      solve_s   opt_status          "
             "eval_cost       eval_valid"
         )
-        for label, optimizer, eval_sol in jpcse_performance_rows:
+        for label, optimizer, eval_sol in jopse_c_performance_rows:
             opt_sol = getattr(optimizer, "sol", None)
             opt_solve = np.nan if opt_sol is None else float(opt_sol.solve_time)
             opt_status = _status_or_na(opt_sol)
@@ -1427,11 +1925,11 @@ if __name__ == "__main__":
         for _, label, sol in solution_records
         if sol is not None
     ]
-    if len(available_comparison) >= 2:
+    if not resume_mode and len(available_comparison) >= 2:
         maybe_plot_solutions(
             [sol for _, sol in available_comparison],
             [label for label, _ in available_comparison],
-            benchmark_label="Naive Controller",
+            benchmark_label=spacs_label,
             show=show_plots,
             subfolder=all_solution_comparison_dir,
             map=map,
@@ -1442,3 +1940,13 @@ if __name__ == "__main__":
     _print_result_table(summary_rows)
     log.debug("[RUN] saved %d solution summaries", len(summary_rows))
     log.debug("[RUN] summary=%s", run_context.run_dir / "summary.csv")
+    if batch_manifest_path and batch_scenario_name:
+        _update_batch_scenario(
+            batch_manifest_path,
+            batch_scenario_name,
+            {
+                "status": "completed",
+                "run_id": run_context.run_id,
+                "run_dir": str(run_context.run_dir),
+            },
+        )

@@ -139,7 +139,7 @@ def test_solution_warning_summary_filters_tiny_battery_command_adjustments(tmp_p
         failure_reason="",
     )
 
-    row = summarize_solution("fr_o", "FR_O", sol)
+    row = summarize_solution("fipse_ti", "FiPSE-TI", sol)
     assert row["validation_warning_count"] == 1
 
     log.configure_run_logging(
@@ -148,7 +148,7 @@ def test_solution_warning_summary_filters_tiny_battery_command_adjustments(tmp_p
         console_verbose=False,
     )
     try:
-        _log_solution_quality("FR_O", sol)
+        _log_solution_quality("FiPSE-TI", sol)
     finally:
         log.shutdown_run_logging()
 

@@ -14,8 +14,12 @@ from lib.optimizers import (
     _future_auxiliary_power,
     _generator_dispatch_data,
 )
+from lib.optimizer_names import GREEDY, optimizer_display_label
 from lib.utils import build_constant_speed_path_reference
 from lib.weather_interpolation import interpolated_weather_at, query_time_for_segment
+
+
+_GREEDY_LABEL = optimizer_display_label(GREEDY)
 
 
 def _record_message(store, key, message, amount=0.0):
@@ -277,7 +281,7 @@ def greedy_power_dispatch_interval(
 
 
 @dataclass
-class GreedyController:
+class GreedyEnergyDispatchController:
     map: object
     itinerary: object
     states: object
@@ -293,16 +297,17 @@ class GreedyController:
     generator_models: Optional[list] = field(default=None, init=False)
     calm_model: Optional[object] = field(default=None, init=False)
     nc_sources: Optional[dict] = field(default=None, init=False)
+    zone_membership_binary_count: int = field(default=0, init=False)
 
     def compute(self, eps=1e-9):
         if self.states.timesteps_completed >= self.itinerary.nb_timesteps:
             raise ValueError("No timesteps left to compute; trip is finished.")
         if self.nc_sources is None:
-            raise ValueError("GreedyController requires nc_sources prepared from weather.toml.")
+            raise ValueError("Greedy requires nc_sources prepared from weather.toml.")
         if self.wind_model is None or self.calm_model is None or self.propulsion_model is None:
-            raise ValueError("GreedyController requires wind, calm-water, and propulsion models.")
+            raise ValueError("Greedy requires wind, calm-water, and propulsion models.")
         if self.generator_models is None:
-            raise ValueError("GreedyController requires generator models.")
+            raise ValueError("Greedy requires generator models.")
 
         start_solve = time.time()
         T_future = self.itinerary.nb_timesteps - self.states.timesteps_completed
@@ -375,7 +380,8 @@ class GreedyController:
             timestep_dt_h=timestep_dt_h,
             interval_port_idx=interval_port_idx,
             generator_unit_commitment=False,
-            first_stage_optimizer="GreedyController",
+            zone_membership_binary_count=self.zone_membership_binary_count,
+            first_stage_optimizer=_GREEDY_LABEL,
         )
 
         segment_data = build_evaluation_segment_records(
@@ -672,11 +678,12 @@ class GreedyController:
             interval_port_idx=interval_port_idx,
             solar_power_available=solar_power_available,
             solar_curtailment=solar_curtailment,
-            first_stage_optimizer="GreedyController",
+            first_stage_optimizer=_GREEDY_LABEL,
             gen_startup=gen_startup,
             gen_shutdown=gen_shutdown,
             generator_transition_cost=generator_transition_cost,
             generator_unit_commitment=False,
+            zone_membership_binary_count=self.zone_membership_binary_count,
             solver_status=None,
             failure_reason=failure_reason,
             is_valid=len(active_validation_errors) == 0,
@@ -691,7 +698,10 @@ class GreedyController:
             fit_range_warnings={},
         )
 
-        log.debug("GreedyController shortest-path distance [km]: %s", total_distance_km)
-        log.debug("GreedyController final SOC [MWh]: %s", SOC[-1])
-        log.debug("GreedyController cost [$]: %s", estimated_cost)
+        log.debug("%s shortest-path distance [km]: %s", _GREEDY_LABEL, total_distance_km)
+        log.debug("%s final SOC [MWh]: %s", _GREEDY_LABEL, SOC[-1])
+        log.debug("%s cost [$]: %s", _GREEDY_LABEL, estimated_cost)
         return 1
+
+
+GreedyController = GreedyEnergyDispatchController

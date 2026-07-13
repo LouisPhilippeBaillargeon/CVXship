@@ -6,6 +6,14 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 
 from lib.models import WindModel1D
+from lib.optimizer_names import (
+    FIPSE_ST,
+    FIPSE_TI,
+    JOPSE_C_DEPARTURE,
+    JOPSE_C_TRANSITION,
+    JOPSE_D,
+    normalize_optimizer_id,
+)
 from lib import logging_utils as log
 from lib.weather_interpolation import interpolated_weather_at, query_time_for_segment
 from lib.utils import safe_unit, xy_from_path_distance
@@ -428,19 +436,23 @@ def record_optimizer_debug(optimizer_name: str, runner, ctx: Dict[str, Any]) -> 
     _record_common_slacks(report, ctx)
     _record_power_slacks(report, runner, ctx)
 
-    mode = ctx["mode"]
+    raw_mode = ctx["mode"]
+    try:
+        mode = normalize_optimizer_id(raw_mode)
+    except ValueError:
+        mode = raw_mode
     eval_by_t = _eval_exact_and_fit(report, runner, _eval_weather_samples(runner, runner.sol, ctx.get("nc_sources")))
 
-    if mode == "JPDSE":
-        _record_djpe(report, runner, ctx, eval_by_t)
-    elif mode == "JPCSE":
-        _record_cjpe(report, runner, ctx, eval_by_t)
-    elif mode == "FPJSE":
-        _record_fr_tso(report, runner, ctx, eval_by_t)
-    elif mode == "FR_O":
-        _record_fr_o(report, runner, ctx, eval_by_t)
+    if mode == JOPSE_D:
+        _record_jopse_d(report, runner, ctx, eval_by_t)
+    elif mode in {JOPSE_C_DEPARTURE, JOPSE_C_TRANSITION}:
+        _record_jopse_c(report, runner, ctx, eval_by_t)
+    elif mode == FIPSE_ST:
+        _record_fipse_st(report, runner, ctx, eval_by_t)
+    elif mode == FIPSE_TI:
+        _record_fipse_ti(report, runner, ctx, eval_by_t)
     else:
-        report.note(f"unknown diagnostics mode {mode}")
+        report.note(f"unknown diagnostics mode {raw_mode}")
 
 
 def _record_resistance_comparison(
@@ -461,7 +473,7 @@ def _record_resistance_comparison(
         report.add(f"compare.{prefix}_op_minus_fit_evaluator_weather_speed", op_value - eval_values[f"{prefix}_fit"])
 
 
-def _record_djpe(report: OptimizerDebugReport, runner, ctx: Dict[str, Any], eval_by_t: Dict[int, Dict[str, float]]) -> None:
+def _record_jopse_d(report: OptimizerDebugReport, runner, ctx: Dict[str, Any], eval_by_t: Dict[int, Dict[str, float]]) -> None:
     set_selection = _value(ctx["set_selection"])
     wind_res = _value(ctx["wind_resistance"])
     calm_res = _value(ctx["calm_water_resistance"])
@@ -491,7 +503,7 @@ def _record_djpe(report: OptimizerDebugReport, runner, ctx: Dict[str, Any], eval
             _record_resistance_comparison(report, "calm", calm_res[t, h], fit_calm, exact_calm, eval_values)
 
 
-def _record_cjpe(report: OptimizerDebugReport, runner, ctx: Dict[str, Any], eval_by_t: Dict[int, Dict[str, float]]) -> None:
+def _record_jopse_c(report: OptimizerDebugReport, runner, ctx: Dict[str, Any], eval_by_t: Dict[int, Dict[str, float]]) -> None:
     set_selection = _value(ctx["set_selection"])
     wind_res = _value(ctx["wind_resistance"])
     calm_res = _value(ctx["calm_water_resistance"])
@@ -576,7 +588,7 @@ def _record_cjpe(report: OptimizerDebugReport, runner, ctx: Dict[str, Any], eval
         _record_resistance_comparison(report, "calm", calm_res[t], fit_calm, exact_calm, eval_values)
 
 
-def _record_fr_tso(report: OptimizerDebugReport, runner, ctx: Dict[str, Any], eval_by_t: Dict[int, Dict[str, float]]) -> None:
+def _record_fipse_st(report: OptimizerDebugReport, runner, ctx: Dict[str, Any], eval_by_t: Dict[int, Dict[str, float]]) -> None:
     path_set_selection = _value(ctx["path_set_selection"])
     wind_res = _value(ctx["wind_resistance"])
     calm_res = _value(ctx["calm_water_resistance"])
@@ -628,7 +640,7 @@ def _record_fr_tso(report: OptimizerDebugReport, runner, ctx: Dict[str, Any], ev
         _record_resistance_comparison(report, "calm", calm_res[t], fit_calm, exact_calm, eval_values)
 
 
-def _record_fr_o(report: OptimizerDebugReport, runner, ctx: Dict[str, Any], eval_by_t: Dict[int, Dict[str, float]]) -> None:
+def _record_fipse_ti(report: OptimizerDebugReport, runner, ctx: Dict[str, Any], eval_by_t: Dict[int, Dict[str, float]]) -> None:
     wind_res = _value(ctx["wind_resistance"])
     calm_res = _value(ctx["calm_water_resistance"])
     speed = _value(ctx["speed_mag"])
@@ -655,3 +667,10 @@ def _record_fr_o(report: OptimizerDebugReport, runner, ctx: Dict[str, Any], eval
         eval_values = eval_by_t.get(t)
         _record_resistance_comparison(report, "wind", wind_res[t], fit_wind, exact_wind, eval_values)
         _record_resistance_comparison(report, "calm", calm_res[t], fit_calm, exact_calm, eval_values)
+
+
+# Legacy private helper aliases kept for notebooks and older tests.
+_record_djpe = _record_jopse_d
+_record_cjpe = _record_jopse_c
+_record_fr_tso = _record_fipse_st
+_record_fr_o = _record_fipse_ti

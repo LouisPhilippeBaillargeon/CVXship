@@ -28,7 +28,7 @@ min_depth       = 15.525
 [hull]
 B               = 25.4
 LWL             = 175.0
-CB              = 0.569
+CB              = 0.572
 T               = 9.5
 AL_air          = 3700
 AF_air          = 750
@@ -51,16 +51,16 @@ delta           = 0.4
 # wake_fraction : Water relative speed is slower on the stern than on the bow due to the hull wake. This is the fraction of relative speed reduced due to this effect, assumed constant.
 # ============================
 [propulsion]
-D               = 7.2
-min_pitch       = 5.2
-max_pitch       = 5.2
-AE_AO           = 0.59
+D               = 5.0
+min_pitch       = 3.96
+max_pitch       = 3.96
+AE_AO           = 0.62
 nb_blades       = 6
 nb_propellers   = 2
-max_n           = 3.0
+max_n           = 2.05
 min_pow         = 0.0
-max_pow         = 20.0
-wake_fraction   = 0.3
+max_pow         = 3.0
+wake_fraction   = 0.16
 # ============================
 # BATTERY
 # capacity      : (MWh)
@@ -72,11 +72,11 @@ wake_fraction   = 0.3
 # ============================
 [battery]
 capacity        = 3
-max_charge_pow  = 2
-max_discharge_pow= 2
+max_charge_pow  = 2.1
+max_discharge_pow= 2.1
 discharge_eff   = 0.95
 charge_eff      = 0.95
-leak            = 0.9998
+leak            = 0.999958
 
 # ============================
 # SOLAR PANELS
@@ -84,8 +84,8 @@ leak            = 0.9998
 # efficiency    : (/1)
 # ============================
 [solarPanels]
-area            = 500
-efficiency      = 0.3
+area            = 1500
+efficiency      = 0.24
 
 # ============================
 # GENERATORS

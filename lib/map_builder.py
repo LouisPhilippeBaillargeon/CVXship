@@ -19,6 +19,7 @@ from matplotlib.widgets import Button
 from matplotlib.gridspec import GridSpec
 
 from lib.load_params import MapInfo, Ship
+from lib.plotting import MIN_PDF_PAD_INCHES, _strip_plot_titles
 from lib.utils import dx_dy_km
 from lib import logging_utils as log
 
@@ -403,12 +404,40 @@ class Set:
         )
         self.patch.set_picker(True)
         ax.add_patch(self.patch)
+        self.label = ax.text(
+            0.0,
+            0.0,
+            str(self.id),
+            fontsize=8,
+            ha="center",
+            va="center",
+            color="black",
+            bbox={
+                "boxstyle": "round,pad=0.18",
+                "fc": "white",
+                "ec": "black",
+                "lw": 0.5,
+                "alpha": 0.72,
+            },
+            zorder=4.2,
+        )
+        self.label.set_picker(False)
+        self.update_label()
 
     def get_xy(self):
         return np.array([c.get_xy() for c in self.corners])
 
     def update_patch(self):
         self.patch.set_xy(self.get_xy())
+        self.update_label()
+
+    def update_label(self):
+        xy = self.get_xy()
+        if xy.size == 0:
+            return
+        center = xy.mean(axis=0)
+        self.label.set_position((center[0], center[1]))
+        self.label.set_text(str(self.id))
 
     def edges_as_corner_pairs(self):
         out = []
@@ -472,6 +501,8 @@ class SetEditor:
         self.artifact_callback = artifact_callback
         self.corners_path = Path(corners_path)
         self.sets_path = Path(sets_path)
+        self.cmap = cmap
+        self.origin = origin
         self.port_coordinates = self._normalize_port_coordinates(port_coordinates)
         self.port_artists = []
         self.weather_overlay = weather_overlay or {}
@@ -496,8 +527,8 @@ class SetEditor:
         self.ax = self.fig.add_subplot(gs[0])
         self.nav_artist = self.ax.imshow(
             self.nav,
-            cmap=cmap,
-            origin=origin,
+            cmap=self.cmap,
+            origin=self.origin,
             extent=self.pixel_extent,
             interpolation="nearest",
         )
@@ -511,7 +542,7 @@ class SetEditor:
         controls = self.fig.add_subplot(gs[1])
         controls.axis("off")
         control_rows = 2 if has_weather_overlay else 1
-        sub = gs[1].subgridspec(control_rows, 8, wspace=0.02, hspace=0.18)
+        sub = gs[1].subgridspec(control_rows, 9, wspace=0.02, hspace=0.18)
 
         ax_new = self.fig.add_subplot(sub[0, 0])
         ax_next = self.fig.add_subplot(sub[0, 1])
@@ -520,7 +551,8 @@ class SetEditor:
         ax_delete = self.fig.add_subplot(sub[0, 4])
         ax_save = self.fig.add_subplot(sub[0, 5])
         ax_import = self.fig.add_subplot(sub[0, 6])
-        ax_done = self.fig.add_subplot(sub[0, 7])
+        ax_print = self.fig.add_subplot(sub[0, 7])
+        ax_done = self.fig.add_subplot(sub[0, 8])
 
         self.btn_new = Button(ax_new, "New Set")
         self.btn_next = Button(ax_next, "Next Step")
@@ -529,6 +561,7 @@ class SetEditor:
         self.btn_delete = Button(ax_delete, "Delete Set")
         self.btn_save = Button(ax_save, "Save All")
         self.btn_import = Button(ax_import, "Import CSV")
+        self.btn_print = Button(ax_print, "Save PDF")
         self.btn_done = Button(ax_done, "Done")
 
         self.btn_new.on_clicked(self.on_new_set)
@@ -538,6 +571,7 @@ class SetEditor:
         self.btn_delete.on_clicked(self.on_delete_set)
         self.btn_save.on_clicked(self.on_save)
         self.btn_import.on_clicked(self.on_import)
+        self.btn_print.on_clicked(self.on_print)
         self.btn_done.on_clicked(self.on_done)
 
         if has_weather_overlay:
@@ -608,13 +642,15 @@ class SetEditor:
 
         return normalized
 
-    def _create_port_coordinate_artists(self):
-        if not self.port_coordinates:
-            return
+    @staticmethod
+    def _draw_port_coordinate_artists(ax, port_coordinates):
+        if not port_coordinates:
+            return []
 
-        xs = [port["x"] for port in self.port_coordinates]
-        ys = [port["y"] for port in self.port_coordinates]
-        marker = self.ax.scatter(
+        artists = []
+        xs = [port["x"] for port in port_coordinates]
+        ys = [port["y"] for port in port_coordinates]
+        marker = ax.scatter(
             xs,
             ys,
             marker="X",
@@ -626,11 +662,11 @@ class SetEditor:
             label="Ports",
         )
         marker.set_picker(False)
-        self.port_artists.append(marker)
+        artists.append(marker)
 
-        for port in self.port_coordinates:
+        for port in port_coordinates:
             label = f"{port['name']}\nx={port['x']:.1f}, y={port['y']:.1f} km"
-            text = self.ax.annotate(
+            text = ax.annotate(
                 label,
                 xy=(port["x"], port["y"]),
                 xytext=(7, 7),
@@ -648,7 +684,14 @@ class SetEditor:
                 zorder=4.9,
             )
             text.set_picker(False)
-            self.port_artists.append(text)
+            artists.append(text)
+
+        return artists
+
+    def _create_port_coordinate_artists(self):
+        self.port_artists.extend(
+            self._draw_port_coordinate_artists(self.ax, self.port_coordinates)
+        )
 
     def _weather_arrow_length(self) -> float:
         if self.pixel_extent is not None and len(self.pixel_extent) == 4:
@@ -667,52 +710,57 @@ class SetEditor:
         stride = int(np.ceil(n_points / max_points))
         return np.arange(0, n_points, stride, dtype=int)
 
+    def _draw_weather_overlay_artist(self, ax, dataset: dict):
+        x = np.asarray(dataset.get("x", []), dtype=float)
+        y = np.asarray(dataset.get("y", []), dtype=float)
+        magnitude = np.asarray(dataset.get("magnitude", []), dtype=float)
+        if x.size == 0 or y.size != x.size or magnitude.size != x.size:
+            return None
+
+        kind = dataset.get("kind", "scalar")
+        if kind == "vector":
+            idx = self._weather_display_indices(dataset, max_points=350)
+            direction_x = np.asarray(dataset.get("direction_x", []), dtype=float)
+            direction_y = np.asarray(dataset.get("direction_y", []), dtype=float)
+            if direction_x.size != x.size or direction_y.size != x.size:
+                return None
+            arrow_len = self._weather_arrow_length()
+            return ax.quiver(
+                x[idx],
+                y[idx],
+                direction_x[idx] * arrow_len,
+                direction_y[idx] * arrow_len,
+                magnitude[idx],
+                cmap="viridis",
+                angles="xy",
+                scale_units="xy",
+                scale=1.0,
+                pivot="middle",
+                width=0.003,
+                alpha=0.85,
+                zorder=2.2,
+            )
+
+        idx = self._weather_display_indices(dataset, max_points=900)
+        return ax.scatter(
+            x[idx],
+            y[idx],
+            c=magnitude[idx],
+            cmap="plasma",
+            s=28,
+            alpha=0.85,
+            linewidths=0.0,
+            zorder=2.1,
+        )
+
     def _create_weather_overlay_artists(self):
         if not self.weather_overlay:
             return
 
-        arrow_len = self._weather_arrow_length()
         for name, dataset in self.weather_overlay.items():
-            x = np.asarray(dataset.get("x", []), dtype=float)
-            y = np.asarray(dataset.get("y", []), dtype=float)
-            magnitude = np.asarray(dataset.get("magnitude", []), dtype=float)
-            if x.size == 0 or y.size != x.size or magnitude.size != x.size:
+            artist = self._draw_weather_overlay_artist(self.ax, dataset)
+            if artist is None:
                 continue
-
-            kind = dataset.get("kind", "scalar")
-            if kind == "vector":
-                idx = self._weather_display_indices(dataset, max_points=350)
-                direction_x = np.asarray(dataset.get("direction_x", []), dtype=float)
-                direction_y = np.asarray(dataset.get("direction_y", []), dtype=float)
-                if direction_x.size != x.size or direction_y.size != x.size:
-                    continue
-                artist = self.ax.quiver(
-                    x[idx],
-                    y[idx],
-                    direction_x[idx] * arrow_len,
-                    direction_y[idx] * arrow_len,
-                    magnitude[idx],
-                    cmap="viridis",
-                    angles="xy",
-                    scale_units="xy",
-                    scale=1.0,
-                    pivot="middle",
-                    width=0.003,
-                    alpha=0.85,
-                    zorder=2.2,
-                )
-            else:
-                idx = self._weather_display_indices(dataset, max_points=900)
-                artist = self.ax.scatter(
-                    x[idx],
-                    y[idx],
-                    c=magnitude[idx],
-                    cmap="plasma",
-                    s=28,
-                    alpha=0.85,
-                    linewidths=0.0,
-                    zorder=2.1,
-                )
 
             artist.set_visible(False)
             self.weather_artists[name] = [artist]
@@ -740,10 +788,7 @@ class SetEditor:
         if mode == "off":
             status(self.ax, "Weather overlay hidden.")
         else:
-            dataset = self.weather_overlay[mode]
-            label = dataset.get("label", mode)
-            units = dataset.get("units", "")
-            colorbar_label = f"{label} ({units})" if units else str(label)
+            colorbar_label = self._weather_colorbar_label(mode)
             self.weather_colorbar = self.fig.colorbar(
                 self.weather_mappables[mode],
                 ax=self.ax,
@@ -755,10 +800,118 @@ class SetEditor:
 
         self.fig.canvas.draw_idle()
 
+    def _weather_colorbar_label(self, mode: str) -> str:
+        dataset = self.weather_overlay[mode]
+        label = dataset.get("label", mode)
+        units = dataset.get("units", "")
+        return f"{label} ({units})" if units else str(label)
+
+    def default_pdf_path(self) -> Path:
+        return self.corners_path.parent / "map_builder_current_view.pdf"
+
+    @staticmethod
+    def _draw_set_label(ax, set_id: int, xy: np.ndarray):
+        if xy.size == 0:
+            return None
+        center = xy.mean(axis=0)
+        return ax.text(
+            center[0],
+            center[1],
+            str(set_id),
+            fontsize=8,
+            ha="center",
+            va="center",
+            color="black",
+            bbox={
+                "boxstyle": "round,pad=0.18",
+                "fc": "white",
+                "ec": "black",
+                "lw": 0.5,
+                "alpha": 0.72,
+            },
+            zorder=4.2,
+        )
+
+    def _draw_sets_on_axes(self, ax):
+        for z in self.sets:
+            xy = z.get_xy()
+            if len(xy) < 3:
+                continue
+            patch = PatchPolygon(
+                xy,
+                closed=True,
+                facecolor=z.patch.get_facecolor(),
+                edgecolor=z.patch.get_edgecolor(),
+                alpha=z.patch.get_alpha(),
+                lw=z.patch.get_linewidth(),
+                zorder=3,
+            )
+            patch.set_picker(False)
+            ax.add_patch(patch)
+            self._draw_set_label(ax, int(z.id), xy)
+
+    def create_print_figure(self):
+        fig, ax = plt.subplots(figsize=(10, 7))
+        image = ax.imshow(
+            self.nav,
+            cmap=self.nav_artist.get_cmap(),
+            origin=self.origin,
+            extent=self.nav_artist.get_extent(),
+            interpolation="nearest",
+        )
+        image.set_clim(*self.nav_artist.get_clim())
+
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel(self.ax.get_xlabel())
+        ax.set_ylabel(self.ax.get_ylabel())
+
+        if self.weather_overlay_mode != "off" and self.weather_overlay_mode in self.weather_overlay:
+            dataset = self.weather_overlay[self.weather_overlay_mode]
+            weather_artist = self._draw_weather_overlay_artist(ax, dataset)
+            if weather_artist is not None:
+                colorbar = fig.colorbar(
+                    weather_artist,
+                    ax=ax,
+                    fraction=0.046,
+                    pad=0.04,
+                )
+                colorbar.set_label(self._weather_colorbar_label(self.weather_overlay_mode))
+
+        self._draw_sets_on_axes(ax)
+        self._draw_port_coordinate_artists(ax, self.port_coordinates)
+
+        ax.set_xlim(self.ax.get_xlim())
+        ax.set_ylim(self.ax.get_ylim())
+        fig.tight_layout()
+        return fig
+
+    def save_current_view_pdf(self, output_path: Optional[Path | str] = None) -> Path:
+        path = Path(output_path) if output_path is not None else self.default_pdf_path()
+        path = path.with_suffix(".pdf")
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        fig = self.create_print_figure()
+        try:
+            _strip_plot_titles(fig)
+            fig.tight_layout(pad=0.4)
+            fig.savefig(
+                path,
+                format="pdf",
+                bbox_inches="tight",
+                pad_inches=MIN_PDF_PAD_INCHES,
+            )
+        finally:
+            plt.close(fig)
+        return path
+
     def _clear_all(self):
         for z in list(self.sets):
             try:
                 z.patch.remove()
+            except Exception:
+                pass
+            try:
+                z.label.remove()
             except Exception:
                 pass
         self.sets.clear()
@@ -982,6 +1135,8 @@ class SetEditor:
 
         for z in self.sets:
             z.id = set_id_map[z.id]
+            if hasattr(z, "update_label"):
+                z.update_label()
 
         used_corners = []
         seen = set()
@@ -1034,6 +1189,15 @@ class SetEditor:
             status(self.ax, "Saved CSVs and rebuilt all set artifacts.")
         except Exception as e:
             status(self.ax, f"Save failed: {e}")
+
+        self.fig.canvas.draw_idle()
+
+    def on_print(self, event):
+        try:
+            output_path = self.save_current_view_pdf()
+            status(self.ax, f"Saved current map view to {output_path.name}.")
+        except Exception as e:
+            status(self.ax, f"PDF export failed: {e}")
 
         self.fig.canvas.draw_idle()
 
@@ -1141,6 +1305,10 @@ class SetEditor:
 
         try:
             z.patch.remove()
+        except Exception:
+            pass
+        try:
+            z.label.remove()
         except Exception:
             pass
 

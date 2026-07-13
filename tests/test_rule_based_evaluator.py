@@ -330,7 +330,19 @@ class RuleBasedPowerBalanceTests(unittest.TestCase):
 
 
 class SpeedLimitEvaluatorTests(unittest.TestCase):
-    def _runner_for_fixed_path(self, path_distance, *, speed_limit=1.0):
+    def _runner_for_fixed_path(
+        self,
+        path_distance,
+        *,
+        speed_limit=1.0,
+        soc=5.0,
+        soc_f=None,
+        auxiliary_power=0.0,
+        generation_power=0.0,
+        gen_on=1.0,
+        battery_charge=0.0,
+        battery_discharge=0.0,
+    ):
         generator = SimpleNamespace(
             name="g0",
             min_power=0.0,
@@ -364,9 +376,9 @@ class SpeedLimitEvaluatorTests(unittest.TestCase):
             ),
             transits=[SimpleNamespace(arrival_datetime="2024-01-01T00:00")],
             fuel_price=1.0,
-            soc_f=0.0,
+            soc_f=float(soc if soc_f is None else soc_f),
         )
-        states = SimpleNamespace(timesteps_completed=0, soc=5.0)
+        states = SimpleNamespace(timesteps_completed=0, soc=float(soc))
         map_obj = SimpleNamespace(
             nb_sets=2,
             speed_limit_bands=[
@@ -395,19 +407,19 @@ class SpeedLimitEvaluatorTests(unittest.TestCase):
             speed_rel_water=np.zeros((1, 2)),
             speed_rel_water_mag=np.zeros(1),
             prop_power=np.zeros(1),
-            auxiliary_power=np.zeros(1),
+            auxiliary_power=np.array([float(auxiliary_power)]),
             wind_resistance=np.zeros(1),
             calm_water_resistance=np.zeros(1),
             total_resistance=np.zeros(1),
-            generation_power=np.zeros((1, 1)),
+            generation_power=np.array([[float(generation_power)]]),
             gen_costs=np.zeros((1, 1)),
-            gen_on=np.ones((1, 1)),
+            gen_on=np.array([[float(gen_on)]]),
             solar_power=np.zeros(1),
             shore_power=np.zeros(1),
             shore_power_cost=np.zeros(1),
-            battery_charge=np.zeros(1),
-            battery_discharge=np.zeros(1),
-            SOC=np.array([5.0, 5.0]),
+            battery_charge=np.array([float(battery_charge)]),
+            battery_discharge=np.array([float(battery_discharge)]),
+            SOC=np.array([float(soc), float(soc)]),
             path_distance=path_distance,
             fixed_path_waypoints=np.array([[0.0, 0.0], [5.0, 0.0], [10.0, 0.0]]),
             path_set_ids=np.array([0, 1]),
@@ -417,6 +429,7 @@ class SpeedLimitEvaluatorTests(unittest.TestCase):
             gen_shutdown=np.zeros((1, 1)),
             generator_transition_cost=0.0,
             generator_unit_commitment=True,
+            zone_membership_binary_count=6,
         )
 
         return SimpleNamespace(
@@ -486,7 +499,7 @@ class SpeedLimitEvaluatorTests(unittest.TestCase):
                 )
             ],
             fuel_price=1.0,
-            soc_f=0.0,
+            soc_f=2.0,
         )
         sol = Solution(
             estimated_cost=0.0,
@@ -544,11 +557,44 @@ class SpeedLimitEvaluatorTests(unittest.TestCase):
         np.testing.assert_allclose(evaluated.battery_charge, [[1.0, 3.0]])
         self.assertAlmostEqual(float(evaluated.SOC[-1]), 2.0)
 
+    def test_segmented_fixed_path_commands_are_not_treated_as_half_steps(self):
+        runner = self._runner_for_fixed_path(
+            [0.0, 10.0],
+            speed_limit=10.0,
+            battery_charge=0.0,
+            generation_power=0.0,
+        )
+        sol = runner.sol
+        sol.speed_mag = np.array([[10.0, 20.0]])
+        sol.ship_speed = np.zeros((1, 2, 2))
+        sol.speed_rel_water = np.zeros((1, 2, 2))
+        sol.speed_rel_water_mag = np.zeros((1, 2))
+        sol.prop_power = np.zeros((1, 2))
+        sol.wind_resistance = np.zeros((1, 2))
+        sol.calm_water_resistance = np.zeros((1, 2))
+        sol.total_resistance = np.zeros((1, 2))
+        sol.generation_power = np.zeros((1, 1, 2))
+        sol.gen_costs = np.zeros((1, 1, 2))
+        sol.gen_on = np.ones((1, 1, 2))
+        sol.solar_power = np.zeros((1, 2))
+        sol.shore_power = np.zeros((1, 2))
+        sol.shore_power_cost = np.zeros((1, 2))
+        sol.battery_charge = np.array([[1.0, 3.0]])
+        sol.battery_discharge = np.zeros((1, 2))
+        sol.segment_dt_h = np.array([[0.5, 0.5]])
+
+        evaluated = self._evaluate(runner)
+
+        np.testing.assert_allclose(evaluated.segment_dt_h, [[0.5, 0.5]])
+        np.testing.assert_allclose(evaluated.step_distance, [[5.0, 5.0]])
+        np.testing.assert_allclose(evaluated.battery_charge, [[1.0, 3.0]])
+
     def test_fixed_path_speed_limit_violation_marks_solution_invalid(self):
         evaluated = self._evaluate(self._runner_for_fixed_path([0.0, 10.0]))
 
         self.assertFalse(evaluated.is_valid)
         self.assertIn("speed_limit_violation", evaluated.validation_errors)
+        self.assertEqual(evaluated.zone_membership_binary_count, 6)
 
     def test_fixed_path_boundary_only_contact_does_not_trigger_speed_limit(self):
         evaluated = self._evaluate(self._runner_for_fixed_path([0.0, 5.0]))
@@ -556,17 +602,71 @@ class SpeedLimitEvaluatorTests(unittest.TestCase):
         self.assertTrue(evaluated.is_valid)
         self.assertNotIn("speed_limit_violation", evaluated.validation_errors)
 
-    def test_rule_based_ems_error_remains_active(self):
-        runner = self._runner_for_fixed_path([0.0, 5.0])
-        runner.itinerary.soc_f = 6.0
+    def test_terminal_soc_restored_during_sailing_with_online_generator(self):
+        runner = self._runner_for_fixed_path([0.0, 5.0], soc_f=6.0)
+
+        evaluated = self._evaluate(runner)
+
+        self.assertTrue(evaluated.is_valid)
+        self.assertAlmostEqual(float(evaluated.SOC[-1]), 6.0)
+        self.assertAlmostEqual(float(np.sum(evaluated.battery_charge)), 1.0)
+        self.assertAlmostEqual(float(np.sum(evaluated.generation_power)), 1.0)
+        self.assertIn(
+            "terminal_soc_restored_by_extra_battery_charge",
+            evaluated.ems_validation_warnings,
+        )
+
+    def test_terminal_soc_repair_reduces_discharge_before_increasing_charge(self):
+        runner = self._runner_for_fixed_path(
+            [0.0, 5.0],
+            soc_f=5.0,
+            auxiliary_power=1.0,
+            battery_discharge=1.0,
+        )
+
+        evaluated = self._evaluate(runner)
+
+        self.assertTrue(evaluated.is_valid)
+        self.assertAlmostEqual(float(evaluated.SOC[-1]), 5.0)
+        self.assertAlmostEqual(float(np.sum(evaluated.battery_discharge)), 0.0)
+        self.assertAlmostEqual(float(np.sum(evaluated.battery_charge)), 0.0)
+        self.assertAlmostEqual(float(np.sum(evaluated.generation_power)), 1.0)
+        self.assertIn(
+            "terminal_soc_restored_by_replacing_battery_discharge",
+            evaluated.ems_validation_warnings,
+        )
+        self.assertNotIn(
+            "terminal_soc_restored_by_extra_battery_charge",
+            evaluated.ems_validation_warnings,
+        )
+
+    def test_terminal_soc_repair_does_not_turn_on_generator(self):
+        runner = self._runner_for_fixed_path([0.0, 5.0], soc_f=6.0, gen_on=0.0)
 
         evaluated = self._evaluate(runner)
 
         self.assertFalse(evaluated.is_valid)
         self.assertIn("terminal_soc_shortfall", evaluated.validation_errors)
         self.assertIn("terminal_soc_shortfall", evaluated.ems_validation_errors)
+        self.assertAlmostEqual(float(np.sum(evaluated.generation_power)), 0.0)
+        self.assertAlmostEqual(float(np.sum(evaluated.battery_charge)), 0.0)
         self.assertEqual(evaluated.route_validation_errors, {})
         self.assertEqual(evaluated.pre_redispatch_ems_validation_errors, {})
+
+    def test_terminal_soc_above_minimum_is_warning_only(self):
+        runner = self._runner_for_fixed_path([0.0, 5.0], soc_f=4.98)
+
+        with patch("lib.evaluation.log.warning") as log_warning:
+            evaluated = self._evaluate(runner)
+
+        self.assertTrue(evaluated.is_valid)
+        self.assertIn("terminal_soc_above_minimum", evaluated.validation_warnings)
+        self.assertIn("terminal_soc_above_minimum", evaluated.ems_validation_warnings)
+        self.assertGreater(
+            evaluated.ems_validation_warnings["terminal_soc_above_minimum"]["max_amount"],
+            0.01,
+        )
+        self.assertTrue(any("MWh" in str(call.args) for call in log_warning.call_args_list))
 
     def test_propulsion_infeasibility_marks_evaluation_invalid_without_raising(self):
         runner = self._runner_for_fixed_path([0.0, 5.0])

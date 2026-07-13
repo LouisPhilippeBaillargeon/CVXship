@@ -4,37 +4,37 @@ import numpy as np
 
 import lib.experiment as experiment
 from lib import logging_utils as log
-from lib.debug_diagnostics import OptimizerDebugReport, _record_cjpe
+from lib.debug_diagnostics import OptimizerDebugReport, _record_jopse_c
 from lib.optimizers import (
-    _jpcse_leg_metrics,
-    _jpcse_normal_wind_inactive_expr,
-    _jpcse_transition_wind_inactive_expr,
+    _jopse_c_leg_metrics,
+    _jopse_c_normal_wind_inactive_expr,
+    _jopse_c_transition_wind_inactive_expr,
     _relaxed_set_membership_rhs,
 )
 from lib.plotting import _print_cost_summary_vs_benchmark
 
 
-def test_jpcse_normal_wind_without_transition_model_uses_departure_set():
+def test_jopse_c_normal_wind_without_transition_model_uses_departure_set():
     set_selection = np.array([[1.0, 0.0], [0.0, 1.0]])
 
-    assert _jpcse_normal_wind_inactive_expr(set_selection, 0, 0, False) == 0.0
-    assert _jpcse_normal_wind_inactive_expr(set_selection, 0, 1, False) == 1.0
+    assert _jopse_c_normal_wind_inactive_expr(set_selection, 0, 0, False) == 0.0
+    assert _jopse_c_normal_wind_inactive_expr(set_selection, 0, 1, False) == 1.0
 
 
-def test_jpcse_transition_wind_model_uses_transition_pair_on_set_change():
+def test_jopse_c_transition_wind_model_uses_transition_pair_on_set_change():
     set_selection = np.array([[1.0, 0.0], [0.0, 1.0]])
 
-    assert _jpcse_normal_wind_inactive_expr(set_selection, 0, 0, True) == 1.0
-    assert _jpcse_normal_wind_inactive_expr(set_selection, 0, 1, True) == 1.0
-    assert _jpcse_transition_wind_inactive_expr(set_selection, 0, 0, 1) == 0.0
-    assert _jpcse_transition_wind_inactive_expr(set_selection, 0, 1, 0) == 2.0
+    assert _jopse_c_normal_wind_inactive_expr(set_selection, 0, 0, True) == 1.0
+    assert _jopse_c_normal_wind_inactive_expr(set_selection, 0, 1, True) == 1.0
+    assert _jopse_c_transition_wind_inactive_expr(set_selection, 0, 0, 1) == 0.0
+    assert _jopse_c_transition_wind_inactive_expr(set_selection, 0, 1, 0) == 2.0
 
 
-def test_jpcse_transition_wind_model_uses_normal_model_on_same_set_leg():
+def test_jopse_c_transition_wind_model_uses_normal_model_on_same_set_leg():
     set_selection = np.array([[1.0, 0.0], [1.0, 0.0]])
 
-    assert _jpcse_normal_wind_inactive_expr(set_selection, 0, 0, True) == 0.0
-    assert _jpcse_transition_wind_inactive_expr(set_selection, 0, 0, 1) == 1.0
+    assert _jopse_c_normal_wind_inactive_expr(set_selection, 0, 0, True) == 0.0
+    assert _jopse_c_transition_wind_inactive_expr(set_selection, 0, 0, 1) == 1.0
 
 
 def test_transition_overlap_tolerance_is_flat_km_slack():
@@ -42,7 +42,7 @@ def test_transition_overlap_tolerance_is_flat_km_slack():
     assert _relaxed_set_membership_rhs(-7.0, 0.0, 0.05) == -7.0
 
 
-def test_jpcse_leg_metrics_use_total_leg_and_water_relative_distances():
+def test_jopse_c_leg_metrics_use_total_leg_and_water_relative_distances():
     ship_pos = np.array([[0.0, 0.0], [9.0, 0.0]])
     crossing_point = np.array([[1.0, 0.0]])
     set_selection = np.array([[1.0, 0.0], [0.0, 1.0]])
@@ -50,7 +50,7 @@ def test_jpcse_leg_metrics_use_total_leg_and_water_relative_distances():
     current_y_future = np.zeros((2, 1))
     timestep_dt_h = np.array([1.0])
 
-    metrics = _jpcse_leg_metrics(
+    metrics = _jopse_c_leg_metrics(
         ship_pos,
         crossing_point,
         set_selection,
@@ -70,8 +70,8 @@ def test_jpcse_leg_metrics_use_total_leg_and_water_relative_distances():
     assert "speed_mag_split" not in metrics
 
 
-def test_jpcse_leg_metrics_zero_water_speed_for_non_sailing_interval():
-    metrics = _jpcse_leg_metrics(
+def test_jopse_c_leg_metrics_zero_water_speed_for_non_sailing_interval():
+    metrics = _jopse_c_leg_metrics(
         ship_pos=np.array([[0.0, 0.0], [0.0, 0.0]]),
         crossing_point=np.array([[0.0, 0.0]]),
         set_selection=np.array([[1.0], [1.0]]),
@@ -87,8 +87,8 @@ def test_jpcse_leg_metrics_zero_water_speed_for_non_sailing_interval():
     np.testing.assert_allclose(metrics["speed_rel_water"], [[0.0, 0.0]])
 
 
-def test_jpcse_debug_diagnostics_accept_leg_distance_context():
-    report = OptimizerDebugReport("JPCSE")
+def test_jopse_c_debug_diagnostics_accept_leg_distance_context():
+    report = OptimizerDebugReport("JoPSE-C")
     runner = SimpleNamespace(
         sol=SimpleNamespace(
             interval_sail_fraction=np.array([0.0]),
@@ -110,7 +110,7 @@ def test_jpcse_debug_diagnostics_accept_leg_distance_context():
         "wind_model_future": np.zeros((1, 1, 2)),
     }
 
-    _record_cjpe(report, runner, ctx, {})
+    _record_jopse_c(report, runner, ctx, {})
 
     assert "slack.speed_mag_minus_leg_speed" in report.metrics
     assert "slack.rel_speed_mag_minus_water_leg_speed" in report.metrics
@@ -126,7 +126,7 @@ def test_optimal_inaccurate_cost_and_status_are_reported(tmp_path):
         validation_errors={},
         validation_warnings={},
         fit_range_warnings={"wind_speed_outside_fit_range": {"count": 1}},
-        first_stage_optimizer="JPCSE",
+        first_stage_optimizer="JoPSE-C",
         solver_status="optimal_inaccurate",
         failure_reason="",
     )

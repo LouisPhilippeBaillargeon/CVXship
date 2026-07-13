@@ -18,6 +18,7 @@ import numpy as np
 
 from lib.paths import CACHE, RESULTS, ROOT
 from lib.weather_interpolation import resolve_weather_files_from_toml
+from lib.optimizer_names import canonicalize_optimizer_label
 from lib import logging_utils as log
 
 CACHE_FILENAMES = {
@@ -42,6 +43,8 @@ class RunContext:
     solutions_dir: Path
     cache_dir: Path
     weather_files: dict[str, Path]
+    scenario_name: str | None = None
+    weather_variant: str | None = None
     settings: dict[str, Any] = field(default_factory=dict)
     start_wall_time: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
     start_perf_counter: float = field(default_factory=time.perf_counter)
@@ -100,12 +103,58 @@ def load_case_run_options(case_dir: Path | str | None) -> dict[str, Any]:
     return dict(load_case_settings(case_dir).get("run", {}))
 
 
+def load_case_scenarios(
+    case_dir: Path | str | None,
+    *,
+    apply_run_filter: bool = True,
+) -> list[dict[str, Any]]:
+    settings = load_case_settings(case_dir)
+    raw_scenarios = [dict(item) for item in settings.get("scenario", [])]
+    if not raw_scenarios:
+        return []
+
+    scenarios_by_name: dict[str, dict[str, Any]] = {}
+    for i, scenario in enumerate(raw_scenarios):
+        raw_name = scenario.get("name")
+        if raw_name in (None, ""):
+            raise ValueError(f"scenario[{i}] must define a non-empty name.")
+        name = str(raw_name)
+        if name in scenarios_by_name:
+            raise ValueError(f"Duplicate scenario name in case.toml: {name!r}.")
+        scenario["name"] = name
+        scenario.setdefault("weather_variant", name)
+        scenarios_by_name[name] = scenario
+
+    run_options = dict(settings.get("run", {}))
+    selected = run_options.get("scenarios") if apply_run_filter else None
+    if selected in (None, ""):
+        selected_names = list(scenarios_by_name)
+    elif isinstance(selected, str):
+        selected_names = [selected]
+    else:
+        selected_names = [str(name) for name in selected]
+
+    missing = [name for name in selected_names if name not in scenarios_by_name]
+    if missing:
+        available = ", ".join(sorted(scenarios_by_name))
+        raise ValueError(
+            f"[run].scenarios references unknown scenario(s): {missing}. "
+            f"Available scenarios: {available}."
+        )
+
+    return [dict(scenarios_by_name[name]) for name in selected_names]
+
+
 def load_case_output_options(case_dir: Path | str | None) -> dict[str, Any]:
     return dict(load_case_settings(case_dir).get("outputs", {}))
 
 
 def load_case_cache_options(case_dir: Path | str | None) -> dict[str, Any]:
     return dict(load_case_settings(case_dir).get("cache", {}))
+
+
+def load_case_fit_range_options(case_dir: Path | str | None) -> dict[str, Any]:
+    return dict(load_case_settings(case_dir).get("fit_range", {}))
 
 
 def resolve_weather_files(case_dir: Path | str | None) -> dict[str, Path]:
@@ -118,6 +167,10 @@ def create_run_context(
     run_name: str | None,
     options: dict[str, Any],
     cache_scope: str = "case",
+    weather_files: dict[str, Path] | None = None,
+    scenario: dict[str, Any] | None = None,
+    weather_variant: str | None = None,
+    resume_run_dir: Path | str | None = None,
 ) -> RunContext:
     if case_dir is None:
         raise ValueError("case_dir is required. Pass a named case directory with --case.")
@@ -125,30 +178,61 @@ def create_run_context(
     case_path = Path(case_dir).resolve()
     settings = load_case_settings(case_path)
     case_name = _slug(str(case_path.name))
-    clean_run_name = _slug(run_name or case_name)
+    scenario_name = None if scenario is None else str(scenario.get("name") or "")
+    if scenario_name == "":
+        scenario_name = None
+    weather_variant = (
+        str(weather_variant)
+        if weather_variant not in (None, "")
+        else (
+            None
+            if scenario is None or scenario.get("weather_variant") in (None, "")
+            else str(scenario.get("weather_variant"))
+        )
+    )
+    default_run_name = f"{case_name}_{scenario_name}" if scenario_name else case_name
+    clean_run_name = _slug(run_name or default_run_name)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_id = _unique_run_id(timestamp, clean_run_name)
 
     run_dir = RESULTS / "runs" / run_id
+    existing_manifest: dict[str, Any] = {}
+    if resume_run_dir is not None:
+        run_dir = Path(resume_run_dir).resolve()
+        if not run_dir.exists():
+            raise FileNotFoundError(f"Cannot resume missing run directory: {run_dir}")
+        manifest_path = run_dir / "manifest.json"
+        if manifest_path.exists():
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                existing_manifest = json.load(f)
+        run_id = str(existing_manifest.get("run_id") or run_dir.name)
+
     inputs_dir = run_dir / "inputs"
     plots_dir = run_dir / "plots"
     solutions_dir = run_dir / "solutions"
 
     cache_scope = str(cache_scope or "case").lower()
-    if cache_scope == "run":
+    if existing_manifest.get("cache_dir"):
+        cache_dir = Path(existing_manifest["cache_dir"])
+    elif cache_scope == "run":
         cache_dir = run_dir / "cache"
     elif cache_scope == "global":
         cache_dir = CACHE
     elif cache_scope == "case":
         cache_dir = CACHE / case_name
+        if weather_variant:
+            cache_dir = cache_dir / _slug(weather_variant)
     else:
         raise ValueError("cache_scope must be one of: case, run, global")
 
-    run_dir.mkdir(parents=True, exist_ok=False)
+    run_dir.mkdir(parents=True, exist_ok=resume_run_dir is not None)
     inputs_dir.mkdir(parents=True, exist_ok=True)
     plots_dir.mkdir(parents=True, exist_ok=True)
     solutions_dir.mkdir(parents=True, exist_ok=True)
     cache_dir.mkdir(parents=True, exist_ok=True)
+
+    if weather_files is None:
+        weather_files = resolve_weather_files_from_toml(case_path, variant=weather_variant)
 
     ctx = RunContext(
         case_dir=case_path,
@@ -160,12 +244,29 @@ def create_run_context(
         plots_dir=plots_dir,
         solutions_dir=solutions_dir,
         cache_dir=cache_dir,
-        weather_files=resolve_weather_files(case_path),
+        weather_files=weather_files,
+        scenario_name=scenario_name,
+        weather_variant=weather_variant,
         settings=settings,
     )
 
-    copy_input_snapshot(ctx)
-    write_initial_manifest(ctx, options=options, cache_scope=cache_scope)
+    if resume_run_dir is None:
+        copy_input_snapshot(ctx)
+        write_initial_manifest(
+            ctx,
+            options=options,
+            cache_scope=cache_scope,
+            scenario=scenario,
+        )
+    else:
+        update_manifest(
+            ctx,
+            {
+                "status": "running",
+                "resumed_at": datetime.now().isoformat(timespec="seconds"),
+                "options": options,
+            },
+        )
     return ctx
 
 
@@ -182,7 +283,13 @@ def copy_input_snapshot(ctx: RunContext) -> None:
         shutil.copytree(map_dir, ctx.inputs_dir / "map", dirs_exist_ok=True)
 
 
-def write_initial_manifest(ctx: RunContext, *, options: dict[str, Any], cache_scope: str) -> None:
+def write_initial_manifest(
+    ctx: RunContext,
+    *,
+    options: dict[str, Any],
+    cache_scope: str,
+    scenario: dict[str, Any] | None = None,
+) -> None:
     source_dir = ctx.case_dir
     manifest = {
         "status": "running",
@@ -193,6 +300,9 @@ def write_initial_manifest(ctx: RunContext, *, options: dict[str, Any], cache_sc
         "run_dir": str(ctx.run_dir),
         "cache_dir": str(ctx.cache_dir),
         "cache_scope": cache_scope,
+        "scenario_name": ctx.scenario_name,
+        "weather_variant": ctx.weather_variant,
+        "scenario": scenario,
         "started_at": ctx.start_wall_time,
         "options": options,
         "git": _git_info(),
@@ -244,6 +354,7 @@ def save_solution_record(
         with open(solution_path, "wb") as f:
             pickle.dump(sol, f)
 
+    label = canonicalize_optimizer_label(label)
     row = summarize_solution(key, label, sol)
     row["solution_file"] = str(Path("solutions") / filename) if save_solutions else ""
     _log_solution_quality(label, sol)
@@ -353,10 +464,15 @@ def summarize_solution(key: str, label: str, sol: Any) -> dict[str, Any]:
 
     return {
         "key": key,
-        "label": label,
-        "first_stage_optimizer": getattr(sol, "first_stage_optimizer", "") or "",
+        "label": canonicalize_optimizer_label(label),
+        "first_stage_optimizer": canonicalize_optimizer_label(
+            getattr(sol, "first_stage_optimizer", "") or ""
+        ),
         "estimated_cost": _float_or_none(getattr(sol, "estimated_cost", None)),
         "solve_time": _float_or_none(getattr(sol, "solve_time", None)),
+        "zone_membership_binary_count": _int_or_none(
+            getattr(sol, "zone_membership_binary_count", None)
+        ),
         "total_distance": _float_or_none(getattr(sol, "total_distance", None)),
         "final_soc": final_soc,
         "is_valid": bool(getattr(sol, "is_valid", True)),
@@ -509,6 +625,15 @@ def _float_or_none(value: Any) -> float | None:
         return None
 
 
+def _int_or_none(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _write_summary_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     fieldnames = [
         "key",
@@ -516,6 +641,7 @@ def _write_summary_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "first_stage_optimizer",
         "estimated_cost",
         "solve_time",
+        "zone_membership_binary_count",
         "total_distance",
         "final_soc",
         "is_valid",

@@ -3,7 +3,8 @@ from unittest.mock import patch
 
 import numpy as np
 
-from lib.greedy import GreedyController, greedy_power_dispatch_interval
+from lib.greedy import GreedyEnergyDispatchController, greedy_power_dispatch_interval
+from lib.evaluation import compute_non_convex_cost_all_timesteps_nc_interpolated
 from lib.load_params import Generator
 from lib.optimizers import ShortestPathSolution
 
@@ -106,7 +107,7 @@ def _basic_controller(*, interval_sail_fraction, auxiliary_power, soc_i=10.0, so
         total_distance=3.6,
         status="test",
     )
-    controller = GreedyController(
+    controller = GreedyEnergyDispatchController(
         map=map_obj,
         itinerary=itinerary,
         states=states,
@@ -168,6 +169,27 @@ def test_controller_computes_greedy_sailing_solution_without_evaluator_repair():
     assert sol.shore_power[0, 0] == 0.0
     assert sol.SOC[-1] == 8.0
     assert sol.is_valid
+
+
+def test_controller_solution_can_pass_through_common_evaluator():
+    controller = _basic_controller(
+        interval_sail_fraction=[1.0],
+        auxiliary_power=[6.0],
+        soc_i=10.0,
+    )
+
+    with patch("lib.greedy.interpolated_weather_at", return_value=_weather(2.0)):
+        controller.compute()
+
+    with patch("lib.evaluation.interpolated_weather_at", return_value=_weather(2.0)):
+        evaluated = compute_non_convex_cost_all_timesteps_nc_interpolated(controller)[1]
+
+    assert evaluated.is_valid
+    np.testing.assert_allclose(evaluated.generation_power[:, 0, 0], [1.0, 1.0])
+    assert evaluated.solar_power[0, 0] == 2.0
+    assert evaluated.battery_discharge[0, 0] == 2.0
+    assert evaluated.shore_power[0, 0] == 0.0
+    assert evaluated.SOC[-1] == 8.0
 
 
 def test_controller_charges_at_port_before_sailing():

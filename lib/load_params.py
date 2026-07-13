@@ -449,19 +449,80 @@ def _compute_auxiliary_power_profile(itinerary):
     return profile
 
 
-def load_itinerary(map, case_dir=None) -> Itinerary:
-    with open(_case_file(case_dir, "itinerary.toml"), "rb") as f:
-        data = tomllib.load(f)
-    params = data.get("params", {})
-    soc_i=params["soc_i"]
-    soc_f=params["soc_f"]
-    timestep = params["timestep"]
-    init_speed = params["init_speed"]
-    fuel_price = params["fuel_price"]
+def _scenario_value(scenario, key, default=None):
+    if scenario is None:
+        return default
+    if isinstance(scenario, dict):
+        return scenario.get(key, default)
+    return getattr(scenario, key, default)
 
-    transit_list = []
-    for t in data.get("transit", []):
-        transit_list.append(
+
+def _default_case_scenario(case_dir):
+    if case_dir is None:
+        return None
+
+    case_toml = _case_file(case_dir, "case.toml")
+    if not case_toml.exists():
+        return None
+
+    with open(case_toml, "rb") as f:
+        data = tomllib.load(f)
+
+    scenarios = data.get("scenario", [])
+    if not scenarios:
+        return None
+
+    return dict(scenarios[0])
+
+
+def _schedule_float(schedule, *keys, default=None, required=False):
+    for key in keys:
+        if key in schedule:
+            return float(schedule[key])
+    if required:
+        names = ", ".join(keys)
+        raise ValueError(f"[schedule] must define one of: {names}.")
+    return default
+
+
+def _schedule_departure_datetime(schedule, scenario):
+    raw_datetime = _scenario_value(scenario, "departure_datetime", None)
+    if raw_datetime is not None:
+        return pd.Timestamp(raw_datetime)
+
+    raw_date = _scenario_value(scenario, "departure_date", None)
+    if raw_date is None:
+        raw_date = _scenario_value(scenario, "date", None)
+    if raw_date is None:
+        raise ValueError(
+            "A scenario departure_date is required when itinerary.toml uses [schedule]."
+        )
+
+    raw_time = (
+        schedule.get("departure_time")
+        or schedule.get("leave_time")
+        or schedule.get("leave_time_hour")
+    )
+    if raw_time is None and "departure_hour" in schedule:
+        hour = float(schedule["departure_hour"])
+        whole_hour = int(hour)
+        minute = int(round((hour - whole_hour) * 60.0))
+        raw_time = f"{whole_hour:02d}:{minute:02d}"
+    if raw_time is None:
+        raise ValueError(
+            "[schedule] must define departure_time, leave_time, or departure_hour."
+        )
+
+    return pd.Timestamp(f"{raw_date}T{raw_time}")
+
+
+def _load_transits(data, schedule, scenario):
+    raw_transits = data.get("transit", [])
+    if not raw_transits:
+        raise ValueError("itinerary.toml must define at least two [[transit]] entries.")
+
+    if not schedule:
+        return [
             Transit(
                 city=t["city"],
                 arrival_datetime=t["arrival_datetime"],
@@ -471,7 +532,69 @@ def load_itinerary(map, case_dir=None) -> Itinerary:
                 power_cost=t["power_cost"],
                 max_charge_power=t["max_charge_power"],
             )
+            for t in raw_transits
+        ]
+
+    if len(raw_transits) != 2:
+        raise ValueError("[schedule] itinerary mode currently supports exactly two [[transit]] entries.")
+
+    departure = _schedule_departure_datetime(schedule, scenario)
+    sail_time_h = _schedule_float(schedule, "sail_time_h", "sail_hours", required=True)
+    default_port_time_h = _schedule_float(schedule, "port_time_h", default=0.0)
+    origin_port_time_h = _schedule_float(
+        schedule,
+        "origin_port_time_h",
+        "departure_port_time_h",
+        default=default_port_time_h,
+    )
+    destination_port_time_h = _schedule_float(
+        schedule,
+        "destination_port_time_h",
+        "arrival_port_time_h",
+        default=default_port_time_h,
+    )
+
+    origin_arrival = departure - pd.to_timedelta(origin_port_time_h, unit="h")
+    destination_arrival = departure + pd.to_timedelta(sail_time_h, unit="h")
+    destination_departure = destination_arrival + pd.to_timedelta(
+        destination_port_time_h,
+        unit="h",
+    )
+    computed_times = [
+        (origin_arrival, departure),
+        (destination_arrival, destination_departure),
+    ]
+
+    transits = []
+    for raw, (arrival, transit_departure) in zip(raw_transits, computed_times):
+        transits.append(
+            Transit(
+                city=raw["city"],
+                arrival_datetime=arrival.isoformat(timespec="minutes"),
+                departure_datetime=transit_departure.isoformat(timespec="minutes"),
+                lat=raw["lat"],
+                lon=raw["lon"],
+                power_cost=raw["power_cost"],
+                max_charge_power=raw["max_charge_power"],
+            )
         )
+    return transits
+
+
+def load_itinerary(map, case_dir=None, scenario=None) -> Itinerary:
+    with open(_case_file(case_dir, "itinerary.toml"), "rb") as f:
+        data = tomllib.load(f)
+    params = data.get("params", {})
+    soc_i=params["soc_i"]
+    soc_f=params["soc_f"]
+    timestep = params["timestep"]
+    init_speed = params["init_speed"]
+    fuel_price = params["fuel_price"]
+
+    if scenario is None and data.get("schedule", {}):
+        scenario = _default_case_scenario(case_dir)
+
+    transit_list = _load_transits(data, data.get("schedule", {}), scenario)
 
     # ---- compute nominal-grid timestep count ----
     start = transit_list[0].arrival_datetime
@@ -540,9 +663,9 @@ def load_states(map, itinerary) -> States:
     )
 
 #===================================================ALL======================================================================================
-def load_config(case_dir=None, weather_files=None):
+def load_config(case_dir=None, weather_files=None, scenario=None):
     map = load_map(case_dir=case_dir)
-    itinerary = load_itinerary(map, case_dir=case_dir)
+    itinerary = load_itinerary(map, case_dir=case_dir, scenario=scenario)
     states = load_states(map, itinerary)
     ship = load_ship(case_dir=case_dir)
     if weather_files is None:

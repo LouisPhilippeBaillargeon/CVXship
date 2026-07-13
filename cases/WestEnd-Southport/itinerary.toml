@@ -8,10 +8,16 @@
 # ============================
 [params]
 soc_i               = 1.5
-soc_f               = 0
+soc_f               = 3.0
 timestep            = 3.0
-fuel_price          = 1.396
+fuel_price          = 1.2155
 init_speed          = 0
+
+[schedule]
+departure_time = "06:00"
+sail_time_h = 38
+origin_port_time_h = 3
+destination_port_time_h = 3
 
 # ============================
 # Auxiliary load forecast
@@ -21,33 +27,28 @@ init_speed          = 0
 # ============================
 
 [[auxiliary_load]]
-power = 0.11
+power = 0.3
 
 # ============================
 # List of transit cities considered in the problem
 #city                : Name
-#arrival_datetime    : "YYYY-MM-DDTHH:MM" in the UTC timezone
-#departure_datetime  : "YYYY-MM-DDTHH:MM" in the UTC timezone
+#arrival/departure datetimes are generated from [schedule] and case.toml scenarios
 #lat                 : latitude
 #lon                 : longitude
 #power_cost          : ($/MWh)
 # ============================
 [[transit]]
 city                = "West End"
-arrival_datetime    = "2026-07-01T01:00"
-departure_datetime  = "2026-07-01T04:00"
 lat                 = 26.698933
 lon                 = -79.137095
-power_cost          = 183
-max_charge_power    = 5
+power_cost          = 363.5
+max_charge_power    = 2
 
 [[transit]]
 city                = "Southport"
-arrival_datetime    = "2026-07-02T00:00"
-departure_datetime  = "2026-07-02T00:00"
 lat                 = 33.640649
 lon                 = -78.060993
-power_cost          = 36.81
-max_charge_power    = 0
+power_cost          = 215
+max_charge_power    = 2
 # ============================
 

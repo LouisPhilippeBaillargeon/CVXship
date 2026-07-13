@@ -1,0 +1,54 @@
+# ============================
+# PARAMETERS
+# soc_i              : Initial state of charge (MWh)
+# soc_f              : Desired final state of charge (MWh)
+# timestep           : Duration of one timestep (h). 
+# fuel_price         : ($/kg)
+# init_speed         : (m/s)
+# ============================
+[params]
+soc_i               = 0.75
+soc_f               = 3.0
+timestep            = 4.0
+fuel_price          = 1.2155
+init_speed          = 0
+
+[schedule]
+departure_time = "06:00"
+sail_time_h = 20
+origin_port_time_h = 3
+destination_port_time_h = 3
+
+# ============================
+# Auxiliary load forecast
+# power              : Auxiliary load (MW)
+# until              : Optional end datetime. Omit on the last band to use it for the rest of the trip.
+# from/start_datetime: Optional explicit start datetime. If omitted, bands are contiguous in file order.
+# ============================
+
+[[auxiliary_load]]
+power = 0.3
+
+# ============================
+# List of transit cities considered in the problem
+#city                : Name
+#arrival/departure datetimes are generated from [schedule] and case.toml scenarios
+#lat                 : latitude
+#lon                 : longitude
+#power_cost          : ($/MWh)
+# ============================
+[[transit]]
+city                = "Sept-ile"
+lat                 = 50.068699
+lon                 = -66.256956
+power_cost          = 79.11
+max_charge_power    = 2
+
+[[transit]]
+city                = "Grosse-Ile"
+lat                 = 47.965557
+lon                 = -61.780420
+power_cost          = 79.11
+max_charge_power    = 2
+# ============================
+

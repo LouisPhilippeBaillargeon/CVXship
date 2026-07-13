@@ -18,6 +18,12 @@ def test_parse_indexes_accepts_spaces_commas_ranges_and_deduplicates():
     assert _parse_indexes("1 2,4 4 6-8", 10) == [1, 2, 4, 6, 7, 8]
 
 
+def test_parse_args_accepts_big_plot_flag():
+    args = pss._parse_args(["--BIG", "--all"])
+
+    assert args.text_size == "big"
+
+
 def test_parse_indexes_rejects_out_of_range_indexes():
     with pytest.raises(ValueError, match="outside 1..3"):
         _parse_indexes("1 4", 3)
@@ -27,7 +33,7 @@ def test_format_indexed_result_table_includes_numbered_rows():
     lines = _format_indexed_result_table(
         [
             {
-                "label": "Naive Controller",
+                "label": "SPaCS",
                 "estimated_cost": "13897.808700979465",
                 "solve_time": "0.0075092315673828125",
                 "is_valid": "True",
@@ -37,7 +43,7 @@ def test_format_indexed_result_table_includes_numbered_rows():
                 "validation_error_count": "0",
             },
             {
-                "label": "JPDSE",
+                "label": "JoPSE-D",
                 "estimated_cost": "14648.010277233052",
                 "solve_time": "31.461581707000732",
                 "is_valid": "True",
@@ -51,9 +57,9 @@ def test_format_indexed_result_table_includes_numbered_rows():
 
     table = "\n".join(lines)
     assert "[PLOT] Saved solution table" in table
-    assert "  1  Naive Controller" in table
+    assert "  1  SPaCS" in table
     assert "13897.808701" in table
-    assert "  2  JPDSE" in table
+    assert "  2  JoPSE-D" in table
     assert "0+2f" in table
     assert "energy_status" not in table
 

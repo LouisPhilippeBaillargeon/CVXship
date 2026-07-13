@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from typing import Optional,List, Any
 import matplotlib.pyplot as plt
 import numpy as np
@@ -10,6 +11,28 @@ from lib.experiment import solution_solver_status
 from lib import logging_utils as log
 
 # ====================== PLOTTING UTILITIES ======================
+
+PLOT_TEXT_SIZE_CHOICES = ("default", "big")
+BIG_PLOT_FONT_SCALE = 2.0
+MIN_PDF_PAD_INCHES = 0.05
+
+
+def normalize_plot_text_size(text_size: str | bool = "default") -> str:
+    if isinstance(text_size, bool):
+        return "big" if text_size else "default"
+
+    value = str(text_size).strip().lower()
+    if value == "ieee":
+        value = "default"
+    if value not in PLOT_TEXT_SIZE_CHOICES:
+        raise ValueError(
+            f"text_size must be one of {PLOT_TEXT_SIZE_CHOICES}, got {text_size!r}."
+        )
+    return value
+
+
+def plot_font_scale(text_size: str | bool = "default") -> float:
+    return BIG_PLOT_FONT_SCALE if normalize_plot_text_size(text_size) == "big" else 1.0
 
 def set_ieee_plot_style():
     """
@@ -36,6 +59,53 @@ def set_ieee_plot_style():
     })
 
 
+def _scale_figure_text(fig, font_scale: float = 1.0):
+    if font_scale == 1.0:
+        return
+
+    for ax in fig.get_axes():
+        if ax.title:
+            ax.title.set_fontsize(ax.title.get_fontsize() * font_scale)
+
+        if ax.xaxis.label:
+            ax.xaxis.label.set_fontsize(ax.xaxis.label.get_fontsize() * font_scale)
+        if ax.yaxis.label:
+            ax.yaxis.label.set_fontsize(ax.yaxis.label.get_fontsize() * font_scale)
+        if hasattr(ax, "zaxis") and ax.zaxis.label:
+            ax.zaxis.label.set_fontsize(ax.zaxis.label.get_fontsize() * font_scale)
+
+        for label in ax.get_xticklabels() + ax.get_yticklabels():
+            label.set_fontsize(label.get_fontsize() * font_scale)
+        if hasattr(ax, "get_zticklabels"):
+            for label in ax.get_zticklabels():
+                label.set_fontsize(label.get_fontsize() * font_scale)
+
+        leg = ax.get_legend()
+        if leg is not None:
+            for text in leg.get_texts():
+                text.set_fontsize(text.get_fontsize() * font_scale)
+
+
+def _strip_plot_titles(fig):
+    suptitle = getattr(fig, "_suptitle", None)
+    if suptitle is not None:
+        suptitle.set_text("")
+
+    for ax in fig.get_axes():
+        ax.set_title("")
+        ax.set_title("", loc="left")
+        ax.set_title("", loc="right")
+
+
+def _pdf_output_path(directory, name: str) -> Path:
+    name_path = Path(str(name))
+    if name_path.suffix:
+        name_path = name_path.with_suffix(".pdf")
+    else:
+        name_path = Path(f"{name_path}.pdf")
+    return Path(directory) / name_path
+
+
 def _ieee_axes(ax):
     ax.grid(True, which="both", linestyle="--", linewidth=0.6, alpha=0.6)
     ax.tick_params(direction="in", top=True, right=True)
@@ -46,8 +116,7 @@ def _ieee_axes(ax):
 def _finalize_axis(ax, xlabel: str, ylabel: str, title: Optional[str] = None):
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
-    if title is not None:
-        ax.set_title(title)
+    ax.set_title("")
     _ieee_axes(ax)
     ax.figure.tight_layout()
 
@@ -58,35 +127,26 @@ def _save_and_maybe_show(
     show: bool = False,
     directory=PLOTS,
     font_scale: float = 1.0,
-    file_format: str = "png",
-    pad_inches: float = 0.1,
+    file_format: str = "pdf",
+    pad_inches: float = MIN_PDF_PAD_INCHES,
 ):
     os.makedirs(directory, exist_ok=True)
-    file_format = str(file_format).lstrip(".")
-    path = os.path.join(directory, f"{name}.{file_format}")
+    path = _pdf_output_path(directory, name)
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-    if font_scale != 1.0:
-        for ax in fig.get_axes():
-            if ax.title:
-                ax.title.set_fontsize(ax.title.get_fontsize() * font_scale)
+    _scale_figure_text(fig, font_scale=font_scale)
+    _strip_plot_titles(fig)
 
-            if ax.xaxis.label:
-                ax.xaxis.label.set_fontsize(ax.xaxis.label.get_fontsize() * font_scale)
-            if ax.yaxis.label:
-                ax.yaxis.label.set_fontsize(ax.yaxis.label.get_fontsize() * font_scale)
+    fig.tight_layout(pad=0.4)
 
-            for label in ax.get_xticklabels() + ax.get_yticklabels():
-                label.set_fontsize(label.get_fontsize() * font_scale)
-
-            leg = ax.get_legend()
-            if leg is not None:
-                for text in leg.get_texts():
-                    text.set_fontsize(text.get_fontsize() * font_scale)
-
-    fig.tight_layout(pad=1.2)
-    fig.subplots_adjust(left=0.18, bottom=0.18)
-
-    fig.savefig(path, bbox_inches="tight", pad_inches=pad_inches, dpi=300)
+    save_pad_inches = max(float(pad_inches), MIN_PDF_PAD_INCHES)
+    fig.savefig(
+        path,
+        format="pdf",
+        bbox_inches="tight",
+        pad_inches=save_pad_inches,
+        dpi=300,
+    )
     log.debug("[SAVED] %s", path)
 
     if show:
@@ -110,6 +170,10 @@ def _get_solution_positions(sol, n_expected=None):
 
 
 _PLOT_TIME_EPS = 1e-9
+_OVERLAP_CURVE_RTOL = 1e-9
+_OVERLAP_CURVE_ATOL = 1e-9
+_OVERLAP_DOT_LENGTH_PT = 1.2
+_OVERLAP_DOT_SPACING_PT = 2.8
 
 
 def _plot_timestep_dt(sol, T):
@@ -174,6 +238,110 @@ def _plot_series_xy(sol, value):
 
     y = arr.reshape(-1)
     return np.arange(len(y), dtype=float), y
+
+
+def _same_plot_curve(curve_a, curve_b) -> bool:
+    xa, ya = curve_a
+    xb, yb = curve_b
+
+    xa = np.asarray(xa, dtype=float)
+    ya = np.asarray(ya, dtype=float)
+    xb = np.asarray(xb, dtype=float)
+    yb = np.asarray(yb, dtype=float)
+
+    if xa.shape != xb.shape or ya.shape != yb.shape:
+        return False
+
+    return (
+        np.allclose(
+            xa,
+            xb,
+            rtol=_OVERLAP_CURVE_RTOL,
+            atol=_OVERLAP_CURVE_ATOL,
+            equal_nan=True,
+        )
+        and np.allclose(
+            ya,
+            yb,
+            rtol=_OVERLAP_CURVE_RTOL,
+            atol=_OVERLAP_CURVE_ATOL,
+            equal_nan=True,
+        )
+    )
+
+
+def _overlap_group_positions(curves):
+    positions = [(1, 0)] * len(curves)
+    groups = []
+
+    for index, curve in enumerate(curves):
+        if curve is None:
+            continue
+
+        for group in groups:
+            if _same_plot_curve(curve, curves[group[0]]):
+                group.append(index)
+                break
+        else:
+            groups.append([index])
+
+    for group in groups:
+        for group_index, curve_index in enumerate(group):
+            positions[curve_index] = (len(group), group_index)
+
+    return positions
+
+
+def _overlap_line_kwargs(group_size: int = 1, group_index: int = 0):
+    group_size = max(int(group_size), 1)
+    group_index = int(group_index) % group_size
+
+    if group_size == 1:
+        gap = _OVERLAP_DOT_SPACING_PT
+        offset = 0.0
+    else:
+        cycle = group_size * _OVERLAP_DOT_SPACING_PT
+        gap = cycle - _OVERLAP_DOT_LENGTH_PT
+        offset = (cycle * group_index) / group_size
+
+    return {
+        "linestyle": (offset, (_OVERLAP_DOT_LENGTH_PT, gap)),
+        "dash_capstyle": "round",
+    }
+
+
+def _solution_map_trajectory_xy(sol, pos):
+    fixed_path_xy = getattr(sol, "fixed_path_waypoints", None)
+    crossing_point = getattr(sol, "crossing_point", None)
+
+    if fixed_path_xy is not None:
+        fixed_path_xy = np.asarray(fixed_path_xy, dtype=float)
+        if (
+            fixed_path_xy.ndim == 2
+            and fixed_path_xy.shape[1] == 2
+            and fixed_path_xy.shape[0] >= 2
+        ):
+            return fixed_path_xy[:, 0], fixed_path_xy[:, 1]
+
+    if crossing_point is not None:
+        Q = np.asarray(crossing_point, dtype=float)
+        if Q.ndim == 2 and Q.shape[1] == 2 and Q.shape[0] == pos.shape[0] - 1:
+            broken_x = []
+            broken_y = []
+
+            for t in range(pos.shape[0] - 1):
+                p0 = pos[t]
+                q = Q[t]
+                p1 = pos[t + 1]
+
+                broken_x.extend([p0[0], q[0], p1[0], np.nan])
+                broken_y.extend([p0[1], q[1], p1[1], np.nan])
+
+            return np.asarray(broken_x, dtype=float), np.asarray(broken_y, dtype=float)
+
+        return None
+
+    return pos[:, 0], pos[:, 1]
 
 
 def _plot_generator_xy(sol, value):
@@ -305,8 +473,16 @@ def _plot_solution_map_overlay(
     draw_sets=True,
     show_positions=False,
     show_crossing_points=False,
+    font_scale: float = 1.0,
 ):
     positions = [_get_solution_positions(sol, T + 1) for sol in solutions]
+    trajectory_curves = [
+        _solution_map_trajectory_xy(sol, pos)
+        if pos is not None and pos.shape[0] > 0
+        else None
+        for sol, pos in zip(solutions, positions)
+    ]
+    overlap_positions = _overlap_group_positions(trajectory_curves)
 
     if not any(pos is not None and pos.shape[0] > 0 for pos in positions):
         log.warning("[WARN] No valid ship_pos found; skipping solution map overlay.")
@@ -323,11 +499,12 @@ def _plot_solution_map_overlay(
         set_polys = _draw_colored_sets(ax, map_obj.set_ineq)
         all_xy.extend(set_polys)
 
-    for sol, pos, label in zip(solutions, positions, labels):
+    for sol, pos, label, overlap_position in zip(solutions, positions, labels, overlap_positions):
         if pos is None or pos.shape[0] == 0:
             continue
 
         pos = np.asarray(pos, dtype=float)
+        line_kwargs = _overlap_line_kwargs(*overlap_position)
 
         fixed_path_xy = getattr(sol, "fixed_path_waypoints", None)
         crossing_point = getattr(sol, "crossing_point", None)
@@ -352,12 +529,12 @@ def _plot_solution_map_overlay(
                 ax.plot(
                     fixed_path_xy[:, 0],
                     fixed_path_xy[:, 1],
-                    "--",                  # dashed
-                    linewidth=1.2,         # thinner
+                    linewidth=1.2,
                     color=color,
-                    alpha=0.8,             # slightly transparent
+                    alpha=0.9,
                     label=label,
                     zorder=10,
+                    **line_kwargs,
                 )
 
                 # Optional timestep positions
@@ -408,12 +585,12 @@ def _plot_solution_map_overlay(
                 ax.plot(
                     broken_x,
                     broken_y,
-                    "--",
                     linewidth=1.2,
                     color=color,
-                    alpha=0.8,
+                    alpha=0.9,
                     label=label,
                     zorder=10,
+                    **line_kwargs,
                 )
 
                 # Optional timestep positions
@@ -448,12 +625,12 @@ def _plot_solution_map_overlay(
             ax.plot(
                 pos[:, 0],
                 pos[:, 1],
-                "--",
                 linewidth=1.2,
                 color=color,
-                alpha=0.8,
+                alpha=0.9,
                 label=label,
                 zorder=10,
+                **line_kwargs,
             )
 
             if show_positions:
@@ -517,7 +694,7 @@ def _plot_solution_map_overlay(
         title="Ship trajectory over feasibility map",
     )
 
-    _save_and_maybe_show(fig, name, show, directory=directory ,font_scale = 2.0)
+    _save_and_maybe_show(fig, name, show, directory=directory, font_scale=font_scale)
 
 # ====================== MAIN SUMMARY / PLOTTING FUNCTIONS ======================
 def _print_cost_summary_vs_benchmark(solutions, labels, benchmark_label):
@@ -720,7 +897,10 @@ def plot_solutions(
     subfolder=None,
     map=None,
     output_root=None,
+    text_size: str = "default",
 ):
+    set_ieee_plot_style()
+    font_scale = plot_font_scale(text_size)
 
     if labels is None:
         labels = [f"Solution {i}" for i in range(len(solutions))]
@@ -757,6 +937,7 @@ def plot_solutions(
     def _plot_attr(attr, title, ylabel, filename):
         fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=150)
 
+        curves = []
         for sol, label in zip(solutions, labels):
             if not hasattr(sol, attr) or getattr(sol, attr) is None:
                 continue
@@ -764,13 +945,20 @@ def plot_solutions(
             x, y = _plot_series_xy(sol, getattr(sol, attr))
             if len(y) == 0:
                 continue
+            curves.append((x, y, label))
+
+        overlap_positions = _overlap_group_positions(
+            [(x, y) for x, y, _ in curves]
+        )
+
+        for (x, y, label), overlap_position in zip(curves, overlap_positions):
             ax.plot(
                 x,
                 y,
-                "--",
                 linewidth=1.2,
-                alpha=0.8,
-                label=label
+                alpha=0.9,
+                label=label,
+                **_overlap_line_kwargs(*overlap_position),
             )
 
         ax.legend(frameon=False)
@@ -780,7 +968,7 @@ def plot_solutions(
             ylabel=ylabel,
             title=title,
         )
-        _save_and_maybe_show(fig, filename, show, directory=directory, font_scale=2.0)
+        _save_and_maybe_show(fig, filename, show, directory=directory, font_scale=font_scale)
 
     # ============================================================
     # 1) Map overlay
@@ -796,6 +984,7 @@ def plot_solutions(
             name="cmp_ship_pos_xy_map",
             draw_feasibility=True,
             draw_sets=True,
+            font_scale=font_scale,
         )
 
     # ============================================================
@@ -826,15 +1015,21 @@ def plot_solutions(
     # ============================================================
     fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=150)
 
+    curves = []
     for sol, label in zip(solutions, labels):
         x, y = _plot_soc_xy(sol, sol.SOC)
+        curves.append((x, y, label))
+
+    overlap_positions = _overlap_group_positions([(x, y) for x, y, _ in curves])
+
+    for (x, y, label), overlap_position in zip(curves, overlap_positions):
         ax.plot(
             x,
             y,
-            "--",
             linewidth=1.2,
-            alpha=0.8,
-            label=label
+            alpha=0.9,
+            label=label,
+            **_overlap_line_kwargs(*overlap_position),
         )
 
     ax.legend(frameon=False)
@@ -844,25 +1039,31 @@ def plot_solutions(
         ylabel="SOC [MWh]",
         title="Battery state of charge",
     )
-    _save_and_maybe_show(fig, "cmp_SOC", show, directory=directory, font_scale=2.0)
+    _save_and_maybe_show(fig, "cmp_SOC", show, directory=directory, font_scale=font_scale)
 
     # ============================================================
     # 4) Total generation power
     # ============================================================
     fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=150)
 
+    curves = []
     for sol, label in zip(solutions, labels):
         x, gen_power = _plot_generator_xy(sol, sol.generation_power)
         y = np.sum(gen_power, axis=0)
         if len(y) == 0:
             continue
+        curves.append((x, y, label))
+
+    overlap_positions = _overlap_group_positions([(x, y) for x, y, _ in curves])
+
+    for (x, y, label), overlap_position in zip(curves, overlap_positions):
         ax.plot(
             x,
             y,
-            "--",
             linewidth=1.2,
-            alpha=0.8,
-            label=label
+            alpha=0.9,
+            label=label,
+            **_overlap_line_kwargs(*overlap_position),
         )
 
     ax.legend(frameon=False)
@@ -872,25 +1073,31 @@ def plot_solutions(
         ylabel="total generation power [MW]",
         title="Total generation power",
     )
-    _save_and_maybe_show(fig, "cmp_total_generation_power", show, directory=directory, font_scale=2.0)
+    _save_and_maybe_show(fig, "cmp_total_generation_power", show, directory=directory, font_scale=font_scale)
 
     # ============================================================
     # 5) Total generator cost
     # ============================================================
     fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=150)
 
+    curves = []
     for sol, label in zip(solutions, labels):
         x, gen_costs = _plot_generator_xy(sol, sol.gen_costs)
         y = np.sum(gen_costs, axis=0)
         if len(y) == 0:
             continue
+        curves.append((x, y, label))
+
+    overlap_positions = _overlap_group_positions([(x, y) for x, y, _ in curves])
+
+    for (x, y, label), overlap_position in zip(curves, overlap_positions):
         ax.plot(
             x,
             y,
-            "--",
             linewidth=1.2,
-            alpha=0.8,
-            label=label
+            alpha=0.9,
+            label=label,
+            **_overlap_line_kwargs(*overlap_position),
         )
 
     ax.legend(frameon=False)
@@ -900,25 +1107,31 @@ def plot_solutions(
         ylabel="total generator cost [$ / h]",
         title="Total generator cost",
     )
-    _save_and_maybe_show(fig, "cmp_total_generator_cost", show, directory=directory, font_scale=2.0)
+    _save_and_maybe_show(fig, "cmp_total_generator_cost", show, directory=directory, font_scale=font_scale)
 
     # ============================================================
     # 6) Set index
     # ============================================================
     fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=150)
 
+    curves = []
     for sol, label in zip(solutions, labels):
         set_selection = np.asarray(sol.set_selection, dtype=float)
         set_idx = np.argmax(set_selection, axis=1)
         x, y = _plot_set_index_xy(sol, set_idx)
+        curves.append((x, y, label))
+
+    overlap_positions = _overlap_group_positions([(x, y) for x, y, _ in curves])
+
+    for (x, y, label), overlap_position in zip(curves, overlap_positions):
         ax.step(
             x,
             y,
             where="post",
-            linestyle="--",
             linewidth=1.2,
-            alpha=0.8,
-            label=label
+            alpha=0.9,
+            label=label,
+            **_overlap_line_kwargs(*overlap_position),
         )
 
     ax.legend(frameon=False)
@@ -928,7 +1141,7 @@ def plot_solutions(
         ylabel="set index",
         title="Selected set",
     )
-    _save_and_maybe_show(fig, "cmp_set_index", show, directory=directory, font_scale=2.0)
+    _save_and_maybe_show(fig, "cmp_set_index", show, directory=directory, font_scale=font_scale)
 
     # ============================================================
     # 7) Total estimated cost summary
@@ -946,7 +1159,7 @@ def plot_solutions(
         ylabel="estimated cost [$]",
         title="Estimated total cost",
     )
-    _save_and_maybe_show(fig, "cmp_estimated_cost", show, directory=directory, font_scale=2.0)
+    _save_and_maybe_show(fig, "cmp_estimated_cost", show, directory=directory, font_scale=font_scale)
 
 
 def load_solutions_from_pkl(
@@ -990,7 +1203,15 @@ def load_solutions_from_pkl(
     log.verbose("Loaded %d solution(s) from: %s", len(solutions), base_dir)
     return solutions
 
-def plot_weather_snapshot(map, weather, variable="current_x", t_index=0, show: bool = False, output_root=None):
+def plot_weather_snapshot(
+    map,
+    weather,
+    variable="current_x",
+    t_index=0,
+    show: bool = False,
+    output_root=None,
+    text_size: str = "default",
+):
     """
     Quick 2D visualization of a weather variable at a given timestep.
 
@@ -1002,6 +1223,7 @@ def plot_weather_snapshot(map, weather, variable="current_x", t_index=0, show: b
     Figure is saved in PLOTS.
     """
     set_ieee_plot_style()
+    font_scale = plot_font_scale(text_size)
 
     data = getattr(weather, variable)[:, t_index]
     centroids = map.set_centroids
@@ -1024,7 +1246,13 @@ def plot_weather_snapshot(map, weather, variable="current_x", t_index=0, show: b
     )
 
     directory = output_root if output_root is not None else PLOTS
-    _save_and_maybe_show(fig, f"weather_snapshot_{variable}_t{t_index}", show, directory=directory, font_scale = 2.0)
+    _save_and_maybe_show(
+        fig,
+        f"weather_snapshot_{variable}_t{t_index}",
+        show,
+        directory=directory,
+        font_scale=font_scale,
+    )
 
 def plot_sets_and_points(
     ship_pos: np.ndarray,
@@ -1034,7 +1262,10 @@ def plot_sets_and_points(
     name: str = "sets_and_trajectory",
     show: bool = False,
     output_root=None,
+    text_size: str = "default",
 ):
+    set_ieee_plot_style()
+    font_scale = plot_font_scale(text_size)
     ship_pos = np.asarray(ship_pos, dtype=float)
 
     if ship_pos.ndim == 1:
@@ -1082,7 +1313,7 @@ def plot_sets_and_points(
                 color=color,
             )
             c = verts.mean(axis=0)
-            ax.text(c[0], c[1], str(z), fontsize=9)
+            ax.text(c[0], c[1], str(z), fontsize=9 if font_scale > 1.0 else plt.rcParams["font.size"])
 
     ax.plot(x, y, "-o", linewidth=1.5, markersize=4, label="trajectory")
     ax.scatter(x[0], y[0], s=80, marker="s", label="start")
@@ -1116,9 +1347,8 @@ def plot_sets_and_points(
     ax.grid(True, which="both", linestyle="--", linewidth=0.6, alpha=0.6)
     ax.set_xlabel("x")
     ax.set_ylabel("y")
-    ax.set_title("Sets (filled) and ship trajectory")
     ax.legend()
 
     directory = output_root if output_root is not None else PLOTS
-    _save_and_maybe_show(fig, name, show, directory=directory, font_scale = 2.0)
+    _save_and_maybe_show(fig, name, show, directory=directory, font_scale=font_scale)
     return in_set

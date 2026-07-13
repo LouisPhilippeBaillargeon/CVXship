@@ -11,7 +11,7 @@ from lib.weather_interpolation import xy_km_to_latlon
 from lib.utils import dx_dy_km
 
 
-CASE_DIR = Path("cases/sept-iles-gaspe")
+CASE_DIR = Path("cases/halifax-grande-entree")
 
 
 def _write_geojson(path, map_obj, waypoints):

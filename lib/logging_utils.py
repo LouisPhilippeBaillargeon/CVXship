@@ -112,9 +112,9 @@ class _ForwardingLogHandler(logging.Handler):
 
 def _level_from_print_text(message: str, default_level: int) -> int:
     normalized = message.lstrip().upper()
-    if normalized.startswith(("[ERROR]", "ERROR", "[EMS ERROR]", "[FR_O ERROR]")):
+    if normalized.startswith(("[ERROR]", "ERROR", "[EMS ERROR]", "[FR_O ERROR]", "[FIPSE-TI ERROR]")):
         return logging.ERROR
-    if normalized.startswith(("[WARN]", "WARNING", "[EMS WARNING]", "[FR_O WARNING]")):
+    if normalized.startswith(("[WARN]", "WARNING", "[EMS WARNING]", "[FR_O WARNING]", "[FIPSE-TI WARNING]")):
         return logging.WARNING
     return default_level
 

@@ -26,11 +26,33 @@ from lib.wrt_adapter import (
     snap_waypoints_to_map_sets,
 )
 from lib.debug_diagnostics import record_optimizer_debug
+from lib.optimizer_names import (
+    FIPSE_ST,
+    FIPSE_TI,
+    JOPSE_C_DEPARTURE,
+    JOPSE_C_TRANSITION,
+    JOPSE_D,
+    SPACS,
+    optimizer_display_label,
+)
 from lib import logging_utils as log
 from lib.logging_utils import solve_with_logging
 
 
 _CVXPY_SUCCESS_STATUSES = {cp.OPTIMAL, cp.OPTIMAL_INACCURATE}
+_SPACS_LABEL = optimizer_display_label(SPACS)
+_FIPSE_ST_LABEL = optimizer_display_label(FIPSE_ST)
+_FIPSE_TI_LABEL = optimizer_display_label(FIPSE_TI)
+_JOPSE_D_LABEL = optimizer_display_label(JOPSE_D)
+_JOPSE_C_DEPARTURE_LABEL = optimizer_display_label(JOPSE_C_DEPARTURE)
+_JOPSE_C_TRANSITION_LABEL = optimizer_display_label(JOPSE_C_TRANSITION)
+
+
+def _cvxpy_variable_scalar_count(variable) -> int:
+    shape = getattr(variable, "shape", ())
+    if shape in (None, ()):
+        return 1
+    return int(np.prod(shape))
 
 
 def _solver_succeeded(problem, optimizer_name: str) -> bool:
@@ -210,13 +232,13 @@ def annotate_fit_range_warnings(sol, propulsion_model=None, wind_model=None, shi
     return sol
 
 
-def _jpcse_normal_wind_inactive_expr(set_selection, t: int, z: int, use_transition_wind_model: bool):
+def _jopse_c_normal_wind_inactive_expr(set_selection, t: int, z: int, use_transition_wind_model: bool):
     if use_transition_wind_model:
         return 2 - set_selection[t, z] - set_selection[t + 1, z]
     return 1 - set_selection[t, z]
 
 
-def _jpcse_transition_wind_inactive_expr(set_selection, t: int, z: int, z_next: int):
+def _jopse_c_transition_wind_inactive_expr(set_selection, t: int, z: int, z_next: int):
     return 2 - set_selection[t, z] - set_selection[t + 1, z_next]
 
 
@@ -306,6 +328,7 @@ class Solution:
     gen_shutdown            : Optional[np.ndarray] = None
     generator_transition_cost: Optional[float] = None
     generator_unit_commitment: Optional[bool] = None
+    zone_membership_binary_count: Optional[int] = None
     solar_curtailment       : Optional[np.ndarray] = None
     solver_status           : Optional[str] = None
     failure_reason          : Optional[str] = None
@@ -999,7 +1022,7 @@ def _ship_speed_limit_matrix(map_obj, itinerary, states, ship, T_future: int) ->
     return ship_speed_limit_matrix(map_obj, itinerary, states, ship, T_future)
 
 
-def _jpcse_leg_metrics(
+def _jopse_c_leg_metrics(
     ship_pos,
     crossing_point,
     set_selection,
@@ -1009,7 +1032,7 @@ def _jpcse_leg_metrics(
     interval_sail_fraction=None,
 ):
     """
-    Compute JPCSE geometry and water-relative leg metrics from solved positions.
+    Compute JoPSE-C geometry and water-relative leg metrics from solved positions.
 
     Positions are in km, currents are in m/s, and returned speeds are in m/s.
     This mirrors the paper formulation: crossing time stays free, scalar speed
@@ -1122,7 +1145,7 @@ def _jpcse_leg_metrics(
 
 
 @dataclass
-class JPDSE:
+class JointPathDiscreteSpeedEnergyOptimizer:
     # Left point indexing
     # Convex non-linear least-squares models
     wind_model          : WindModel2D
@@ -1155,11 +1178,12 @@ class JPDSE:
         restrict_to_base=False,
         base_solution=None,
         base_set_radius=1,
-        transition_overlap_tol_km=0.05,
+        transition_overlap_tol_km=0.0,
         verbose=False,
     ):
         constraints = []
-        _require_convex_ship_models(self, "JPDSE")
+        self.zone_membership_binary_count = 0
+        _require_convex_ship_models(self, _JOPSE_D_LABEL)
         transition_overlap_tol_km = float(transition_overlap_tol_km)
         if transition_overlap_tol_km < 0.0:
             raise ValueError("transition_overlap_tol_km must be nonnegative.")
@@ -1211,6 +1235,7 @@ class JPDSE:
                 constraints += [ship_pos[t, 1] == port_y[p]]
         # ================================================== SETS ====================================================
         set_selection = cp.Variable((T_future + 1, self.map.nb_sets), boolean=True)
+        self.zone_membership_binary_count = _cvxpy_variable_scalar_count(set_selection)
         big_M = _compute_tight_big_M_set(self.map, self.map.set_ineq)
 
         for t in range(T_future + 1):
@@ -1255,7 +1280,7 @@ class JPDSE:
                 self.map.set_adj,
                 current_set=current_set,
                 destination_set=int(port_set_idx[-1]),
-                optimizer_name="JPDSE",
+                optimizer_name=_JOPSE_D_LABEL,
             )
 
             log.debug("Ordered set ids from %s: %s", ordered_set_source, ordered_set_ids)
@@ -1394,7 +1419,7 @@ class JPDSE:
                     if allowed_set_mask[t, z] < 0.5:
                         constraints += [set_selection[t, z] == 0]
 
-            log.debug("Restricted JPDSE sets to base +/- %s.", base_set_radius)
+            log.debug("Restricted %s sets to base +/- %s.", _JOPSE_D_LABEL, base_set_radius)
 
         # ================================================ EARTH-FIXED SPEED ==========================================
         ship_speed_x = cp.Variable((T_future, H))
@@ -1691,7 +1716,7 @@ class JPDSE:
         self.solve_time = solve_time
 
         # ================================================= RESULTS ====================================================
-        if _solver_succeeded(problem, "JPDSE"):
+        if _solver_succeeded(problem, _JOPSE_D_LABEL):
 
             gen_on_out = _value_array(generator_dispatch.gen_on)
             gen_startup_out = _value_array(generator_dispatch.startup)
@@ -1773,6 +1798,7 @@ class JPDSE:
                 gen_shutdown            = gen_shutdown_out,
                 generator_transition_cost= generator_transition_cost,
                 generator_unit_commitment=unit_commitment,
+                zone_membership_binary_count=self.zone_membership_binary_count,
                 solver_status=problem.status,
             )
             annotate_fit_range_warnings(
@@ -1782,10 +1808,10 @@ class JPDSE:
                 ship=self.ship,
             )
             record_optimizer_debug(
-                "JPDSE",
+                _JOPSE_D_LABEL,
                 self,
                 {
-                    "mode": "JPDSE",
+                    "mode": JOPSE_D,
                     "set_selection": set_selection.value,
                     "ship_speed_vec": ship_speed_out,
                     "rel_speed_vec": speed_rel_water_out,
@@ -1805,12 +1831,12 @@ class JPDSE:
             return 1
 
         else:
-            log.error("JPDSE optimization status: %s", problem.status)
+            log.error("%s optimization status: %s", _JOPSE_D_LABEL, problem.status)
             self.failure_reason = f"solver_status:{problem.status}"
             return 0
 
 @dataclass
-class JPCSE:
+class JointPathContinuousSpeedEnergyOptimizer:
     wind_model          : WindModel2D
     wind_model_nd       : Optional[WindModelTransition1D]
     propulsion_model    : PropulsionModel
@@ -1844,11 +1870,12 @@ class JPCSE:
         base_solution=None,
         base_set_radius=1,
         use_transition_wind_model=None,
-        transition_overlap_tol_km=0.05,
+        transition_overlap_tol_km=0.0,
         verbose=False,
     ):
         constraints = []
-        _require_convex_ship_models(self, "JPCSE")
+        self.zone_membership_binary_count = 0
+        _require_convex_ship_models(self, _JOPSE_C_DEPARTURE_LABEL)
         transition_overlap_tol_km = float(transition_overlap_tol_km)
         if transition_overlap_tol_km < 0.0:
             raise ValueError("transition_overlap_tol_km must be nonnegative.")
@@ -1873,7 +1900,7 @@ class JPCSE:
         interval_sail = interval_sail_fraction > 0.5
         interval_port_idx = _future_interval_port_idx(self.itinerary, self.states, T_future, port_idx)
         if use_transition_wind_model and self.wind_model_nd is None:
-            raise ValueError("JPCSE transition wind model option requires wind_model_nd.")
+            raise ValueError("JoPSE-C transition weather model option requires wind_model_nd.")
         transition_valid_pairs = (
             getattr(self.wind_model_nd, "valid_pairs", None)
             if use_transition_wind_model
@@ -1881,7 +1908,7 @@ class JPCSE:
         )
         if use_transition_wind_model and transition_valid_pairs is not None and not enforce_adjacency:
             raise ValueError(
-                "JPCSE transition wind model is fitted only for adjacent set pairs; "
+                "JoPSE-C transition weather model is fitted only for adjacent set pairs; "
                 "use enforce_adjacency=True or fit transition coefficients for all allowed pairs."
             )
 
@@ -1914,6 +1941,7 @@ class JPCSE:
 
         # ================================================== SETS ====================================================
         set_selection = cp.Variable((T_future + 1, self.map.nb_sets), boolean=True)
+        self.zone_membership_binary_count = _cvxpy_variable_scalar_count(set_selection)
         big_M = _compute_tight_big_M_set(self.map, self.map.set_ineq)
 
         for t in range(T_future + 1):
@@ -1958,7 +1986,7 @@ class JPCSE:
                 self.map.set_adj,
                 current_set=current_set,
                 destination_set=int(port_set_idx[-1]),
-                optimizer_name="JPCSE",
+                optimizer_name=_JOPSE_C_DEPARTURE_LABEL,
             )
 
             log.debug("Ordered set ids from %s: %s", ordered_set_source, ordered_set_ids)
@@ -2097,7 +2125,7 @@ class JPCSE:
                     if allowed_set_mask[t, z] < 0.5:
                         constraints += [set_selection[t, z] == 0]
 
-            log.debug("Restricted JPCSE sets to base +/- %s.", base_set_radius)
+            log.debug("Restricted JoPSE-C sets to base +/- %s.", base_set_radius)
 
         # ================================================ EARTH-FIXED SPEED ==========================================
         ship_speed_x = cp.Variable(T_future)
@@ -2118,7 +2146,7 @@ class JPCSE:
                 ]
 
         for t in range(T_future):
-            # JPCSE keeps crossing time free; legal speed applies to the scalar
+            # JoPSE-C keeps crossing time free; legal speed applies to the scalar
             # speed magnitude from total leg distance, not to helper-leg speeds.
             constraints += [
                 speed_mag[t] <= set_selection[t, :] @ ship_speed_limit[:, t],
@@ -2209,7 +2237,7 @@ class JPCSE:
             if interval_sail_fraction[t] > 0.01:
 
                 for z in range(self.map.nb_sets):
-                    normal_inactive = _jpcse_normal_wind_inactive_expr(
+                    normal_inactive = _jopse_c_normal_wind_inactive_expr(
                         set_selection,
                         t,
                         z,
@@ -2244,7 +2272,7 @@ class JPCSE:
                             if transition_valid_pairs is not None and not transition_valid_pairs[z, z_next]:
                                 continue
 
-                            transition_inactive = _jpcse_transition_wind_inactive_expr(
+                            transition_inactive = _jopse_c_transition_wind_inactive_expr(
                                 set_selection,
                                 t,
                                 z,
@@ -2424,7 +2452,13 @@ class JPCSE:
         self.solve_time = solve_time
 
         # ================================================= RESULTS ====================================================
-        if _solver_succeeded(problem, "JPCSE"):
+        active_label = (
+            _JOPSE_C_TRANSITION_LABEL
+            if use_transition_wind_model
+            else _JOPSE_C_DEPARTURE_LABEL
+        )
+
+        if _solver_succeeded(problem, active_label):
             gen_on_out = _value_array(generator_dispatch.gen_on)
             gen_startup_out = _value_array(generator_dispatch.startup)
             gen_shutdown_out = _value_array(generator_dispatch.shutdown)
@@ -2433,7 +2467,7 @@ class JPCSE:
             set_selection_out = np.asarray(set_selection.value, dtype=float)
             ship_pos_out = np.asarray(ship_pos.value, dtype=float)
             crossing_point_out = np.asarray(crossing_point.value, dtype=float)
-            leg_metrics = _jpcse_leg_metrics(
+            leg_metrics = _jopse_c_leg_metrics(
                 ship_pos_out,
                 crossing_point_out,
                 set_selection_out,
@@ -2492,10 +2526,11 @@ class JPCSE:
                 gen_shutdown            = gen_shutdown_out,
                 generator_transition_cost= generator_transition_cost,
                 generator_unit_commitment=unit_commitment,
+                zone_membership_binary_count=self.zone_membership_binary_count,
                 first_stage_optimizer   = (
-                    "JPCSE_transit_wind"
+                    _JOPSE_C_TRANSITION_LABEL
                     if use_transition_wind_model
-                    else "JPCSE_departure_wind"
+                    else _JOPSE_C_DEPARTURE_LABEL
                 ),
                 solver_status=problem.status,
             )
@@ -2510,12 +2545,12 @@ class JPCSE:
                 ship=self.ship,
             )
             record_optimizer_debug(
-                "JPCSE_transit_wind"
-                if use_transition_wind_model
-                else "JPCSE_departure_wind",
+                active_label,
                 self,
                 {
-                    "mode": "JPCSE",
+                    "mode": JOPSE_C_TRANSITION
+                    if use_transition_wind_model
+                    else JOPSE_C_DEPARTURE,
                     "use_transition_wind_model": use_transition_wind_model,
                     "set_selection": set_selection.value,
                     "ship_speed_x": ship_speed_x.value,
@@ -2540,12 +2575,12 @@ class JPCSE:
             return 1
 
         else:
-            log.error("JPCSE optimization status: %s", problem.status)
+            log.error("%s optimization status: %s", active_label, problem.status)
             self.failure_reason = f"solver_status:{problem.status}"
             return 0
 
 @dataclass
-class FPJSE:
+class FixedPathSpaceTimeSpeedEnergyOptimizer:
     wind_model          : WindModel1D
     propulsion_model    : PropulsionModel
     calm_model          : CalmWaterModel
@@ -2581,7 +2616,7 @@ class FPJSE:
         T_future: int,
     ):
         if self.nc_sources is None:
-            raise ValueError("FPJSE requires nc_sources prepared from weather.toml.")
+            raise ValueError("FiPSE-ST requires nc_sources prepared from weather.toml.")
 
         weather_inputs = build_path_segment_weather_inputs(
             self.nc_sources,
@@ -2615,9 +2650,9 @@ class FPJSE:
             diagnostic_wind_samples=weather_inputs["diagnostic_wind_samples"],
         )
 
-        log.debug("[FPJSE] fitted path-segment sampled wind models")
-        log.debug("[FPJSE] sampled current_x first segment: %s", current_x_path[0, :5])
-        log.debug("[FPJSE] sampled irradiance first segment: %s", irradiance_path[0, :5])
+        log.debug("[FiPSE-ST] fitted path-segment sampled wind models")
+        log.debug("[FiPSE-ST] sampled current_x first segment: %s", current_x_path[0, :5])
+        log.debug("[FiPSE-ST] sampled irradiance first segment: %s", irradiance_path[0, :5])
 
     def optimize(
         self,
@@ -2630,7 +2665,8 @@ class FPJSE:
         verbose=False,
     ):
         constraints = []
-        _require_convex_ship_models(self, "FPJSE")
+        self.zone_membership_binary_count = 0
+        _require_convex_ship_models(self, _FIPSE_ST_LABEL)
 
         if self.states.timesteps_completed >= self.itinerary.nb_timesteps:
             raise ValueError("No timesteps left to optimize; trip is finished.")
@@ -2724,6 +2760,7 @@ class FPJSE:
 
         # ================================= NODE SEGMENTS =================================
         path_set_selection = cp.Variable((T_future + 1, nb_path_sets), boolean=True)
+        self.zone_membership_binary_count = _cvxpy_variable_scalar_count(path_set_selection)
 
         for t in range(T_future + 1):
             constraints += [cp.sum(path_set_selection[t, :]) == 1]
@@ -2806,7 +2843,7 @@ class FPJSE:
                     if allowed_set_mask[t, s] < 0.5:
                         constraints += [path_set_selection[t, s] == 0]
 
-            log.debug("Restricted FPJSE segments to base +/- %s.", base_set_radius)
+            log.debug("Restricted %s segments to base +/- %s.", _FIPSE_ST_LABEL, base_set_radius)
 
         # ================================= SPEED =================================
         step_distance = cp.Variable(T_future, nonneg=True)
@@ -2826,7 +2863,7 @@ class FPJSE:
             constraints += [cp.sum(speed_set_end[t, :]) == speed_mag[t]]
 
             for s in range(nb_path_sets):
-                # FPJSE uses one legal speed per timestep. Start/end auxiliaries
+                # FiPSE-ST uses one legal speed per timestep. Start/end auxiliaries
                 # only select heading/current approximations, so both endpoints
                 # conservatively cap the full timestep speed.
                 constraints += [
@@ -2928,7 +2965,7 @@ class FPJSE:
 
 
         if self.wind_model_path is None:
-            raise ValueError("FPJSE path-sampled wind model was not fitted.")
+            raise ValueError("FiPSE-ST path-sampled wind model was not fitted.")
         WIND_BIG_M = float(self.wind_model_path.big_m_resistance)
 
         constraints += [wind_resistance <= WIND_BIG_M]
@@ -3003,8 +3040,7 @@ class FPJSE:
         advance_speed = cp.Variable(T_future, nonneg=True)
         norm_adv_speed = cp.Variable(T_future, nonneg=True)
 
-        constraints += [prop_power <= self.ship.propulsion.max_pow * self.ship.propulsion.nb_propellers]
-        constraints += [res_per_prop <= self.ship.propulsion.max_pow]
+        constraints += [prop_power <= self.ship.propulsion.max_pow * self.ship.propulsion.nb_propellers]
 
         constraints += [advance_speed == speed_rel_water_mag * (1 - self.ship.propulsion.wake_fraction)]
         constraints += [norm_adv_speed == advance_speed / self.propulsion_model.max_ua]
@@ -3142,8 +3178,8 @@ class FPJSE:
         self.solver_status = problem.status
         self.solve_time = solve_time
 
-        if not _solver_succeeded(problem, "FPJSE"):
-            log.error("FPJSE optimization status: %s", problem.status)
+        if not _solver_succeeded(problem, _FIPSE_ST_LABEL):
+            log.error("%s optimization status: %s", _FIPSE_ST_LABEL, problem.status)
             self.failure_reason = f"solver_status:{problem.status}"
             return 0
 
@@ -3152,7 +3188,7 @@ class FPJSE:
         _assert_fixed_path_single_waypoint_per_timestep(
             D_breaks,
             d_opt,
-            "FPJSE",
+            _FIPSE_ST_LABEL,
             waypoints=waypoints,
             path_set_ids=path_set_ids,
         )
@@ -3240,6 +3276,7 @@ class FPJSE:
             gen_shutdown=gen_shutdown_out,
             generator_transition_cost=generator_transition_cost,
             generator_unit_commitment=unit_commitment,
+            zone_membership_binary_count=self.zone_membership_binary_count,
             solver_status=problem.status,
         )
         annotate_fit_range_warnings(
@@ -3253,10 +3290,10 @@ class FPJSE:
             ship=self.ship,
         )
         record_optimizer_debug(
-            "FPJSE",
+            _FIPSE_ST_LABEL,
             self,
             {
-                "mode": "FPJSE",
+                "mode": FIPSE_ST,
                 "path_set_selection": path_set_selection.value,
                 "ship_speed_split_value": np.stack(
                     [
@@ -3289,13 +3326,13 @@ class FPJSE:
 
 
 @dataclass
-class FR_O:
+class FixedPathTrajectoryIndexedSpeedEnergyOptimizer:
     """
-    Fixed-path optimizer with time-sampled weather.
+    Fixed-path speed-and-energy optimizer with trajectory-indexed weather.
 
-    Weather and heading are frozen from a one-shot constant-speed
-    reference trajectory. The optimization still chooses path distance
-    d[t], speed, propulsion, and energy management.
+    Weather and heading are sampled from a fixed reference trajectory and
+    indexed by time. Speed and energy remain optimized, but weather does not
+    move with the optimized trajectory.
     """
 
     wind_model          : WindModel1D
@@ -3362,7 +3399,7 @@ class FR_O:
         irradiance_ts = np.zeros(T_future)
 
         if self.nc_sources is None:
-            raise ValueError("FR_O requires nc_sources prepared from weather.toml.")
+            raise ValueError("FiPSE-TI requires nc_sources prepared from weather.toml.")
 
         for t in range(T_future):
             if interval_sail_fraction[t] <= 1e-9:
@@ -3416,11 +3453,15 @@ class FR_O:
         verbose=False,
     ):
         constraints = []
+        self.zone_membership_binary_count = 0
         self.failure_reason = None
-        _require_convex_ship_models(self, "FR_O")
+        _require_convex_ship_models(self, _FIPSE_TI_LABEL)
 
         if unit_commitment:
-            log.warning("[FR_O WARNING] unit_commitment=True ignored; FR_O is kept binary-free.")
+            log.warning(
+                "[FiPSE-TI WARNING] unit_commitment=True ignored; "
+                "FiPSE-TI is kept binary-free."
+            )
             unit_commitment = False
 
         if self.states.timesteps_completed >= self.itinerary.nb_timesteps:
@@ -3627,8 +3668,7 @@ class FR_O:
         advance_speed = cp.Variable(T_future, nonneg=True)
         norm_adv_speed = cp.Variable(T_future, nonneg=True)
 
-        constraints += [prop_power <= self.ship.propulsion.max_pow * self.ship.propulsion.nb_propellers]
-        constraints += [res_per_prop <= self.ship.propulsion.max_pow]
+        constraints += [prop_power <= self.ship.propulsion.max_pow * self.ship.propulsion.nb_propellers]
 
         constraints += [advance_speed == speed_rel_water_mag * (1 - self.ship.propulsion.wake_fraction)]
         constraints += [norm_adv_speed == advance_speed / self.propulsion_model.max_ua]
@@ -3757,8 +3797,8 @@ class FR_O:
         self.solver_status = problem.status
         self.solve_time = solve_time
 
-        if not _solver_succeeded(problem, "FR_O"):
-            log.error("FR_O optimization status: %s", problem.status)
+        if not _solver_succeeded(problem, _FIPSE_TI_LABEL):
+            log.error("%s optimization status: %s", _FIPSE_TI_LABEL, problem.status)
             self.failure_reason = f"solver_status:{problem.status}"
             return 0
 
@@ -3841,6 +3881,7 @@ class FR_O:
             gen_shutdown=gen_shutdown_out,
             generator_transition_cost=generator_transition_cost,
             generator_unit_commitment=unit_commitment,
+            zone_membership_binary_count=self.zone_membership_binary_count,
             solver_status=problem.status,
         )
         annotate_fit_range_warnings(
@@ -3854,10 +3895,10 @@ class FR_O:
             ship=self.ship,
         )
         record_optimizer_debug(
-            "FR_O",
+            _FIPSE_TI_LABEL,
             self,
             {
-                "mode": "FR_O",
+                "mode": FIPSE_TI,
                 "ship_speed_x": ship_speed_x.value,
                 "ship_speed_y": ship_speed_y.value,
                 "speed_rel_water_x": speed_rel_water_x.value,
@@ -3877,7 +3918,7 @@ class FR_O:
         return 1
 
 @dataclass
-class NaiveController:
+class ShortestPathConstantSpeedController:
     map: Map
     itinerary: Itinerary
     states: States
@@ -3892,6 +3933,7 @@ class NaiveController:
     propulsion_model: Optional["PropulsionModel"] = field(default=None, init=False)
     generator_models: Optional[List["GeneratorModel"]] = field(default=None, init=False)
     calm_model: Optional["CalmWaterModel"] = field(default=None, init=False)
+    zone_membership_binary_count: int = field(default=0, init=False)
 
     def compute(self):
 
@@ -3991,7 +4033,6 @@ class NaiveController:
         gen_on = np.zeros((nb_gen, T_future), dtype=float)
 
         if nb_gen > 0:
-            generation_power[:, :] = 1.0 / nb_gen
             gen_on[:, :] = 1.0
 
         gen_startup, gen_shutdown, generator_transition_cost = (
@@ -4051,15 +4092,17 @@ class NaiveController:
             gen_shutdown=gen_shutdown,
             generator_transition_cost=generator_transition_cost,
             generator_unit_commitment=False,
+            zone_membership_binary_count=self.zone_membership_binary_count,
+            first_stage_optimizer=_SPACS_LABEL,
         )
 
-        log.debug("NaiveController shortest-path distance [km]: %s", total_distance_km)
-        log.debug("NaiveController constant speed [m/s]: %s", constant_speed_mps)
-        log.debug("NaiveController constant discharge [MW]: %s", discharge_power)
-        log.debug("NaiveController final SOC [MWh]: %s", SOC[-1])
-        log.debug("NaiveController ship_speed shape: %s", ship_speed.shape)
-        log.debug("NaiveController solar_power shape: %s", solar_power.shape)
-        log.debug("NaiveController generation_power shape: %s", generation_power.shape)
+        log.debug("%s shortest-path distance [km]: %s", _SPACS_LABEL, total_distance_km)
+        log.debug("%s constant speed [m/s]: %s", _SPACS_LABEL, constant_speed_mps)
+        log.debug("%s constant discharge [MW]: %s", _SPACS_LABEL, discharge_power)
+        log.debug("%s final SOC [MWh]: %s", _SPACS_LABEL, SOC[-1])
+        log.debug("%s ship_speed shape: %s", _SPACS_LABEL, ship_speed.shape)
+        log.debug("%s solar_power shape: %s", _SPACS_LABEL, solar_power.shape)
+        log.debug("%s generation_power shape: %s", _SPACS_LABEL, generation_power.shape)
 
         return 1
 
@@ -5117,3 +5160,13 @@ class WeatherRoutingToolPath(ShortestPath):
 
 
 WRTPath = WeatherRoutingToolPath
+
+# Legacy import aliases kept for compatibility with old scripts and notebooks.
+JPDSE = JointPathDiscreteSpeedEnergyOptimizer
+JPCSE = JointPathContinuousSpeedEnergyOptimizer
+FPJSE = FixedPathSpaceTimeSpeedEnergyOptimizer
+FR_O = FixedPathTrajectoryIndexedSpeedEnergyOptimizer
+NaiveController = ShortestPathConstantSpeedController
+_jpcse_normal_wind_inactive_expr = _jopse_c_normal_wind_inactive_expr
+_jpcse_transition_wind_inactive_expr = _jopse_c_transition_wind_inactive_expr
+_jpcse_leg_metrics = _jopse_c_leg_metrics

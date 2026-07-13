@@ -32,7 +32,7 @@ from lib.models import (
     GeneratorModel,
     PropulsionModel,
 )
-from lib.optimizers import NaiveController, ShortestPath
+from lib.optimizers import ShortestPath, ShortestPathConstantSpeedController
 from lib.paths import RESULTS
 from lib.utils import (
     _path_segment_index,
@@ -58,7 +58,7 @@ SCAN_COLUMNS = (
     "itinerary_end_time",
     "status",
     "reason",
-    "naive_cost",
+    "spacs_cost",
     "is_valid",
     "mean_resistance",
     "max_resistance",
@@ -105,6 +105,12 @@ WINDOW_COLUMNS = (
     "best_adjacent_resistance",
 )
 
+WINDOW_CACHE_COLUMNS = (
+    "raw_rank",
+    "passed_local_relief",
+    *WINDOW_COLUMNS,
+)
+
 TRIAL_COLUMNS = (
     "case",
     "departure_time",
@@ -116,7 +122,7 @@ TRIAL_COLUMNS = (
     "recovery_h",
     "status",
     "reason",
-    "naive_cost",
+    "spacs_cost",
     "adjusted_cost",
     "savings",
     "savings_pct",
@@ -129,7 +135,7 @@ BEST_COLUMNS = (
     "case",
     "departure_time",
     "arrival_time",
-    "naive_cost",
+    "spacs_cost",
     "best_adjusted_cost",
     "savings",
     "savings_pct",
@@ -169,7 +175,7 @@ class ScanContext:
     states: States
     ship: Any
     path_sol: Any
-    base_naive_sol: Any
+    base_spacs_sol: Any
     wind_model: BaseWindModel
     calm_model: CalmWaterModel
     propulsion_model: PropulsionModel
@@ -200,6 +206,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
+        "--postprocess-only",
+        action="store_true",
+        help=(
+            "Do not scan more departures. Read scan_departures.csv and "
+            "baseline_timesteps.csv from --output-dir, then write candidate outputs."
+        ),
+    )
+    parser.add_argument(
         "--dry-run-limit",
         type=int,
         default=None,
@@ -207,6 +221,15 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-candidate-windows", type=int, default=100)
     parser.add_argument("--max-candidates", type=int, default=100)
+    parser.add_argument(
+        "--candidate-window-offset",
+        type=int,
+        default=0,
+        help=(
+            "Skip this many ranked candidate windows after local-weather filtering. "
+            "Use 100 with --max-candidate-windows 100 to process ranks 101-200."
+        ),
+    )
     parser.add_argument(
         "--window-prefilter-multiplier",
         type=int,
@@ -252,10 +275,16 @@ def _output_dir(args: argparse.Namespace, case_name: str) -> Path:
     if args.output_dir is not None:
         path = args.output_dir
     else:
+        if args.postprocess_only:
+            raise ValueError("--postprocess-only requires --output-dir pointing at an existing scan folder.")
         stamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
         suffix = "_dry" if args.dry_run_limit is not None else ""
-        path = RESULTS / "fpjse_candidates" / f"{case_name}_{args.year}_{stamp}{suffix}"
-    path.mkdir(parents=True, exist_ok=args.resume)
+        path = RESULTS / "fipse_st_candidates" / f"{case_name}_{args.year}_{stamp}{suffix}"
+    if args.postprocess_only:
+        if not path.exists():
+            raise FileNotFoundError(f"--postprocess-only output directory does not exist: {path}")
+    else:
+        path.mkdir(parents=True, exist_ok=args.resume)
     return path.resolve()
 
 
@@ -289,6 +318,11 @@ def _csv_value(value: Any) -> Any:
     if isinstance(value, float) and not np.isfinite(value):
         return ""
     return value
+
+
+def _spacs_cost(row: dict[str, Any]) -> Any:
+    value = row.get("spacs_cost")
+    return row.get("naive_cost") if value in ("", None) else value
 
 
 def _timestamp(value: Any) -> pd.Timestamp:
@@ -396,7 +430,7 @@ def _build_multi_time_source(
 def build_annual_weather_sources(map_obj: Any, weather_root: Path, year: int) -> dict[str, Any]:
     files = _weather_file_group(weather_root, year)
     sources = {
-        "_fpjse_annual": True,
+        "_fipse_st_annual": True,
         "currents": _build_multi_time_source(
             files.currents,
             "time",
@@ -414,7 +448,7 @@ def build_annual_weather_sources(map_obj: Any, weather_root: Path, year: int) ->
 
 
 def close_annual_weather_sources(sources: dict[str, Any]) -> None:
-    if not sources or not sources.get("_fpjse_annual"):
+    if not sources or not (sources.get("_fipse_st_annual") or sources.get("_fpjse_annual")):
         return
     for key in ("currents", "atmo", "sun"):
         for part in sources[key]["parts"]:
@@ -488,7 +522,7 @@ def annual_interpolated_weather_at(
     pos_xy_km: np.ndarray,
     query_time: Any,
 ) -> dict[str, Any]:
-    if not sources.get("_fpjse_annual"):
+    if not (sources.get("_fipse_st_annual") or sources.get("_fpjse_annual")):
         return wi.interpolated_weather_at(sources, map_obj, pos_xy_km, query_time)
 
     lat, lon = wi.xy_km_to_latlon(map_obj, pos_xy_km[0], pos_xy_km[1])
@@ -606,7 +640,7 @@ def build_scan_context(args: argparse.Namespace) -> ScanContext:
         max(1, int(base_itinerary.nb_timesteps)),
         axis=1,
     )
-    naive = NaiveController(
+    spacs = ShortestPathConstantSpeedController(
         map=map_obj,
         itinerary=base_itinerary,
         states=states,
@@ -615,7 +649,7 @@ def build_scan_context(args: argparse.Namespace) -> ScanContext:
         path_sol=path_sol,
         course_angles=course_angles,
     )
-    naive.compute()
+    spacs.compute()
 
     fit_range = FitRange.initial_from_ship(ship)
     wind_model = BaseWindModel(ship, fit_range)
@@ -649,7 +683,7 @@ def build_scan_context(args: argparse.Namespace) -> ScanContext:
         states=states,
         ship=ship,
         path_sol=path_sol,
-        base_naive_sol=naive.sol,
+        base_spacs_sol=spacs.sol,
         wind_model=wind_model,
         calm_model=calm_model,
         propulsion_model=propulsion_model,
@@ -710,7 +744,7 @@ def evaluate_departure(ctx: ScanContext, departure_time: pd.Timestamp) -> tuple[
 
     started = time.perf_counter()
     itinerary = shifted_itinerary(ctx.base_itinerary, departure_time)
-    sol = _clone_solution(ctx.base_naive_sol)
+    sol = _clone_solution(ctx.base_spacs_sol)
     runner = make_runner(ctx, itinerary, sol)
 
     try:
@@ -734,7 +768,7 @@ def evaluate_departure(ctx: ScanContext, departure_time: pd.Timestamp) -> tuple[
         **row_base,
         "status": "ok",
         "reason": "",
-        "naive_cost": eval_sol.estimated_cost,
+        "spacs_cost": eval_sol.estimated_cost,
         "is_valid": bool(eval_sol.is_valid),
         "mean_resistance": float(np.nanmean(res_values)) if res_values.size else np.nan,
         "max_resistance": float(np.nanmax(res_values)) if res_values.size else np.nan,
@@ -850,7 +884,7 @@ def scan_departures(
             if args.progress_every and evaluated % int(args.progress_every) == 0:
                 print(
                     f"[scan] evaluated={evaluated} attempted={attempted} "
-                    f"last_departure={departure_time} cost={scan_row.get('naive_cost')}"
+                    f"last_departure={departure_time} cost={_spacs_cost(scan_row)}"
                 )
 
             if args.dry_run_limit is not None and evaluated >= int(args.dry_run_limit):
@@ -875,10 +909,121 @@ def scan_departures(
     return baseline_rows, detail_rows
 
 
+def load_existing_scan_outputs(output_dir: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    scan_path = output_dir / "scan_departures.csv"
+    detail_path = output_dir / "baseline_timesteps.csv"
+    missing = [str(path) for path in (scan_path, detail_path) if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "--postprocess-only requires completed/partial scan files. Missing: "
+            + ", ".join(missing)
+        )
+
+    scan_df = pd.read_csv(scan_path)
+    detail_df = pd.read_csv(detail_path)
+    if "status" not in scan_df.columns:
+        raise ValueError(f"{scan_path} is missing a status column.")
+    if scan_df.empty:
+        raise ValueError(f"{scan_path} has no rows.")
+    if detail_df.empty:
+        raise ValueError(f"{detail_path} has no timestep rows to postprocess.")
+
+    baseline_rows = scan_df[scan_df["status"] == "ok"].to_dict("records")
+    detail_rows = detail_df.to_dict("records")
+    for row in baseline_rows:
+        if "departure_time" in row:
+            row["departure_time"] = pd.Timestamp(row["departure_time"])
+        if "arrival_time" in row:
+            row["arrival_time"] = pd.Timestamp(row["arrival_time"])
+        if "itinerary_start_time" in row:
+            row["itinerary_start_time"] = pd.Timestamp(row["itinerary_start_time"])
+        if "itinerary_end_time" in row:
+            row["itinerary_end_time"] = pd.Timestamp(row["itinerary_end_time"])
+    for row in detail_rows:
+        row["departure_time"] = pd.Timestamp(row["departure_time"])
+        row["time_start"] = pd.Timestamp(row["time_start"])
+        row["time_end"] = pd.Timestamp(row["time_end"])
+
+    if not baseline_rows:
+        raise ValueError(f"{scan_path} has no successfully evaluated departures.")
+    return baseline_rows, detail_rows
+
+
+def _window_cache_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    departure = pd.Timestamp(row["departure_time"]).isoformat()
+    return (
+        departure,
+        int(row["t_start"]),
+        int(row["t_end"]),
+        round(float(row["path_km_start"]), 6),
+        round(float(row["path_km_end"]), 6),
+    )
+
+
+def _normalize_window_row(row: dict[str, Any]) -> dict[str, Any]:
+    out = dict(row)
+    for key in (
+        "departure_time",
+        "high_window_start_time",
+        "high_window_end_time",
+    ):
+        if key in out and out[key] not in ("", None):
+            out[key] = pd.Timestamp(out[key])
+    for key in ("window_id", "t_start", "t_end", "raw_rank"):
+        if key in out and out[key] not in ("", None) and not pd.isna(out[key]):
+            out[key] = int(out[key])
+    for key in (
+        "high_window_duration_h",
+        "path_km_start",
+        "path_km_end",
+        "path_km_mid",
+        "window_mean_resistance",
+        "resistance_z_score",
+        "local_relief_pct",
+        "better_offset_h",
+        "base_sample_resistance",
+        "best_adjacent_resistance",
+    ):
+        if key in out and out[key] not in ("", None) and not pd.isna(out[key]):
+            out[key] = float(out[key])
+    return out
+
+
+def _load_candidate_window_cache(output_dir: Path | None) -> dict[tuple[Any, ...], dict[str, Any]]:
+    if output_dir is None:
+        return {}
+    cache_path = output_dir / "candidate_window_cache.csv"
+    if not cache_path.exists() or cache_path.stat().st_size == 0:
+        return {}
+    df = pd.read_csv(cache_path)
+    cache: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for raw in df.to_dict("records"):
+        row = _normalize_window_row(raw)
+        try:
+            cache[_window_cache_key(row)] = row
+        except Exception:
+            continue
+    return cache
+
+
+def _write_candidate_window_cache(
+    output_dir: Path | None,
+    cache: dict[tuple[Any, ...], dict[str, Any]],
+) -> None:
+    if output_dir is None:
+        return
+    rows = sorted(
+        (_normalize_window_row(row) for row in cache.values()),
+        key=lambda row: int(row.get("raw_rank", 0) or 0),
+    )
+    _write_csv(output_dir / "candidate_window_cache.csv", WINDOW_CACHE_COLUMNS, rows)
+
+
 def detect_candidate_windows(
     ctx: ScanContext,
     detail_rows: list[dict[str, Any]],
     args: argparse.Namespace,
+    output_dir: Path | None = None,
 ) -> list[dict[str, Any]]:
     if not detail_rows:
         return []
@@ -948,12 +1093,31 @@ def detect_candidate_windows(
         ),
         reverse=True,
     )
+    page_size = max(0, int(args.max_candidate_windows))
+    offset = max(0, int(args.candidate_window_offset))
+    target_count = offset + page_size
+    if page_size == 0:
+        return []
+
     prefilter_count = max(
-        int(args.max_candidate_windows),
-        int(args.max_candidate_windows) * max(1, int(args.window_prefilter_multiplier)),
+        target_count,
+        target_count * max(1, int(args.window_prefilter_multiplier)),
     )
-    filtered: list[dict[str, Any]] = []
-    for window in windows[:prefilter_count]:
+    cache = _load_candidate_window_cache(output_dir)
+    accepted: list[dict[str, Any]] = []
+    checked = 0
+    for raw_rank, window in enumerate(windows[:prefilter_count], start=1):
+        cache_key = _window_cache_key(window)
+        cached = cache.get(cache_key)
+        if cached is not None:
+            checked += 1
+            local_window = _normalize_window_row(cached)
+            if float(local_window.get("local_relief_pct", 0.0) or 0.0) >= float(args.min_local_relief_pct):
+                accepted.append(local_window)
+            if len(accepted) >= target_count:
+                break
+            continue
+
         start_row = {
             "time_start": window["high_window_start_time"],
             "path_mid_km": window["path_km_start"],
@@ -972,13 +1136,31 @@ def detect_candidate_windows(
             end_row.update(representative)
             end_row["time_end"] = window["high_window_end_time"]
         local = local_weather_relief(ctx, start_row, end_row, args)
-        if local["local_relief_pct"] < float(args.min_local_relief_pct):
-            continue
-        filtered.append({**window, **local})
-        if len(filtered) >= int(args.max_candidate_windows):
+        checked += 1
+        local_window = _normalize_window_row(
+            {
+                "raw_rank": raw_rank,
+                "passed_local_relief": bool(
+                    local["local_relief_pct"] >= float(args.min_local_relief_pct)
+                ),
+                **window,
+                **local,
+            }
+        )
+        cache[cache_key] = local_window
+        if local_window["passed_local_relief"]:
+            accepted.append(local_window)
+        if len(accepted) >= target_count:
             break
 
-    return filtered
+    _write_candidate_window_cache(output_dir, cache)
+    page = accepted[offset : offset + page_size]
+    if offset and len(accepted) <= offset:
+        print(
+            f"[windows] candidate-window-offset={offset} exceeded available "
+            f"accepted windows in checked prefix ({len(accepted)} accepted, {checked} checked)."
+        )
+    return page
 
 
 def _representative_timestep_row(df: pd.DataFrame, window: dict[str, Any]) -> dict[str, Any] | None:
@@ -1180,13 +1362,15 @@ def evaluate_adjustments(
         baseline = baseline_by_departure.get(baseline_key)
         if baseline is None:
             scan_row, _, base_eval_sol, itinerary = evaluate_departure(ctx, departure_time)
-            naive_cost = scan_row.get("naive_cost")
+            spacs_cost = _spacs_cost(scan_row)
         else:
             scan_row, _, base_eval_sol, itinerary = evaluate_departure(ctx, departure_time)
-            naive_cost = scan_row.get("naive_cost", baseline.get("naive_cost"))
-        if base_eval_sol is None or itinerary is None or naive_cost in ("", None):
+            spacs_cost = _spacs_cost(scan_row)
+            if spacs_cost in ("", None):
+                spacs_cost = _spacs_cost(baseline)
+        if base_eval_sol is None or itinerary is None or spacs_cost in ("", None):
             continue
-        naive_cost = float(naive_cost)
+        spacs_cost = float(spacs_cost)
 
         direction = str(window.get("better_direction", ""))
         if direction not in {"ahead", "behind"}:
@@ -1217,11 +1401,11 @@ def evaluate_adjustments(
                         "shift_h_equivalent": float(shift_h),
                         "lead_h": float(lead_h),
                         "recovery_h": float(recovery_h),
-                        "naive_cost": naive_cost,
+                        "spacs_cost": spacs_cost,
                     }
                     adjusted_sol, reason = adjusted_solution_from_offset(
                         ctx,
-                        ctx.base_naive_sol,
+                        ctx.base_spacs_sol,
                         itinerary,
                         window,
                         signed_shift_km=signed_shift_km,
@@ -1257,8 +1441,8 @@ def evaluate_adjustments(
                         savings_pct = np.nan
                     else:
                         adjusted_cost = float(adjusted_cost)
-                        savings = naive_cost - adjusted_cost
-                        savings_pct = 100.0 * savings / naive_cost if naive_cost else np.nan
+                        savings = spacs_cost - adjusted_cost
+                        savings_pct = 100.0 * savings / spacs_cost if spacs_cost else np.nan
                     max_speed = float(np.nanmax(np.asarray(adjusted_eval.speed_mag, dtype=float)))
                     positive_speed = np.asarray(adjusted_eval.speed_mag, dtype=float)
                     positive_speed = positive_speed[positive_speed > 1e-9]
@@ -1317,7 +1501,7 @@ def build_best_rows(ctx: ScanContext, rows: list[dict[str, Any]]) -> list[dict[s
                 "case": ctx.case_name,
                 "departure_time": departure,
                 "arrival_time": arrival,
-                "naive_cost": row.get("naive_cost"),
+                "spacs_cost": _spacs_cost(row),
                 "best_adjusted_cost": row.get("adjusted_cost"),
                 "savings": row.get("savings"),
                 "savings_pct": row.get("savings_pct"),
@@ -1358,12 +1542,22 @@ def main() -> int:
     )
 
     try:
-        baseline_rows, detail_rows = scan_departures(ctx, args, output_dir)
-        print(f"[scan] ok_departures={len(baseline_rows)} timestep_rows={len(detail_rows)}")
+        if args.postprocess_only:
+            baseline_rows, detail_rows = load_existing_scan_outputs(output_dir)
+            print(
+                f"[postprocess] loaded_ok_departures={len(baseline_rows)} "
+                f"timestep_rows={len(detail_rows)}"
+            )
+        else:
+            baseline_rows, detail_rows = scan_departures(ctx, args, output_dir)
+            print(f"[scan] ok_departures={len(baseline_rows)} timestep_rows={len(detail_rows)}")
 
-        windows = detect_candidate_windows(ctx, detail_rows, args)
+        windows = detect_candidate_windows(ctx, detail_rows, args, output_dir=output_dir)
         _write_csv(output_dir / "candidate_windows.csv", WINDOW_COLUMNS, windows)
-        print(f"[windows] local_bad_weather_windows={len(windows)}")
+        print(
+            f"[windows] local_bad_weather_windows={len(windows)} "
+            f"offset={max(0, int(args.candidate_window_offset))}"
+        )
 
         _, best_rows = evaluate_adjustments(ctx, windows, baseline_rows, args, output_dir)
         _write_csv(output_dir / "best_candidates.csv", BEST_COLUMNS, best_rows)

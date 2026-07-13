@@ -53,7 +53,37 @@ def _grid_radius_deg(ds):
 REQUIRED_WEATHER_FILES = ("currents", "atmo", "sun")
 
 
-def resolve_weather_files_from_toml(case_dir) -> dict[str, Path]:
+def _resolve_weather_file_table(weather_toml: Path, files: dict, *, label: str) -> dict[str, Path]:
+    missing = [key for key in REQUIRED_WEATHER_FILES if key not in files]
+    if missing:
+        raise ValueError(f"{weather_toml} is missing {label} entries: {missing}")
+
+    resolved = {}
+    for key in REQUIRED_WEATHER_FILES:
+        path = Path(files[key])
+        if not path.is_absolute():
+            path = weather_toml.parent / path
+        resolved[key] = path.resolve()
+
+    return resolved
+
+
+def load_weather_variants_from_toml(case_dir) -> dict[str, dict]:
+    if case_dir is None:
+        raise ValueError("A case directory with weather.toml is required for weather variants.")
+
+    case_dir = Path(case_dir).resolve()
+    weather_toml = case_dir / "weather.toml"
+    if not weather_toml.exists():
+        raise FileNotFoundError(f"Missing weather.toml: {weather_toml}")
+
+    with open(weather_toml, "rb") as f:
+        data = tomllib.load(f)
+
+    return dict(data.get("variants", {}))
+
+
+def resolve_weather_files_from_toml(case_dir, variant: str | None = None) -> dict[str, Path]:
     if case_dir is None:
         raise ValueError("A case directory with weather.toml is required for weather file paths.")
 
@@ -65,19 +95,23 @@ def resolve_weather_files_from_toml(case_dir) -> dict[str, Path]:
     with open(weather_toml, "rb") as f:
         data = tomllib.load(f)
 
+    if variant not in (None, ""):
+        variants = data.get("variants", {})
+        if variant not in variants:
+            available = ", ".join(sorted(str(name) for name in variants)) or "<none>"
+            raise ValueError(
+                f"Unknown weather variant {variant!r} in {weather_toml}. "
+                f"Available variants: {available}."
+            )
+        files = dict(variants[variant].get("files", {}))
+        return _resolve_weather_file_table(
+            weather_toml,
+            files,
+            label=f"[variants.{variant}.files]",
+        )
+
     files = data.get("files", {})
-    missing = [key for key in REQUIRED_WEATHER_FILES if key not in files]
-    if missing:
-        raise ValueError(f"{weather_toml} is missing [files] entries: {missing}")
-
-    resolved = {}
-    for key in REQUIRED_WEATHER_FILES:
-        path = Path(files[key])
-        if not path.is_absolute():
-            path = weather_toml.parent / path
-        resolved[key] = path.resolve()
-
-    return resolved
+    return _resolve_weather_file_table(weather_toml, files, label="[files]")
 
 
 def _resolve_weather_files(weather_files):

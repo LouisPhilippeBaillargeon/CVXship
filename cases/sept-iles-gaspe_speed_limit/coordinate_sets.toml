@@ -1,8 +1,0 @@
-[[set]]
-name = "dynamic_shipping_zone_a"
-points = [
-  { lat = "49 41 N", lon = "065 00 W" },
-  { lat = "49 20 N", lon = "065 00 W" },
-  { lat = "49 11 N", lon = "064 00 W" },
-  { lat = "49 22 N", lon = "064 00 W" },
-]
