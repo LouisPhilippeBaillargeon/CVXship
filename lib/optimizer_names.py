@@ -10,6 +10,7 @@ SPACS = "spacs"
 GREEDY = "greedy"
 FIPSE_ST = "fipse_st"
 FIPSE_TI = "fipse_ti"
+FIPSE_PA = "fipse_pa"
 JOPSE_D = "jopse_d"
 JOPSE_C_DEPARTURE = "jopse_c_departure"
 JOPSE_C_TRANSITION = "jopse_c_transition"
@@ -17,6 +18,7 @@ JOPSE_C_TRANSITION = "jopse_c_transition"
 BASELINE_IDS = (SPACS, GREEDY)
 SELECTABLE_OPTIMIZER_IDS = (
     FIPSE_TI,
+    FIPSE_PA,
     FIPSE_ST,
     JOPSE_D,
     JOPSE_C_DEPARTURE,
@@ -91,6 +93,27 @@ OPTIMIZER_NAMES = {
             "Fixed-Path Speed-and-Energy Optimizer with Trajectory-Indexed Weather",
             "FiPSE TI",
             "FiPSE-TI",
+        ),
+    ),
+    FIPSE_PA: OptimizerName(
+        id=FIPSE_PA,
+        display_label="FiPSE-PA",
+        formal_name=(
+            "Fixed-Path Speed-and-Energy Optimizer with "
+            "Path-Averaged Weather"
+        ),
+        class_name="FixedPathPathAveragedSpeedEnergyOptimizer",
+        aliases=(
+            "FixedPathPathAveragedSpeedEnergyOptimizer",
+            "Fixed-Path Speed-and-Energy Optimizer with Path-Averaged Weather",
+            "Fixed Path Path-Averaged Weather",
+            "Fixed Path Path Averaged Weather",
+            "fipse_path_average",
+            "fipse_path_averaged",
+            "path_average",
+            "path_averaged",
+            "FiPSE PA",
+            "FiPSE-PA",
         ),
     ),
     JOPSE_D: OptimizerName(

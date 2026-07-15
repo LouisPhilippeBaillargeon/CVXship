@@ -6,12 +6,15 @@ import pytest
 from lib import logging_utils as log
 from lib.load_params import load_itinerary
 from lib.optimizer_names import (
+    FIPSE_PA,
     FIPSE_ST,
+    FIPSE_TI,
     JOPSE_C_DEPARTURE,
     canonicalize_optimizer_label,
 )
 from optimize import (
     FIT_ERROR_REPORT_COLUMNS,
+    _expected_optimizer_keys,
     _fit_range_factor_options,
     _format_result_table,
     _parse_args,
@@ -80,10 +83,41 @@ def test_optimize_accepts_saved_path_solution_flag():
     assert args.path_solution_json == Path("results/runs/demo/routes/path_solution.json")
 
 
+def test_optimize_accepts_precomputed_wrt_route_flag():
+    args = _parse_args(
+        [
+            "--case",
+            "cases/sept-iles-gaspe",
+            "--path-generator",
+            "wrt",
+            "--wrt-precomputed-route",
+            "results/runs/demo/routes/wrt_route_raw.json",
+        ]
+    )
+
+    assert args.path_generator == "wrt"
+    assert args.wrt_route_geojson == Path("results/runs/demo/routes/wrt_route_raw.json")
+
+
 def test_optimize_accepts_short_optimizer_flag():
     args = _parse_args(["--case", "cases/sept-iles-gaspe", "--o", "FPJSE"])
 
     assert args.optimizer == FIPSE_ST
+
+
+def test_optimize_accepts_path_average_optimizer_alias():
+    args = _parse_args(["--case", "cases/sept-iles-gaspe", "--o", "FiPSE-PA"])
+
+    assert args.optimizer == FIPSE_PA
+
+
+def test_default_expected_optimizers_include_path_average_benchmark():
+    args = _parse_args(["--case", "cases/sept-iles-gaspe"])
+
+    keys = _expected_optimizer_keys(args, {})
+
+    assert FIPSE_PA in keys
+    assert keys.index(FIPSE_TI) < keys.index(FIPSE_PA) < keys.index(FIPSE_ST)
 
 
 def test_optimize_normalizes_optimizer_alias():

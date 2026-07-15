@@ -15,6 +15,10 @@ from lib import logging_utils as log
 PLOT_TEXT_SIZE_CHOICES = ("default", "big")
 BIG_PLOT_FONT_SCALE = 2.0
 MIN_PDF_PAD_INCHES = 0.05
+MAP_X0_SYMBOL = r"$x^0$"
+MAP_X1_SYMBOL = r"$x^1$"
+MAP_X0_LABEL_KM = rf"{MAP_X0_SYMBOL} (km)"
+MAP_X1_LABEL_KM = rf"{MAP_X1_SYMBOL} (km)"
 
 
 def normalize_plot_text_size(text_size: str | bool = "default") -> str:
@@ -689,8 +693,8 @@ def _plot_solution_map_overlay(
 
     _finalize_axis(
         ax,
-        xlabel="x position [km]",
-        ylabel="y position [km]",
+        xlabel=MAP_X0_LABEL_KM,
+        ylabel=MAP_X1_LABEL_KM,
         title="Ship trajectory over feasibility map",
     )
 
@@ -1240,8 +1244,8 @@ def plot_weather_snapshot(
     ax.set_aspect("equal", adjustable="box")
     _finalize_axis(
         ax,
-        xlabel="x (km)",
-        ylabel="y (km)",
+        xlabel=MAP_X0_LABEL_KM,
+        ylabel=MAP_X1_LABEL_KM,
         title=f"Weather snapshot: {variable} (t={t_index})",
     )
 
@@ -1345,8 +1349,8 @@ def plot_sets_and_points(
 
     ax.set_aspect("equal", adjustable="box")
     ax.grid(True, which="both", linestyle="--", linewidth=0.6, alpha=0.6)
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
+    ax.set_xlabel(MAP_X0_SYMBOL)
+    ax.set_ylabel(MAP_X1_SYMBOL)
     ax.legend()
 
     directory = output_root if output_root is not None else PLOTS

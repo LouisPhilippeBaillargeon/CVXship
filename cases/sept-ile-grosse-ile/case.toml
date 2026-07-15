@@ -13,8 +13,8 @@ ordered_sets = false
 scope = "case"
 
 [fit_range]
-lower_speed_factor = 0.85
-upper_speed_factor = 1.1
+lower_speed_factor = 0.9
+upper_speed_factor = 1.15
 lower_res_factor = 0.7
 upper_res_factor = 1.2
 lower_prop_factor = 0.7
@@ -26,7 +26,18 @@ show_plots = false
 save_solutions = true
 save_console_log = true
 
+
+[[scenario]]
+name = "may01"
+departure_date = "2025-05-01"
+weather_variant = "may01"
+
 [[scenario]]
 name = "jun01"
-departure_date = "2024-06-01"
+departure_date = "2025-06-01"
 weather_variant = "jun01"
+
+[[scenario]]
+name = "jun28"
+departure_date = "2025-06-28"
+weather_variant = "jun28"

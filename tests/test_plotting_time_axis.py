@@ -1,8 +1,16 @@
 from types import SimpleNamespace
 
+import matplotlib
+
+matplotlib.use("Agg", force=True)
+
+import matplotlib.pyplot as plt
 import numpy as np
 
+import lib.plotting as plotting_module
 from lib.plotting import (
+    MAP_X0_LABEL_KM,
+    MAP_X1_LABEL_KM,
     _overlap_group_positions,
     _overlap_line_kwargs,
     _plot_generator_xy,
@@ -106,3 +114,39 @@ def test_identical_plot_curves_get_distinct_dot_phases():
         _overlap_line_kwargs(*positions[0])["linestyle"]
         != _overlap_line_kwargs(*positions[1])["linestyle"]
     )
+
+
+def test_solution_map_overlay_uses_paper_coordinate_labels(tmp_path, monkeypatch):
+    captured_axis_labels = []
+
+    def fake_save(fig, name, show=False, directory=None, **kwargs):
+        ax = fig.axes[0]
+        captured_axis_labels.append((ax.get_xlabel(), ax.get_ylabel()))
+        plt.close(fig)
+
+    monkeypatch.setattr(plotting_module, "_save_and_maybe_show", fake_save)
+
+    solution = SimpleNamespace(
+        ship_pos=np.array([
+            [0.0, 0.0],
+            [1.0, 2.0],
+        ]),
+    )
+    map_obj = SimpleNamespace(
+        info=SimpleNamespace(
+            span_km_east=1.0,
+            span_km_north=2.0,
+        ),
+    )
+
+    plotting_module._plot_solution_map_overlay(
+        solutions=[solution],
+        labels=["solution"],
+        map_obj=map_obj,
+        T=1,
+        directory=tmp_path,
+        draw_feasibility=False,
+        draw_sets=False,
+    )
+
+    assert captured_axis_labels == [(MAP_X0_LABEL_KM, MAP_X1_LABEL_KM)]

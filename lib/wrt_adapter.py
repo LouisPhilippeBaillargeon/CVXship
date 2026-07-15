@@ -358,7 +358,7 @@ def prepare_wrt_run_files(
     end_xy,
     work_dir: Path,
     weather_files: dict[str, Path | str] | None,
-    algorithm: str = "isofuel",
+    algorithm: str = "genetic",
     boat_speed_mps: float | None = None,
     route_bbox_margin_deg: float = 0.25,
     use_depth_constraint: bool = True,

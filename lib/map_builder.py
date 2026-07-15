@@ -19,7 +19,14 @@ from matplotlib.widgets import Button
 from matplotlib.gridspec import GridSpec
 
 from lib.load_params import MapInfo, Ship
-from lib.plotting import MIN_PDF_PAD_INCHES, _strip_plot_titles
+from lib.plotting import (
+    MAP_X0_LABEL_KM,
+    MAP_X0_SYMBOL,
+    MAP_X1_LABEL_KM,
+    MAP_X1_SYMBOL,
+    MIN_PDF_PAD_INCHES,
+    _strip_plot_titles,
+)
 from lib.utils import dx_dy_km
 from lib import logging_utils as log
 
@@ -533,8 +540,8 @@ class SetEditor:
             interpolation="nearest",
         )
         self.ax.set_aspect("equal", adjustable="box")
-        self.ax.set_xlabel("X (km)")
-        self.ax.set_ylabel("Y (km)")
+        self.ax.set_xlabel(MAP_X0_LABEL_KM)
+        self.ax.set_ylabel(MAP_X1_LABEL_KM)
         status(self.ax, "Click 'New Set'. Drag corners. 'Save All' exports CSVs and artifacts.")
         self._create_port_coordinate_artists()
         self._create_weather_overlay_artists()
@@ -665,7 +672,11 @@ class SetEditor:
         artists.append(marker)
 
         for port in port_coordinates:
-            label = f"{port['name']}\nx={port['x']:.1f}, y={port['y']:.1f} km"
+            label = (
+                f"{port['name']}\n"
+                f"{MAP_X0_SYMBOL}={port['x']:.1f}, "
+                f"{MAP_X1_SYMBOL}={port['y']:.1f} km"
+            )
             text = ax.annotate(
                 label,
                 xy=(port["x"], port["y"]),

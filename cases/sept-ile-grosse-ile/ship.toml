@@ -59,8 +59,8 @@ nb_blades       = 6
 nb_propellers   = 2
 max_n           = 2.05
 min_pow         = 0.0
-max_pow         = 3.0
-wake_fraction   = 0.16
+max_pow         = 2.67
+wake_fraction   = 0.3
 # ============================
 # BATTERY
 # capacity      : (MWh)

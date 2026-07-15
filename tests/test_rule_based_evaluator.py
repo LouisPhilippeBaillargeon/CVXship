@@ -342,6 +342,10 @@ class SpeedLimitEvaluatorTests(unittest.TestCase):
         gen_on=1.0,
         battery_charge=0.0,
         battery_discharge=0.0,
+        is_sail=True,
+        generator_unit_commitment=True,
+        startup_cost=0.0,
+        incoming_transition_cost=0.0,
     ):
         generator = SimpleNamespace(
             name="g0",
@@ -350,6 +354,8 @@ class SpeedLimitEvaluatorTests(unittest.TestCase):
             fuel_intercept=0.0,
             fuel_linear=1.0,
             fuel_quadratic=0.0,
+            startup_cost=float(startup_cost),
+            shutdown_cost=0.0,
         )
         ship = SimpleNamespace(
             info=SimpleNamespace(max_speed=10.0),
@@ -378,6 +384,8 @@ class SpeedLimitEvaluatorTests(unittest.TestCase):
             fuel_price=1.0,
             soc_f=float(soc if soc_f is None else soc_f),
         )
+        itinerary.transits[0].power_cost = 0.0
+        itinerary.transits[0].max_charge_power = 10.0
         states = SimpleNamespace(timesteps_completed=0, soc=float(soc))
         map_obj = SimpleNamespace(
             nb_sets=2,
@@ -396,9 +404,9 @@ class SpeedLimitEvaluatorTests(unittest.TestCase):
             estimated_cost=0.0,
             solve_time=0.0,
             T_future=1,
-            instant_sail=np.array([1.0, 1.0]),
-            port_idx=np.array([-1, -1]),
-            interval_sail_fraction=np.array([1.0]),
+            instant_sail=np.array([1.0, 1.0]) if is_sail else np.array([0.0, 0.0]),
+            port_idx=np.array([-1, -1]) if is_sail else np.array([0, 0]),
+            interval_sail_fraction=np.array([1.0 if is_sail else 0.0]),
             total_distance=float(path_distance[-1] - path_distance[0]),
             set_selection=np.array([[1.0, 0.0], [0.0, 1.0]]),
             ship_pos=np.array([[path_distance[0], 0.0], [path_distance[-1], 0.0]]),
@@ -424,11 +432,11 @@ class SpeedLimitEvaluatorTests(unittest.TestCase):
             fixed_path_waypoints=np.array([[0.0, 0.0], [5.0, 0.0], [10.0, 0.0]]),
             path_set_ids=np.array([0, 1]),
             timestep_dt_h=np.ones(1),
-            interval_port_idx=np.array([-1]),
+            interval_port_idx=np.array([-1 if is_sail else 0]),
             gen_startup=np.zeros((1, 1)),
             gen_shutdown=np.zeros((1, 1)),
-            generator_transition_cost=0.0,
-            generator_unit_commitment=True,
+            generator_transition_cost=float(incoming_transition_cost),
+            generator_unit_commitment=bool(generator_unit_commitment),
             zone_membership_binary_count=6,
         )
 
@@ -556,6 +564,41 @@ class SpeedLimitEvaluatorTests(unittest.TestCase):
         np.testing.assert_allclose(evaluated.segment_dt_h, [[0.5, 0.5]])
         np.testing.assert_allclose(evaluated.battery_charge, [[1.0, 3.0]])
         self.assertAlmostEqual(float(evaluated.SOC[-1]), 2.0)
+
+    def test_non_unit_commitment_forces_generators_on_and_recomputes_startup_cost(self):
+        runner = self._runner_for_fixed_path(
+            [0.0, 0.0],
+            is_sail=False,
+            gen_on=0.0,
+            generator_unit_commitment=False,
+            startup_cost=100.0,
+            incoming_transition_cost=999.0,
+        )
+
+        evaluated = self._evaluate(runner)
+
+        np.testing.assert_allclose(evaluated.gen_on, [[[1.0]]])
+        np.testing.assert_allclose(evaluated.gen_startup, [[1.0]])
+        np.testing.assert_allclose(evaluated.gen_shutdown, [[0.0]])
+        self.assertEqual(evaluated.generator_transition_cost, 100.0)
+        self.assertEqual(evaluated.estimated_cost, 100.0)
+
+    def test_unit_commitment_recomputes_transition_cost_from_evaluated_gen_on(self):
+        runner = self._runner_for_fixed_path(
+            [0.0, 0.0],
+            is_sail=False,
+            gen_on=0.0,
+            generator_unit_commitment=True,
+            startup_cost=100.0,
+            incoming_transition_cost=999.0,
+        )
+
+        evaluated = self._evaluate(runner)
+
+        np.testing.assert_allclose(evaluated.gen_on, [[[0.0]]])
+        np.testing.assert_allclose(evaluated.gen_startup, [[0.0]])
+        self.assertEqual(evaluated.generator_transition_cost, 0.0)
+        self.assertEqual(evaluated.estimated_cost, 0.0)
 
     def test_segmented_fixed_path_commands_are_not_treated_as_half_steps(self):
         runner = self._runner_for_fixed_path(

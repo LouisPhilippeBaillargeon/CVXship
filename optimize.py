@@ -17,6 +17,7 @@ from lib.load_params import load_config
 from lib.models import FitRange, PropulsionModel, BaseWindModel, WindModel1D, WindModelTransition1D, WindModel2D, WindModelPathAligned2D, GeneratorModel, CalmWaterModel, save_obj, load_obj
 from lib.plotting import normalize_plot_text_size, plot_solutions, plot_sets_and_points
 from lib.optimizers import (
+    FixedPathPathAveragedSpeedEnergyOptimizer,
     FixedPathSpaceTimeSpeedEnergyOptimizer,
     FixedPathTrajectoryIndexedSpeedEnergyOptimizer,
     JointPathContinuousSpeedEnergyOptimizer,
@@ -29,6 +30,7 @@ from lib.optimizers import (
 from lib.greedy import GreedyEnergyDispatchController
 from lib.optimizer_names import (
     ALL_OPTIMIZERS,
+    FIPSE_PA,
     FIPSE_ST,
     FIPSE_TI,
     GREEDY,
@@ -177,7 +179,7 @@ def _parse_args(argv=None):
     parser.add_argument("--wrt-algorithm", choices=["isofuel", "genetic"], default=None)
     parser.add_argument("--wrt-source-dir", type=Path, default=None)
     parser.add_argument("--wrt-python", default=None)
-    parser.add_argument("--wrt-route-geojson", type=Path, default=None)
+    parser.add_argument("--wrt-route-geojson", "--wrt-precomputed-route", type=Path, default=None)
     parser.add_argument("--wrt-timeout-s", type=float, default=None)
     parser.add_argument("--wrt-boat-speed-mps", type=float, default=None)
     parser.add_argument("--wrt-use-depth-constraint", dest="wrt_use_depth_constraint", action="store_true", default=None)
@@ -643,7 +645,7 @@ def _resolve_optimizer_plan(args, run_toml_options):
         run_jopse_c_transition_weather,
     )
     if selected_optimizer is not None:
-        if selected_optimizer in {FIPSE_TI, FIPSE_ST}:
+        if selected_optimizer in {FIPSE_TI, FIPSE_PA, FIPSE_ST}:
             resolved_dimensions = "1D"
         elif selected_optimizer == JOPSE_D:
             resolved_dimensions = "2D"
@@ -666,6 +668,7 @@ def _expected_optimizer_keys(args, run_toml_options):
         return keys
 
     if resolved_dimensions in ("1D", "both"):
+        keys.append(FIPSE_PA)
         keys.append(FIPSE_ST)
     if resolved_dimensions in ("2D", "both"):
         keys.append(JOPSE_D)
@@ -898,7 +901,7 @@ if __name__ == "__main__":
         run_jopse_c_transition_weather,
     )
     if selected_optimizer is not None:
-        if selected_optimizer in {FIPSE_TI, FIPSE_ST}:
+        if selected_optimizer in {FIPSE_TI, FIPSE_PA, FIPSE_ST}:
             dimensions = "1D"
         elif selected_optimizer == JOPSE_D:
             dimensions = "2D"
@@ -931,7 +934,7 @@ if __name__ == "__main__":
         path_generator = "saved"
     if path_generator not in {"shortest", "wrt", "saved"}:
         raise ValueError("path_generator must be one of: shortest, wrt, saved")
-    wrt_algorithm = str(_option(args.wrt_algorithm, run_toml_options, "wrt_algorithm", "isofuel")).lower()
+    wrt_algorithm = str(_option(args.wrt_algorithm, run_toml_options, "wrt_algorithm", "genetic")).lower()
     if wrt_algorithm not in {"isofuel", "genetic"}:
         raise ValueError("wrt_algorithm must be one of: isofuel, genetic")
     wrt_source_raw = (
@@ -1199,7 +1202,10 @@ if __name__ == "__main__":
             timeout_s=float(wrt_timeout_s),
             use_depth_constraint=wrt_use_depth_constraint,
         )
-        log.progress("[RUN] Starting WeatherRoutingTool path solve (%s)", wrt_algorithm)
+        if wrt_route_geojson is not None:
+            log.progress("[RUN] Loading precomputed WeatherRoutingTool route (%s)", wrt_route_geojson)
+        else:
+            log.progress("[RUN] Starting WeatherRoutingTool path solve (%s)", wrt_algorithm)
     else:
         path = ShortestPath(
             map=map,
@@ -1253,6 +1259,7 @@ if __name__ == "__main__":
     spacs_label = optimizer_display_label(SPACS)
     greedy_label = optimizer_display_label(GREEDY)
     fipse_ti_label = optimizer_display_label(FIPSE_TI)
+    fipse_pa_label = optimizer_display_label(FIPSE_PA)
     fipse_st_label = optimizer_display_label(FIPSE_ST)
     jopse_d_label = optimizer_display_label(JOPSE_D)
     jopse_c_departure_label = optimizer_display_label(JOPSE_C_DEPARTURE)
@@ -1680,6 +1687,62 @@ if __name__ == "__main__":
             subfolder=relaxation_quality_dir(FIPSE_TI),
             map=fipse_ti_runner.map,
         )
+
+    if (
+        (dimensions == "1D" or dimensions == "both")
+        and should_run_optimizer(FIPSE_PA)
+        and not optimizer_is_done(FIPSE_PA)
+    ):
+        fipse_pa_runner = FixedPathPathAveragedSpeedEnergyOptimizer(
+            wind_model=wind_model_1D,
+            propulsion_model=propulsion_model,
+            calm_model=calm_model,
+            generator_models=generatorModels,
+            map=map,
+            itinerary=itinerary,
+            states=states,
+            weather=weather,
+            ship=ship,
+            ref_speed=ref_speed,
+            waypoints=path.sol.waypoints,
+            path_set_ids=path.sol.set_sequence,
+        )
+        fipse_pa_runner.nc_sources = nc_sources
+
+        log.progress("[RUN] Starting %s optimization", fipse_pa_label)
+        ok = fipse_pa_runner.optimize(
+            unit_commitment=False,
+            verbose=solver_verbose,
+        )
+        if ok:
+            log.debug("%s optimization succeeded.", fipse_pa_label)
+            _, fipse_pa_eval_sol, _, _ = evaluate_solution(
+                fipse_pa_runner,
+                fipse_pa_label,
+            )
+            save_evaluated_solutions(
+                (FIPSE_PA, fipse_pa_label, fipse_pa_eval_sol),
+            )
+            maybe_plot_solutions(
+                [fipse_pa_runner.sol, fipse_pa_eval_sol],
+                [
+                    f"Convex {fipse_pa_label} solution",
+                    f"{fipse_pa_label} evaluated solution",
+                ],
+                benchmark_label=f"{fipse_pa_label} evaluated solution",
+                show=False,
+                subfolder=relaxation_quality_dir(FIPSE_PA),
+                map=fipse_pa_runner.map,
+            )
+        else:
+            log.error("%s optimization failed.", fipse_pa_label)
+            fipse_pa_eval_sol = _failed_optimizer_summary(
+                fipse_pa_runner,
+                fipse_pa_label,
+            )
+            save_evaluated_solutions(
+                (FIPSE_PA, fipse_pa_label, fipse_pa_eval_sol),
+            )
 
     if (
         (dimensions == "1D" or dimensions == "both")

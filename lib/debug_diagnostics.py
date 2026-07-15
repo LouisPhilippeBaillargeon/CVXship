@@ -7,6 +7,7 @@ import numpy as np
 
 from lib.models import WindModel1D
 from lib.optimizer_names import (
+    FIPSE_PA,
     FIPSE_ST,
     FIPSE_TI,
     JOPSE_C_DEPARTURE,
@@ -449,7 +450,7 @@ def record_optimizer_debug(optimizer_name: str, runner, ctx: Dict[str, Any]) -> 
         _record_jopse_c(report, runner, ctx, eval_by_t)
     elif mode == FIPSE_ST:
         _record_fipse_st(report, runner, ctx, eval_by_t)
-    elif mode == FIPSE_TI:
+    elif mode in {FIPSE_TI, FIPSE_PA}:
         _record_fipse_ti(report, runner, ctx, eval_by_t)
     else:
         report.note(f"unknown diagnostics mode {raw_mode}")

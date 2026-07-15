@@ -7,6 +7,12 @@ import numpy as np
 import pandas as pd
 
 from lib.map_builder import SetEditor
+from lib.plotting import (
+    MAP_X0_LABEL_KM,
+    MAP_X0_SYMBOL,
+    MAP_X1_LABEL_KM,
+    MAP_X1_SYMBOL,
+)
 
 
 def _overlay():
@@ -53,6 +59,8 @@ def test_set_editor_weather_overlay_toggle(tmp_path):
     )
 
     try:
+        assert editor.ax.get_xlabel() == MAP_X0_LABEL_KM
+        assert editor.ax.get_ylabel() == MAP_X1_LABEL_KM
         assert editor.weather_overlay_mode == "off"
         assert not editor.weather_artists["wind"][0].get_visible()
 
@@ -90,6 +98,12 @@ def test_set_editor_draws_non_pickable_port_coordinates(tmp_path):
         assert len(editor.port_coordinates) == 2
         assert len(editor.port_artists) == 3
         assert all(artist.get_picker() is False for artist in editor.port_artists)
+        port_labels = [
+            artist.get_text()
+            for artist in editor.port_artists
+            if hasattr(artist, "get_text")
+        ]
+        assert any(MAP_X0_SYMBOL in label and MAP_X1_SYMBOL in label for label in port_labels)
     finally:
         plt.close(editor.fig)
 
@@ -131,6 +145,8 @@ def test_set_editor_print_figure_includes_current_visible_layers(tmp_path):
 
         assert "0" in labels
         assert any("Origin" in label for label in labels)
+        assert map_ax.get_xlabel() == MAP_X0_LABEL_KM
+        assert map_ax.get_ylabel() == MAP_X1_LABEL_KM
         assert len(print_fig.axes) == 2
         assert print_fig.axes[1].get_ylabel() == "Average wind speed (m/s)"
     finally:

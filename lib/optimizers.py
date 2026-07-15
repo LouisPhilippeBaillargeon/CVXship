@@ -14,7 +14,7 @@ from lib.load_params import Ship, Map, Itinerary, States
 from lib.models import BaseWindModel, WindModel1D, WindModelTransition1D, WindModel2D, WindModelPathAligned2D, PropulsionModel, GeneratorModel, CalmWaterModel
 from lib.weather import Weather
 from lib.utils import classify_timesteps, dx_dy_km, compute_port_set_indices, point_in_sets, _compute_tight_big_M_set, _compute_min_set_timesteps, _compute_min_crossing_distance_per_set, build_constant_speed_path_reference, xy_from_path_distance, _ordered_set_corner_ids, _set_edges_from_corner_ids, ship_speed_limit_matrix, build_speed_limit_partitions
-from lib.weather_interpolation import build_path_segment_weather_inputs, interpolated_weather_at, query_time_for_segment
+from lib.weather_interpolation import build_path_segment_weather_inputs, interpolated_weather_at, query_time_for_segment, sample_weather_average
 from lib.wrt_adapter import (
     drop_duplicate_waypoints,
     find_wrt_route_file,
@@ -27,6 +27,7 @@ from lib.wrt_adapter import (
 )
 from lib.debug_diagnostics import record_optimizer_debug
 from lib.optimizer_names import (
+    FIPSE_PA,
     FIPSE_ST,
     FIPSE_TI,
     JOPSE_C_DEPARTURE,
@@ -3325,6 +3326,27 @@ class FixedPathSpaceTimeSpeedEnergyOptimizer:
         return 1
 
 
+def _fixed_path_equidistant_sample_points(waypoints, n_points: int = 10):
+    waypoints = np.asarray(waypoints, dtype=float)
+    n_points = int(n_points)
+    if n_points <= 0:
+        raise ValueError("n_points must be positive.")
+    if waypoints.ndim != 2 or waypoints.shape[1] != 2:
+        raise ValueError("waypoints must have shape (N, 2).")
+    if waypoints.shape[0] < 2:
+        raise ValueError("waypoints must contain at least 2 points.")
+
+    segment_vecs = waypoints[1:] - waypoints[:-1]
+    segment_lengths = np.linalg.norm(segment_vecs, axis=1)
+    if np.any(segment_lengths <= 0):
+        raise ValueError("Consecutive waypoints must be distinct.")
+
+    total_path_length = float(np.sum(segment_lengths))
+    distances = np.linspace(0.0, total_path_length, n_points, dtype=float)
+    points = np.vstack([xy_from_path_distance(waypoints, d) for d in distances])
+    return distances, points
+
+
 @dataclass
 class FixedPathTrajectoryIndexedSpeedEnergyOptimizer:
     """
@@ -3349,6 +3371,9 @@ class FixedPathTrajectoryIndexedSpeedEnergyOptimizer:
 
     waypoints           : np.ndarray
     path_set_ids       : List[int]
+    weather_sampling_mode: str = "trajectory_midpoint"
+    path_average_sample_count: int = 10
+    optimizer_id: str = FIPSE_TI
 
     sol: Optional[Solution] = field(default=None, init=False)
     ref: Optional[dict] = field(default=None, init=False)
@@ -3358,10 +3383,15 @@ class FixedPathTrajectoryIndexedSpeedEnergyOptimizer:
     sampled_wind: Optional[np.ndarray] = field(default=None, init=False)
     sampled_irradiance: Optional[np.ndarray] = field(default=None, init=False)
     sampled_course_angle: Optional[np.ndarray] = field(default=None, init=False)
+    path_average_distances: Optional[np.ndarray] = field(default=None, init=False)
+    path_average_points: Optional[np.ndarray] = field(default=None, init=False)
     nc_sources: Optional[dict] = field(default=None, init=False)
     solver_status: Optional[str] = field(default=None, init=False)
     solve_time: Optional[float] = field(default=None, init=False)
     failure_reason: Optional[str] = field(default=None, init=False)
+
+    def _optimizer_label(self):
+        return optimizer_display_label(self.optimizer_id)
 
     def _precompute_timesampled_weather_models(self):
         T_future = self.itinerary.nb_timesteps - self.states.timesteps_completed
@@ -3399,7 +3429,26 @@ class FixedPathTrajectoryIndexedSpeedEnergyOptimizer:
         irradiance_ts = np.zeros(T_future)
 
         if self.nc_sources is None:
-            raise ValueError("FiPSE-TI requires nc_sources prepared from weather.toml.")
+            raise ValueError(
+                f"{self._optimizer_label()} requires nc_sources prepared from weather.toml."
+            )
+
+        weather_sampling_mode = str(self.weather_sampling_mode)
+        if weather_sampling_mode == "path_average":
+            (
+                self.path_average_distances,
+                self.path_average_points,
+            ) = _fixed_path_equidistant_sample_points(
+                waypoints,
+                self.path_average_sample_count,
+            )
+        elif weather_sampling_mode == "trajectory_midpoint":
+            self.path_average_distances = None
+            self.path_average_points = None
+        else:
+            raise ValueError(
+                "weather_sampling_mode must be one of: trajectory_midpoint, path_average"
+            )
 
         for t in range(T_future):
             if interval_sail_fraction[t] <= 1e-9:
@@ -3409,14 +3458,22 @@ class FixedPathTrajectoryIndexedSpeedEnergyOptimizer:
 
             s = np.searchsorted(D_breaks, d_mid, side="right") - 1
             s = int(np.clip(s, 0, len(segment_dirs) - 1))
-            mid_pos = xy_from_path_distance(waypoints, d_mid)
             query_time = query_time_for_segment(
                 self.itinerary,
                 self.states,
                 t,
                 0.5 * float(timestep_dt_h[t]),
             )
-            w = interpolated_weather_at(self.nc_sources, self.map, mid_pos, query_time)
+            if weather_sampling_mode == "path_average":
+                w = sample_weather_average(
+                    self.nc_sources,
+                    self.map,
+                    self.path_average_points,
+                    query_time,
+                )
+            else:
+                mid_pos = xy_from_path_distance(waypoints, d_mid)
+                w = interpolated_weather_at(self.nc_sources, self.map, mid_pos, query_time)
 
             course_ts[0, t] = np.arctan2(segment_dirs[s, 1], segment_dirs[s, 0])
 
@@ -3442,9 +3499,9 @@ class FixedPathTrajectoryIndexedSpeedEnergyOptimizer:
             course_ts,
         )
 
-        log.debug("[TimeSampled] fitted one wind model per timestep")
-        log.debug("[TimeSampled] current_x: %s", current_x_ts[:5])
-        log.debug("[TimeSampled] irradiance: %s", irradiance_ts[:5])
+        log.debug("[%s] fitted one wind model per timestep", self._optimizer_label())
+        log.debug("[%s] current_x: %s", self._optimizer_label(), current_x_ts[:5])
+        log.debug("[%s] irradiance: %s", self._optimizer_label(), irradiance_ts[:5])
 
     def optimize(
         self,
@@ -3455,12 +3512,14 @@ class FixedPathTrajectoryIndexedSpeedEnergyOptimizer:
         constraints = []
         self.zone_membership_binary_count = 0
         self.failure_reason = None
-        _require_convex_ship_models(self, _FIPSE_TI_LABEL)
+        optimizer_label = self._optimizer_label()
+        _require_convex_ship_models(self, optimizer_label)
 
         if unit_commitment:
             log.warning(
-                "[FiPSE-TI WARNING] unit_commitment=True ignored; "
-                "FiPSE-TI is kept binary-free."
+                "[%s WARNING] unit_commitment=True ignored; %s is kept binary-free.",
+                optimizer_label,
+                optimizer_label,
             )
             unit_commitment = False
 
@@ -3797,8 +3856,8 @@ class FixedPathTrajectoryIndexedSpeedEnergyOptimizer:
         self.solver_status = problem.status
         self.solve_time = solve_time
 
-        if not _solver_succeeded(problem, _FIPSE_TI_LABEL):
-            log.error("%s optimization status: %s", _FIPSE_TI_LABEL, problem.status)
+        if not _solver_succeeded(problem, optimizer_label):
+            log.error("%s optimization status: %s", optimizer_label, problem.status)
             self.failure_reason = f"solver_status:{problem.status}"
             return 0
 
@@ -3895,10 +3954,10 @@ class FixedPathTrajectoryIndexedSpeedEnergyOptimizer:
             ship=self.ship,
         )
         record_optimizer_debug(
-            _FIPSE_TI_LABEL,
+            optimizer_label,
             self,
             {
-                "mode": FIPSE_TI,
+                "mode": self.optimizer_id,
                 "ship_speed_x": ship_speed_x.value,
                 "ship_speed_y": ship_speed_y.value,
                 "speed_rel_water_x": speed_rel_water_x.value,
@@ -3916,6 +3975,24 @@ class FixedPathTrajectoryIndexedSpeedEnergyOptimizer:
             },
         )
         return 1
+
+
+@dataclass
+class FixedPathPathAveragedSpeedEnergyOptimizer(
+    FixedPathTrajectoryIndexedSpeedEnergyOptimizer
+):
+    """
+    Fixed-path speed-and-energy optimizer with path-averaged timestep weather.
+
+    The optimization model is identical to FiPSE-TI. Only the frozen weather
+    sampler changes: each timestep uses the average weather over fixed
+    equidistant points along the full input path.
+    """
+
+    weather_sampling_mode: str = "path_average"
+    path_average_sample_count: int = 10
+    optimizer_id: str = FIPSE_PA
+
 
 @dataclass
 class ShortestPathConstantSpeedController:
@@ -4841,7 +4918,7 @@ class SavedPath(ShortestPath):
 
 @dataclass
 class WeatherRoutingToolPath(ShortestPath):
-    algorithm: str = "isofuel"
+    algorithm: str = "genetic"
     work_dir: Optional[Path] = None
     weather_files: Optional[dict] = None
     wrt_source_dir: Optional[Path] = None
@@ -4894,13 +4971,18 @@ class WeatherRoutingToolPath(ShortestPath):
         if total_distance <= 0.0:
             raise ValueError("WeatherRoutingToolPath produced zero route distance.")
 
+        route_status_kind = (
+            "precomputed"
+            if self.last_route_source == "precomputed"
+            else str(self.algorithm)
+        )
         self.sol = ShortestPathSolution(
             waypoints=waypoints,
             transition_points=np.asarray(waypoints[1:-1], dtype=float),
             set_sequence=[int(z) for z in set_sequence],
             portal_endpoints=[],
             total_distance=float(total_distance),
-            status=f"wrt:{self.algorithm}:{route_path.name}",
+            status=f"wrt:{route_status_kind}:{route_path.name}",
         )
 
         log.debug("WeatherRoutingToolPath route_file = %s", route_path)
@@ -5166,6 +5248,7 @@ JPDSE = JointPathDiscreteSpeedEnergyOptimizer
 JPCSE = JointPathContinuousSpeedEnergyOptimizer
 FPJSE = FixedPathSpaceTimeSpeedEnergyOptimizer
 FR_O = FixedPathTrajectoryIndexedSpeedEnergyOptimizer
+FIPSE_PA_O = FixedPathPathAveragedSpeedEnergyOptimizer
 NaiveController = ShortestPathConstantSpeedController
 _jpcse_normal_wind_inactive_expr = _jopse_c_normal_wind_inactive_expr
 _jpcse_transition_wind_inactive_expr = _jopse_c_transition_wind_inactive_expr

@@ -7,26 +7,10 @@ points = [
   { lat = "49 22 N", lon = "064 00 W" },
 ]
 [[set]]
-name = "dynamic_shipping_zone_b"
+name = "dynamic_shipping_zone_b_c_e"
 points = [
   { lat = "49 22 N", lon = "064 00 W" },
   { lat = "49 11 N", lon = "064 00 W" },
-  { lat = "48 48 N", lon = "063 00 W" },
-  { lat = "49 00 N", lon = "063 00 W" },
-]
-[[set]]
-name = "dynamic_shipping_zone_c"
-points = [
-  { lat = "49 00 N", lon = "063 00 W" },
-  { lat = "48 48 N", lon = "063 00 W" },
-  { lat = "48 24 N", lon = "062 00 W" },
-  { lat = "48 35 N", lon = "062 00 W" },
-]
-[[set]]
-name = "dynamic_shipping_zone_e"
-points = [
-  { lat = "48 35 N", lon = "062 00 W" },
-  { lat = "48 24 N", lon = "062 00 W" },
   { lat = "48 00 N", lon = "061 00 W" },
   { lat = "48 10.5 N", lon = "061 00 W" },
 ]

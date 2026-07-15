@@ -11,17 +11,9 @@ resolution_km = 1.0
 # Boundary-only path contact is ignored with a 1e-5 km tolerance.
 #
 [[speed_limit]]
-set = 5
+set = 3
 speed = 5.14444444
 
 [[speed_limit]]
-set = 6
-speed = 5.14444444
-
-[[speed_limit]]
-set = 7
-speed = 5.14444444
-
-[[speed_limit]]
-set = 8
+set = 4
 speed = 5.14444444

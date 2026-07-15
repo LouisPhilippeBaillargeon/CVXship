@@ -73,7 +73,7 @@ The same can be set in `case.toml` under `[run]`:
 
 ```toml
 path_generator = "wrt"      # default: "shortest"
-wrt_algorithm = "isofuel"   # or "genetic"
+wrt_algorithm = "genetic"   # or "isofuel"
 wrt_source_dir = "C:/path/to/WeatherRoutingTool"
 ```
 
@@ -92,9 +92,10 @@ upper_prop_factor = 1.2
 
 If WeatherRoutingTool is already importable in Python, `wrt_source_dir` is not
 needed. You can also set `WRT_SOURCE_DIR` in the environment, or pass
-`--wrt-route-geojson <file>` to reuse a route already written by WRT. The
-returned object still exposes `path.sol.waypoints` and `path.sol.set_sequence`
-like the local shortest path.
+`--wrt-route-geojson <file>` / `--wrt-precomputed-route <file>` to reuse a route
+already written by WRT. In that reuse mode CVXship skips the WRT input-file
+preparation and subprocess call, then directly projects the supplied route into
+`path.sol.waypoints` and `path.sol.set_sequence` like the local shortest path.
 
 Every run saves the generated route before any optimizer is called:
 

@@ -139,10 +139,16 @@ def test_wrt_default_map_uses_full_cvx_map_extent():
     assert bounds[3] > -58.0
 
 
-def test_weather_routing_tool_path_accepts_precomputed_geojson(tmp_path):
+def test_weather_routing_tool_path_accepts_precomputed_geojson(tmp_path, monkeypatch):
     map_obj, itinerary, states, end_pos, shortest_sol = _case_shortest_path()
     route_path = tmp_path / "min_time_route.json"
     _write_geojson(route_path, map_obj, shortest_sol.waypoints)
+
+    def _unexpected_wrt_generation(*args, **kwargs):
+        pytest.fail("Precomputed WRT route reuse should not prepare files or run WRT.")
+
+    monkeypatch.setattr("lib.optimizers.prepare_wrt_run_files", _unexpected_wrt_generation)
+    monkeypatch.setattr("lib.optimizers.run_weather_routing_tool", _unexpected_wrt_generation)
 
     path = WeatherRoutingToolPath(
         map=map_obj,
@@ -152,13 +158,15 @@ def test_weather_routing_tool_path_accepts_precomputed_geojson(tmp_path):
         ship=None,
         route_geojson_path=route_path,
     )
+    assert path.algorithm == "genetic"
+
     sol = path.compute(end_pos)
 
     assert sol.waypoints.shape[1] == 2
     assert len(sol.set_sequence) == sol.waypoints.shape[0] - 1
     np.testing.assert_allclose(sol.waypoints[0], shortest_sol.waypoints[0])
     np.testing.assert_allclose(sol.waypoints[-1], shortest_sol.waypoints[-1])
-    assert sol.status.startswith("wrt:isofuel:")
+    assert sol.status.startswith("wrt:precomputed:")
 
 
 def test_weather_routing_tool_path_bridges_nonadjacent_wrt_sets(tmp_path):

@@ -909,26 +909,9 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
     shore_cost_cmd, shore_cost_kind = _as_T_or_TH(sol.shore_power_cost, "shore_power_cost")
     batt_ch_cmd, batt_ch_kind = _as_T_or_TH(sol.battery_charge, "battery_charge")
     batt_dis_cmd, batt_dis_kind = _as_T_or_TH(sol.battery_discharge, "battery_discharge")
-
-    gen_startup_out = getattr(sol, "gen_startup", None)
-    gen_shutdown_out = getattr(sol, "gen_shutdown", None)
-    generator_transition_cost = getattr(sol, "generator_transition_cost", None)
-    if (
-        gen_startup_out is None
-        or gen_shutdown_out is None
-        or generator_transition_cost is None
-    ):
-        gen_startup_out, gen_shutdown_out, generator_transition_cost = (
-            _generator_transition_cost_from_schedule(
-                ship,
-                sol.gen_on,
-                first_instant_sail=np.asarray(sol.instant_sail, dtype=float).reshape(-1)[0],
-            )
-        )
-    else:
-        gen_startup_out = np.asarray(gen_startup_out, dtype=float)
-        gen_shutdown_out = np.asarray(gen_shutdown_out, dtype=float)
-        generator_transition_cost = float(generator_transition_cost)
+    source_generator_unit_commitment = bool(
+        getattr(sol, "generator_unit_commitment", False)
+    )
 
     def _pick_T(arr, kind, t, h_cmd, h_seg):
         if kind == "T":
@@ -1280,7 +1263,6 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
     c0 = c0_matrix[:, 0]
     gen_min_power = np.array([g.min_power for g in ship.generators], dtype=float)
     gen_max_power = np.array([g.max_power for g in ship.generators], dtype=float)
-    source_generator_unit_commitment = getattr(sol, "generator_unit_commitment", None)
     battery_capacity = float(ship.battery.capacity)
     battery_charge_eff = float(ship.battery.charge_eff)
     battery_discharge_eff = float(ship.battery.discharge_eff)
@@ -1345,6 +1327,8 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
 
             gen_sched = _pick_NT(gen_cmd, gen_kind, t, h_cmd, h)
             gen_on = _pick_NT(gen_on_cmd, gen_on_kind, t, h_cmd, h)
+            if not source_generator_unit_commitment:
+                gen_on = np.ones(nb_gen, dtype=float)
 
             qtime = query_time_for_segment(itinerary, runner.states, t, segment_record["mid_offset_h"])
             w = interpolated_weather_at(nc_sources, runner.map, segment_record["mid_pos"], qtime)
@@ -1760,6 +1744,19 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         n_all[t, n_real:Hmax] = n_all[t, last]
         best_pitch[t, n_real:Hmax] = best_pitch[t, last]
         total_cost_all[t, n_real:Hmax] = 0.0
+
+    transition_gen_on = (
+        gen_on_all
+        if source_generator_unit_commitment
+        else np.ones((nb_gen, T), dtype=float)
+    )
+    gen_startup_out, gen_shutdown_out, generator_transition_cost = (
+        _generator_transition_cost_from_schedule(
+            ship,
+            transition_gen_on,
+            first_instant_sail=np.asarray(sol.instant_sail, dtype=float).reshape(-1)[0],
+        )
+    )
 
     first_stage_optimizer = (
         getattr(sol, "first_stage_optimizer", None)

@@ -7,9 +7,9 @@
 # init_speed         : (m/s)
 # ============================
 [params]
-soc_i               = 0.75
+soc_i               = 1.5
 soc_f               = 3.0
-timestep            = 4.0
+timestep            = 0.75
 fuel_price          = 1.2155
 init_speed          = 0
 
@@ -39,15 +39,15 @@ power = 0.3
 # ============================
 [[transit]]
 city                = "Sept-ile"
-lat                 = 50.068699
-lon                 = -66.256956
+lat                 = 50.07266
+lon                 = -66.5892
 power_cost          = 79.11
 max_charge_power    = 2
 
 [[transit]]
 city                = "Grosse-Ile"
-lat                 = 47.965557
-lon                 = -61.780420
+lat                 = 47.854326
+lon                 = -61.680062
 power_cost          = 79.11
 max_charge_power    = 2
 # ============================
