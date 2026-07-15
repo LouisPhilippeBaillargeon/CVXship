@@ -9,6 +9,7 @@ from pathlib import Path
 
 from lib import logging_utils as log
 from lib.utils import _halfspace_polygon_4ineq, _ordered_set_corner_ids, _set_edges_from_corner_ids, safe_unit
+from lib.weather_override import apply_weather_override
 
 
 _GEOD = Geod(ellps="WGS84")
@@ -125,7 +126,7 @@ def _resolve_weather_files(weather_files):
     return {key: Path(weather_files[key]) for key in REQUIRED_WEATHER_FILES}
 
 
-def prepare_nc_interp_source(map_obj, itinerary, weather_files):
+def prepare_nc_interp_source(map_obj, itinerary, weather_files, weather_override=None):
     files = _resolve_weather_files(weather_files)
     t_start = pd.Timestamp(itinerary.transits[0].arrival_datetime)
     t_end = pd.Timestamp(itinerary.transits[-1].departure_datetime)
@@ -183,6 +184,9 @@ def prepare_nc_interp_source(map_obj, itinerary, weather_files):
         src["lat"] = np.asarray(ds["latitude"].values, dtype=float)
         src["lon"] = np.asarray(ds["longitude"].values, dtype=float)
         src["lon2d"], src["lat2d"] = np.meshgrid(src["lon"], src["lat"])
+
+    if weather_override is not None:
+        sources["weather_override"] = weather_override
 
     return sources
 
@@ -294,7 +298,7 @@ def sample_weather_at_point(sources, map_obj, pos_xy_km, query_time):
 
     irradiance = interp_nc_value(sun, "ssrd", query_time, lat, lon) / (1_000_000.0 * 3600.0)
 
-    return {
+    weather = {
         "current": np.array([current_x, current_y], dtype=float),
         "wind": np.array([wind_x, wind_y], dtype=float),
         "irradiance": float(irradiance),
@@ -302,6 +306,13 @@ def sample_weather_at_point(sources, map_obj, pos_xy_km, query_time):
         "lat": float(lat),
         "lon": float(lon),
     }
+    return apply_weather_override(
+        weather,
+        sources.get("weather_override"),
+        map_obj,
+        pos_xy_km,
+        query_time,
+    )
 
 
 def interpolated_weather_at(sources, map_obj, pos_xy_km, query_time):

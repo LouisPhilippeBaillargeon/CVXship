@@ -663,12 +663,17 @@ def load_states(map, itinerary) -> States:
     )
 
 #===================================================ALL======================================================================================
-def load_config(case_dir=None, weather_files=None, scenario=None):
+def load_config(case_dir=None, weather_files=None, scenario=None, weather_override=None):
     map = load_map(case_dir=case_dir)
     itinerary = load_itinerary(map, case_dir=case_dir, scenario=scenario)
     states = load_states(map, itinerary)
     ship = load_ship(case_dir=case_dir)
     if weather_files is None:
         weather_files = resolve_weather_files_from_toml(case_dir)
-    weather = weather_from_nc_file(map, itinerary, weather_files=weather_files)
+    weather = weather_from_nc_file(
+        map,
+        itinerary,
+        weather_files=weather_files,
+        weather_override=weather_override,
+    )
     return map, itinerary, states, ship, weather

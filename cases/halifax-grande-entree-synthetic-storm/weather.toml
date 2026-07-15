@@ -1,0 +1,46 @@
+[files]
+currents = "../../weather_data/halifax-grande-entree/currents/currents_01_01.nc"
+atmo = "../../weather_data/halifax-grande-entree/atmo.nc"
+sun = "../../weather_data/halifax-grande-entree/sun.nc"
+
+[variants.jan01.files]
+currents = "../../weather_data/halifax-grande-entree/currents/currents_01_01.nc"
+atmo = "../../weather_data/halifax-grande-entree/atmo.nc"
+sun = "../../weather_data/halifax-grande-entree/sun.nc"
+
+[variants.mar01.files]
+currents = "../../weather_data/halifax-grande-entree/currents/currents_01_03.nc"
+atmo = "../../weather_data/halifax-grande-entree/atmo.nc"
+sun = "../../weather_data/halifax-grande-entree/sun.nc"
+
+[variants.jul01.files]
+currents = "../../weather_data/halifax-grande-entree/currents/currents_01_07.nc"
+atmo = "../../weather_data/halifax-grande-entree/atmo.nc"
+sun = "../../weather_data/halifax-grande-entree/sun.nc"
+
+[variants.sep01.files]
+currents = "../../weather_data/halifax-grande-entree/currents/currents_01_09.nc"
+atmo = "../../weather_data/halifax-grande-entree/atmo.nc"
+sun = "../../weather_data/halifax-grande-entree/sun.nc"
+
+[variants.nov01.files]
+currents = "../../weather_data/halifax-grande-entree/currents/currents_01_11.nc"
+atmo = "../../weather_data/halifax-grande-entree/atmo.nc"
+sun = "../../weather_data/halifax-grande-entree/sun.nc"
+
+[variants.jan01_synthetic_storm.files]
+currents = "../../weather_data/halifax-grande-entree/currents/currents_01_01.nc"
+atmo = "../../weather_data/halifax-grande-entree/atmo.nc"
+sun = "../../weather_data/halifax-grande-entree/sun.nc"
+
+[variants.jan01_synthetic_storm.weather_override]
+label = "Synthetic dummy local storm"
+kind = "synthetic_dummy_local_storm"
+disclosure = "Synthetic dummy case: wind and current replace real weather only inside the configured target zone/time window; all other samples use the referenced NetCDF files."
+mode = "replace"
+direction = "against_spacs"
+target_zone = 2
+start = "2025-01-01T18:00"
+end = "2025-01-01T21:00"
+wind_magnitude_mps = 30.0
+current_magnitude_mps = 2.0

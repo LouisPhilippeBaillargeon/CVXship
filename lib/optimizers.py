@@ -92,6 +92,26 @@ def _require_convex_ship_models(runner, optimizer_name: str) -> None:
         raise ValueError(f"{context} requires PropulsionModel.fit_convex_model() first.")
 
 
+def _weather_current_margin_mps(weather, default: float = 1.0) -> float:
+    current_x = getattr(weather, "current_x", None)
+    current_y = getattr(weather, "current_y", None)
+    if current_x is None or current_y is None:
+        return float(default)
+
+    try:
+        cx = np.asarray(current_x, dtype=float)
+        cy = np.asarray(current_y, dtype=float)
+    except (TypeError, ValueError):
+        return float(default)
+    if cx.shape != cy.shape or cx.size == 0:
+        return float(default)
+
+    magnitude = np.sqrt(cx * cx + cy * cy)
+    if not np.any(np.isfinite(magnitude)):
+        return float(default)
+    return max(float(default), float(np.nanmax(magnitude)))
+
+
 def _propulsion_physical_feasibility_constraints(
     propulsion_model: PropulsionModel,
     advance_speed,
@@ -1460,7 +1480,8 @@ class JointPathDiscreteSpeedEnergyOptimizer:
         speed_rel_water_x = cp.Variable((T_future, H))
         speed_rel_water_y = cp.Variable((T_future, H))
         speed_rel_water_mag = cp.Variable((T_future, H), nonneg=True)
-        constraints += [speed_rel_water_mag<=self.ship.info.max_speed+1]  #adding 1m/s to account for currents that can go up to 1m/s
+        current_margin = _weather_current_margin_mps(self.weather)
+        constraints += [speed_rel_water_mag <= self.ship.info.max_speed + current_margin]
 
         current_x_future = self.weather.current_x[:, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
         current_y_future = self.weather.current_y[:, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
@@ -2161,7 +2182,8 @@ class JointPathContinuousSpeedEnergyOptimizer:
         current_x_future = self.weather.current_x[:, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
         current_y_future = self.weather.current_y[:, self.states.timesteps_completed : self.states.timesteps_completed + T_future]
 
-        constraints += [speed_rel_water_mag<=self.ship.info.max_speed+1]  #adding 1m/s to account for currents that can go up to 1m/s
+        current_margin = _weather_current_margin_mps(self.weather)
+        constraints += [speed_rel_water_mag <= self.ship.info.max_speed + current_margin]
         for t in range(T_future):
             if interval_sail_fraction[t] <= 0.01:
                 constraints += [
@@ -2907,13 +2929,14 @@ class FixedPathSpaceTimeSpeedEnergyOptimizer:
         ship_speed_y_split_rel_water = cp.Variable((T_future, 2))
         ship_speed_rel_water_mag_split = cp.Variable((T_future, 2), nonneg=True)
         speed_rel_water_mag = cp.Variable(T_future, nonneg=True)
+        current_margin = _weather_current_margin_mps(self.weather)
 
-        constraints += [ship_speed_rel_water_mag_split <= self.ship.info.max_speed+1] #adding 1 m/s to account for current
-        constraints += [speed_rel_water_mag <= self.ship.info.max_speed+1]
-        constraints += [ship_speed_x_split_rel_water >= -self.ship.info.max_speed-1]
-        constraints += [ship_speed_x_split_rel_water <= self.ship.info.max_speed+1]
-        constraints += [ship_speed_y_split_rel_water >= -self.ship.info.max_speed-1]
-        constraints += [ship_speed_y_split_rel_water <= self.ship.info.max_speed+1]
+        constraints += [ship_speed_rel_water_mag_split <= self.ship.info.max_speed + current_margin]
+        constraints += [speed_rel_water_mag <= self.ship.info.max_speed + current_margin]
+        constraints += [ship_speed_x_split_rel_water >= -self.ship.info.max_speed - current_margin]
+        constraints += [ship_speed_x_split_rel_water <= self.ship.info.max_speed + current_margin]
+        constraints += [ship_speed_y_split_rel_water >= -self.ship.info.max_speed - current_margin]
+        constraints += [ship_speed_y_split_rel_water <= self.ship.info.max_speed + current_margin]
 
         current_x_path = np.asarray(self.sampled_current_x_path, dtype=float)
         current_y_path = np.asarray(self.sampled_current_y_path, dtype=float)
@@ -3657,7 +3680,8 @@ class FixedPathTrajectoryIndexedSpeedEnergyOptimizer:
         speed_rel_water_y = cp.Variable(T_future)
         speed_rel_water_mag = cp.Variable(T_future, nonneg=True)
 
-        constraints += [speed_rel_water_mag <= self.ship.info.max_speed + 1.0]
+        current_margin = _weather_current_margin_mps(self.weather)
+        constraints += [speed_rel_water_mag <= self.ship.info.max_speed + current_margin]
 
         constraints += [
             speed_rel_water_x == ship_speed_x - self.sampled_current_x,

@@ -1,0 +1,33 @@
+name = "halifax-grande-entree-synthetic-storm"
+description = "Disclosed synthetic dummy Halifax to Grande-Entree case with a targeted adverse weather override for theoretical capability demonstrations."
+
+[run]
+dimensions = "both"
+new_ship = true
+new_weather = true
+solver_verbose = false
+unit_commitment = false
+ordered_sets = true
+scenarios = ["jan01_synthetic_storm"]
+
+[cache]
+scope = "case"
+
+[fit_range]
+lower_speed_factor = 0.90
+upper_speed_factor = 1.15
+lower_res_factor = 0.7
+upper_res_factor = 1.2
+lower_prop_factor = 0.7
+upper_prop_factor = 1.2
+
+[outputs]
+save_plots = true
+show_plots = false
+save_solutions = true
+save_console_log = true
+
+[[scenario]]
+name = "jan01_synthetic_storm"
+departure_date = "2025-01-01"
+weather_variant = "jan01_synthetic_storm"

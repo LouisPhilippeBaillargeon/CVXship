@@ -122,8 +122,13 @@ def _build_set_weather_from_point_sampler(
     )
 
 
-def weather_from_nc_file(map, itinerary, weather_files):
-    sources = prepare_nc_interp_source(map, itinerary, weather_files=weather_files)
+def weather_from_nc_file(map, itinerary, weather_files, weather_override=None):
+    sources = prepare_nc_interp_source(
+        map,
+        itinerary,
+        weather_files=weather_files,
+        weather_override=weather_override,
+    )
 
     def print_time_range(name, times):
         log.verbose("%s: %s  ->  %s  (n=%d)", name, times.min(), times.max(), len(times))

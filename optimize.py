@@ -13,9 +13,14 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-from lib.load_params import load_config
+from lib.load_params import load_itinerary, load_map, load_ship, load_states
 from lib.models import FitRange, PropulsionModel, BaseWindModel, WindModel1D, WindModelTransition1D, WindModel2D, WindModelPathAligned2D, GeneratorModel, CalmWaterModel, save_obj, load_obj
 from lib.plotting import normalize_plot_text_size, plot_solutions, plot_sets_and_points
+from lib.weather import weather_from_nc_file
+from lib.weather_override import (
+    finalize_weather_override_against_spacs,
+    load_weather_override_from_toml,
+)
 from lib.optimizers import (
     FixedPathPathAveragedSpeedEnergyOptimizer,
     FixedPathSpaceTimeSpeedEnergyOptimizer,
@@ -470,6 +475,7 @@ def _cache_metadata(
         "fit_range": _fit_range_metadata(fit_range),
         "case_inputs": case_inputs if case_inputs is not None else _case_input_fingerprint(run_context),
         "weather_files": weather_files if weather_files is not None else _weather_file_fingerprint(run_context),
+        "weather_override": getattr(run_context, "weather_override", None),
         "extra": extra,
     }
 
@@ -977,6 +983,10 @@ if __name__ == "__main__":
     save_console_log = bool(_option(args.save_console_log, output_toml_options, "save_console_log", True))
     cache_scope = str(_option(args.cache_scope, cache_toml_options, "scope", "case"))
     fit_range_factors = _fit_range_factor_options(fit_range_toml_options)
+    raw_weather_override = load_weather_override_from_toml(
+        args.case,
+        active_weather_variant,
+    )
 
     run_options = {
         "case": args.case,
@@ -1008,6 +1018,7 @@ if __name__ == "__main__":
         "save_console_log": save_console_log,
         "cache_scope": cache_scope,
         "fit_range_factors": fit_range_factors,
+        "weather_override": raw_weather_override,
         "resume_run_dir": str(resume_run_dir) if resume_run_dir is not None else None,
     }
     run_context = create_run_context(
@@ -1149,16 +1160,62 @@ if __name__ == "__main__":
 
     clear_debug_reports()
     log.progress("[RUN] Loading case inputs")
-    map, itinerary, states, ship, weather = load_config(
-        case_dir=run_context.case_dir,
+    map = load_map(case_dir=run_context.case_dir)
+    itinerary = load_itinerary(map, case_dir=run_context.case_dir, scenario=active_scenario)
+    states = load_states(map, itinerary)
+    ship = load_ship(case_dir=run_context.case_dir)
+    x, y, _ = dx_dy_km(map, itinerary.transits[-1].lat, itinerary.transits[-1].lon)
+
+    spacs_reference_path = None
+    weather_override = None
+    if raw_weather_override is not None:
+        log.progress("[RUN] Preparing synthetic weather override against SPaCS route")
+        spacs_reference_path = ShortestPath(
+            map=map,
+            itinerary=itinerary,
+            states=states,
+            weather=None,
+            ship=ship,
+        )
+        spacs_reference_path.compute([x, y], verbose=solver_verbose)
+        weather_override = finalize_weather_override_against_spacs(
+            raw_weather_override,
+            path_set_ids=spacs_reference_path.sol.set_sequence,
+            waypoints=spacs_reference_path.sol.waypoints,
+        )
+        run_context.weather_override = weather_override
+        update_manifest(
+            run_context,
+            {
+                "synthetic_weather": True,
+                "weather_override": weather_override,
+            },
+        )
+        for z, vector in weather_override.get("vectors_by_set", {}).items():
+            log.progress(
+                "[RUN] Synthetic weather override set=%s window=%s..%s "
+                "wind=(%.3f, %.3f) current=(%.3f, %.3f)",
+                z,
+                weather_override["start"],
+                weather_override["end"],
+                vector["wind_x"],
+                vector["wind_y"],
+                vector["current_x"],
+                vector["current_y"],
+            )
+
+    weather = weather_from_nc_file(
+        map,
+        itinerary,
         weather_files=run_context.weather_files,
-        scenario=active_scenario,
+        weather_override=weather_override,
     )
     log.progress("[RUN] Preparing weather interpolation")
     nc_sources = prepare_nc_interp_source(
         map,
         itinerary,
         weather_files=run_context.weather_files,
+        weather_override=weather_override,
     )
     _assert_finite("map.set_ineq", map.set_ineq)
     _assert_finite("map.set_adj", map.set_adj)
@@ -1170,8 +1227,6 @@ if __name__ == "__main__":
     _assert_finite("weather.wind_y", weather.wind_y)
     _assert_finite("weather.current_x", weather.current_x)
     _assert_finite("weather.current_y", weather.current_y)
-
-    x, y, _ = dx_dy_km(map, itinerary.transits[-1].lat, itinerary.transits[-1].lon)
 
     if path_generator == "saved":
         path = SavedPath(
@@ -1207,16 +1262,25 @@ if __name__ == "__main__":
         else:
             log.progress("[RUN] Starting WeatherRoutingTool path solve (%s)", wrt_algorithm)
     else:
-        path = ShortestPath(
-            map=map,
-            itinerary=itinerary,
-            states=states,
-            weather=weather,
-            ship=ship,
+        path = (
+            spacs_reference_path
+            if spacs_reference_path is not None
+            else ShortestPath(
+                map=map,
+                itinerary=itinerary,
+                states=states,
+                weather=weather,
+                ship=ship,
+            )
         )
-        log.progress("[RUN] Starting shortest-path solve")
+        path.weather = weather
+        if path.sol is None:
+            log.progress("[RUN] Starting shortest-path solve")
+        else:
+            log.progress("[RUN] Reusing shortest-path solve used for synthetic weather direction")
 
-    path.compute([x, y], verbose=solver_verbose)
+    if path.sol is None:
+        path.compute([x, y], verbose=solver_verbose)
     path_artifacts = _save_path_artifacts(run_context, path_generator, path)
     log.progress("[RUN] Saved path artifacts to %s", path_artifacts["path_solution_json"])
     update_manifest(run_context, {"path_artifacts": path_artifacts})

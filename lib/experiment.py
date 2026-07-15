@@ -18,6 +18,7 @@ import numpy as np
 
 from lib.paths import CACHE, RESULTS, ROOT
 from lib.weather_interpolation import resolve_weather_files_from_toml
+from lib.weather_override import weather_override_summary_fields
 from lib.optimizer_names import canonicalize_optimizer_label
 from lib import logging_utils as log
 
@@ -43,6 +44,7 @@ class RunContext:
     solutions_dir: Path
     cache_dir: Path
     weather_files: dict[str, Path]
+    weather_override: dict[str, Any] | None = None
     scenario_name: str | None = None
     weather_variant: str | None = None
     settings: dict[str, Any] = field(default_factory=dict)
@@ -356,6 +358,7 @@ def save_solution_record(
 
     label = canonicalize_optimizer_label(label)
     row = summarize_solution(key, label, sol)
+    row.update(weather_override_summary_fields(getattr(ctx, "weather_override", None)))
     row["solution_file"] = str(Path("solutions") / filename) if save_solutions else ""
     _log_solution_quality(label, sol)
     return row
@@ -657,6 +660,15 @@ def _write_summary_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "fit_range_warning_keys",
         "solver_status",
         "failure_reason",
+        "synthetic_weather",
+        "weather_override_label",
+        "weather_override_kind",
+        "weather_override_target_sets",
+        "weather_override_start",
+        "weather_override_end",
+        "weather_override_wind_magnitude_mps",
+        "weather_override_current_magnitude_mps",
+        "weather_override_disclosure",
         "solution_file",
     ]
     with open(path, "w", newline="", encoding="utf-8") as f:
