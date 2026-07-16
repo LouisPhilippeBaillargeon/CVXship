@@ -174,7 +174,7 @@ def main(argv=None) -> int:
         _error_summary(speeds, true_resistance, convex_resistance),
     )
     _print_error_summary(
-        "Evaluated C",
+        r"evaluated $\tilde{c}_\text{d}$",
         _error_summary(speeds, true_resistance, evaluated_c_resistance),
     )
     return 0

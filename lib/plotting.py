@@ -113,8 +113,24 @@ def _pdf_output_path(directory, name: str) -> Path:
 def _ieee_axes(ax):
     ax.grid(True, which="both", linestyle="--", linewidth=0.6, alpha=0.6)
     ax.tick_params(direction="in", top=True, right=True)
+    _tight_x_axis(ax)
     for spine in ax.spines.values():
         spine.set_linewidth(0.8)
+
+
+def _tight_x_axis(ax):
+    try:
+        ax.margins(x=0)
+    except (TypeError, ValueError):
+        return
+
+    if not ax.get_autoscalex_on():
+        return
+
+    try:
+        ax.autoscale(enable=True, axis="x", tight=True)
+    except (TypeError, ValueError):
+        pass
 
 
 def _finalize_axis(ax, xlabel: str, ylabel: str, title: Optional[str] = None):
@@ -140,6 +156,8 @@ def _save_and_maybe_show(
 
     _scale_figure_text(fig, font_scale=font_scale)
     _strip_plot_titles(fig)
+    for ax in fig.get_axes():
+        _tight_x_axis(ax)
 
     fig.tight_layout(pad=0.4)
 

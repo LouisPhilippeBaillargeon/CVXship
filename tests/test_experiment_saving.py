@@ -17,6 +17,7 @@ def test_save_solution_record_writes_pickle_and_refreshes_summary(tmp_path):
         solutions_dir=run_dir / "solutions",
         cache_dir=run_dir / "cache",
         weather_files={},
+        trajectory_generation_time_s=1.234,
     )
     ctx.solutions_dir.mkdir(parents=True)
 
@@ -36,5 +37,9 @@ def test_save_solution_record_writes_pickle_and_refreshes_summary(tmp_path):
     assert (run_dir / "summary.csv").exists()
     assert (run_dir / "summary.json").exists()
     assert row["zone_membership_binary_count"] == 18
-    assert "zone_membership_binary_count" in (run_dir / "summary.csv").read_text(encoding="utf-8")
+    assert row["trajectory_generation_time_s"] == 1.234
+    summary_csv = (run_dir / "summary.csv").read_text(encoding="utf-8")
+    assert "zone_membership_binary_count" in summary_csv
+    assert "trajectory_generation_time_s" in summary_csv
+    assert "1.234" in summary_csv
     assert Path(row["solution_file"]) == Path("solutions/fipse_st.pkl")

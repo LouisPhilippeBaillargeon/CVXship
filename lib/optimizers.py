@@ -153,6 +153,8 @@ def _range_violation_record(
     *,
     key: str,
     message: str,
+    lower_parameter: Optional[str] = None,
+    upper_parameter: Optional[str] = None,
     tol: float = 1e-6,
 ):
     arr = np.asarray(values, dtype=float)
@@ -163,14 +165,37 @@ def _range_violation_record(
     lower_violation = float(lower) - arr
     upper_violation = arr - float(upper)
     violation = np.maximum(lower_violation, upper_violation)
-    bad = mask & (violation > tol)
+    lower_bad = mask & (lower_violation > tol)
+    upper_bad = mask & (upper_violation > tol)
+    bad = lower_bad | upper_bad
     if not np.any(bad):
         return None
+
+    lower_count = int(np.sum(lower_bad))
+    upper_count = int(np.sum(upper_bad))
+    if lower_count and upper_count:
+        bound_side = "lower_and_upper"
+    elif lower_count:
+        bound_side = "lower"
+    else:
+        bound_side = "upper"
+
+    recommendations = []
+    if lower_count and lower_parameter:
+        recommendations.append(f"decrease [fit_range].{lower_parameter}")
+    if upper_count and upper_parameter:
+        recommendations.append(f"increase [fit_range].{upper_parameter}")
 
     return key, {
         "message": message,
         "count": int(np.sum(bad)),
         "max_amount": float(np.nanmax(violation[bad])),
+        "bound_side": bound_side,
+        "lower_count": lower_count,
+        "upper_count": upper_count,
+        "lower_bound": float(lower),
+        "upper_bound": float(upper),
+        "recommendation": " and ".join(recommendations),
     }
 
 
@@ -216,6 +241,8 @@ def annotate_fit_range_warnings(sol, propulsion_model=None, wind_model=None, shi
             float(propulsion_model.max_ua),
             key="propulsion_advance_speed_outside_fit_range",
             message="Optimizer advance speed is outside the propulsion power-fit range.",
+            lower_parameter="lower_speed_factor",
+            upper_parameter="upper_speed_factor",
         )
         if rec is not None:
             warnings[rec[0]] = rec[1]
@@ -231,6 +258,8 @@ def annotate_fit_range_warnings(sol, propulsion_model=None, wind_model=None, shi
             float(propulsion_model.max_thrust),
             key="propulsion_resistance_outside_fit_range",
             message="Optimizer resistance per propeller is outside the propulsion power-fit range.",
+            lower_parameter="lower_res_factor",
+            upper_parameter="upper_res_factor",
         )
         if rec is not None:
             warnings[rec[0]] = rec[1]
@@ -245,6 +274,8 @@ def annotate_fit_range_warnings(sol, propulsion_model=None, wind_model=None, shi
                 bounds[1],
                 key="wind_speed_outside_fit_range",
                 message="Optimizer ship speed is outside the wind model fit range.",
+                lower_parameter="lower_speed_factor",
+                upper_parameter="upper_speed_factor",
             )
             if rec is not None:
                 warnings[rec[0]] = rec[1]
@@ -4407,30 +4438,12 @@ class ShortestPath:
 
         corner_xy, set_edges = self._load_set_geometry()
 
-        candidate_sequences: List[List[int]] = []
-        seen_sequences = set()
-
-        for init_set in init_sets:
-            for end_set in end_sets:
-                if init_set == end_set:
-                    seq = [int(init_set)]
-                    key = tuple(seq)
-                    if key not in seen_sequences:
-                        candidate_sequences.append(seq)
-                        seen_sequences.add(key)
-                    continue
-
-                for seq in self._enumerate_set_sequences(
-                    int(init_set),
-                    int(end_set),
-                    max_hops=max_set_hops,
-                    max_paths=max_set_sequences,
-                ):
-                    key = tuple(seq)
-                    if key in seen_sequences:
-                        continue
-                    candidate_sequences.append(seq)
-                    seen_sequences.add(key)
+        candidate_sequences = self._candidate_set_sequences(
+            init_sets,
+            end_sets,
+            max_set_hops=max_set_hops,
+            max_set_sequences=max_set_sequences,
+        )
 
         if not candidate_sequences:
             raise ValueError(
@@ -4480,6 +4493,38 @@ class ShortestPath:
 
         self.sol = best
         return self.sol
+
+    def _candidate_set_sequences(
+        self,
+        start_sets: List[int],
+        end_sets: List[int],
+        *,
+        max_set_hops: Optional[int] = None,
+        max_set_sequences: Optional[int] = None,
+    ) -> List[List[int]]:
+        candidate_sequences: List[List[int]] = []
+        seen_sequences = set()
+
+        for start_set in start_sets:
+            for end_set in end_sets:
+                if int(start_set) == int(end_set):
+                    sequences = [[int(start_set)]]
+                else:
+                    sequences = self._enumerate_set_sequences(
+                        int(start_set),
+                        int(end_set),
+                        max_hops=max_set_hops,
+                        max_paths=max_set_sequences,
+                    )
+
+                for seq in sequences:
+                    key = tuple(int(z) for z in seq)
+                    if key in seen_sequences:
+                        continue
+                    candidate_sequences.append([int(z) for z in seq])
+                    seen_sequences.add(key)
+
+        return candidate_sequences
 
     def _load_set_geometry(self):
         corners_path = getattr(self.map, "corners_path", None)
@@ -5120,26 +5165,12 @@ class WeatherRoutingToolPath(ShortestPath):
         max_set_hops: Optional[int] = None,
         max_set_sequences: Optional[int] = None,
     ) -> ShortestPathSolution:
-        candidate_sequences: list[list[int]] = []
-        seen_sequences = set()
-
-        for start_set in start_sets:
-            for end_set in end_sets:
-                if int(start_set) == int(end_set):
-                    sequences = [[int(start_set)]]
-                else:
-                    sequences = self._enumerate_set_sequences(
-                        int(start_set),
-                        int(end_set),
-                        max_hops=max_set_hops,
-                        max_paths=max_set_sequences,
-                    )
-                for seq in sequences:
-                    key = tuple(int(z) for z in seq)
-                    if key in seen_sequences:
-                        continue
-                    candidate_sequences.append([int(z) for z in seq])
-                    seen_sequences.add(key)
+        candidate_sequences = self._candidate_set_sequences(
+            start_sets,
+            end_sets,
+            max_set_hops=max_set_hops,
+            max_set_sequences=max_set_sequences,
+        )
 
         if not candidate_sequences:
             raise ValueError(

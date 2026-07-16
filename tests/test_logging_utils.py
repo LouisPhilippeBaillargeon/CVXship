@@ -156,3 +156,41 @@ def test_solution_warning_summary_filters_tiny_battery_command_adjustments(tmp_p
     assert "Simultaneous battery charge and discharge commands were netted" not in warnings_text
     assert "Battery charge command was reduced" not in warnings_text
     assert "Battery discharge command was reduced" in warnings_text
+
+
+def test_fit_warning_log_includes_bound_side_and_recommendation(tmp_path):
+    warnings_errors_log = tmp_path / "warnings_errors.log"
+    sol = SimpleNamespace(
+        validation_warnings={},
+        fit_range_warnings={
+            "wind_speed_outside_fit_range": {
+                "message": "Optimizer ship speed is outside the wind model fit range.",
+                "count": 2,
+                "max_amount": 0.5,
+                "bound_side": "lower_and_upper",
+                "recommendation": (
+                    "decrease [fit_range].lower_speed_factor and "
+                    "increase [fit_range].upper_speed_factor"
+                ),
+            },
+        },
+        validation_errors={},
+        failure_reason="",
+    )
+
+    log.configure_run_logging(
+        debug_log_path=tmp_path / "debug.log",
+        warnings_errors_log_path=warnings_errors_log,
+        console_verbose=False,
+    )
+    try:
+        _log_solution_quality("FiPSE-TI", sol)
+    finally:
+        log.shutdown_run_logging()
+
+    warnings_text = warnings_errors_log.read_text(encoding="utf-8")
+    assert "bound=lower and upper out-of-bounds" in warnings_text
+    assert (
+        "recommendation=decrease [fit_range].lower_speed_factor and "
+        "increase [fit_range].upper_speed_factor"
+    ) in warnings_text

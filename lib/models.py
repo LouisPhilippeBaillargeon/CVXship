@@ -20,6 +20,7 @@ from lib.plotting import (
     _save_and_maybe_show,
     _scale_figure_text,
     _strip_plot_titles,
+    _tight_x_axis,
     normalize_plot_text_size,
     plot_font_scale,
 )
@@ -193,6 +194,8 @@ def _save_tight_pdf(
     path.parent.mkdir(parents=True, exist_ok=True)
     _scale_figure_text(fig, font_scale=font_scale)
     _strip_plot_titles(fig)
+    for ax in fig.get_axes():
+        _tight_x_axis(ax)
     fig.tight_layout(rect=(0.0, 0.0, 1.0, top), pad=0.4)
     save_pad_inches = max(float(pad_inches), MIN_PDF_PAD_INCHES)
     fig.savefig(path, format="pdf", bbox_inches="tight", pad_inches=save_pad_inches)
@@ -204,6 +207,13 @@ def _save_tight_pdf(
         plt.close(fig)
 
     return path
+
+
+def _suffixed_plot_filename(filename: str, suffix: str) -> Path:
+    path = Path(str(filename))
+    if path.suffix:
+        path = path.with_suffix("")
+    return path.with_name(f"{path.name}_{suffix}")
 
 
 @dataclass
@@ -743,20 +753,30 @@ class CalmWaterModel:
         # ---------------------------------
         # Plot C(v)
         # ---------------------------------
+        evaluated_cd_label = r"evaluated $\tilde{c}_\text{d}$"
         fig, ax = plt.subplots()
-        ax.plot(speeds, C_values, label="True $C(v)$")
+        ax.plot(
+            speeds,
+            C_values,
+            color="0.20",
+            linewidth=1.8,
+            label=r"true $c_\text{d}(v)$",
+            zorder=2,
+        )
         ax.axhline(
             C_nominal,
-            linestyle="--",
-            linewidth=1.0,
-            label="Evaluated $C$",
+            color="tab:blue",
+            linestyle=(0, (5, 2)),
+            linewidth=1.4,
+            label=evaluated_cd_label,
+            zorder=3,
         )
         _finalize_axis(
             ax,
             xlabel="Speed relative to water [m/s]",
             ylabel="Resistance coefficient [-]",
         )
-        ax.legend(loc="best", frameon=False)
+        ax.legend(loc="upper left", frameon=False)
         _save_and_maybe_show(
             fig,
             "calm_water_C_vs_speed",
@@ -771,32 +791,42 @@ class CalmWaterModel:
         # Plot resistance comparison
         # ---------------------------------
         fig, ax = plt.subplots()
-        ax.plot(speeds, R_true, label="True resistance")
+        ax.plot(
+            speeds,
+            R_true,
+            color="0.20",
+            linewidth=2.2,
+            label="True resistance",
+            zorder=1,
+        )
 
         ax.plot(
             speeds,
             R_nominal_C,
-            linestyle="--",
-            label="Evaluated $C$",
+            color="tab:blue",
+            linestyle=(0, (5, 2)),
+            linewidth=1.5,
+            label=evaluated_cd_label,
+            zorder=3,
         )
 
         if self.res_coeffs is not None:
             ax.plot(
                 speeds,
                 R_convex,
-                linestyle=":",
+                color="tab:orange",
+                linestyle=(0, (1, 2)),
+                linewidth=1.8,
                 label="Convex fit",
+                zorder=4,
             )
-        ax.axvline(v_min, linestyle="--", linewidth=0.8, alpha=0.6)
-        ax.axvline(v_max, linestyle="--", linewidth=0.8, alpha=0.6)
-
 
         _finalize_axis(
             ax,
             xlabel="Speed relative to water [m/s]",
             ylabel="Resistance [MN]",
         )
-        ax.legend(loc="best", frameon=False)
+        ax.legend(loc="upper left", frameon=False)
         _save_and_maybe_show(
             fig,
             "calm_water_resistance_comparison",
@@ -997,21 +1027,11 @@ class BaseWindModel:
 
         set_ieee_plot_style()
         font_scale = plot_font_scale(text_size)
-        fig, axes = plt.subplots(1, 3, figsize=(11.5, 3.6))
         panels = [
-            (diag["true_resistance"], "True wind resistance"),
-            (diag["convex_resistance"], "Fitted wind resistance"),
-            (diag["abs_error"], "Absolute error"),
+            (diag["true_resistance"], "true_wind_resistance"),
+            (diag["convex_resistance"], "fitted_wind_resistance"),
+            (diag["abs_error"], "absolute_error"),
         ]
-
-        x = diag["ship_speed_x"]
-        y = diag["ship_speed_y"]
-        for ax, (values, title) in zip(axes, panels):
-            pcm = ax.pcolormesh(x, y, values, shading="auto")
-            fig.colorbar(pcm, ax=ax, label="MN")
-            ax.set_xlabel("ship speed x [m/s]")
-            ax.set_ylabel("ship speed y [m/s]")
-            ax.set_aspect("equal", adjustable="box")
 
         if filename is None:
             model_slug = "".join(
@@ -1021,13 +1041,27 @@ class BaseWindModel:
             filename = f"wind_fit_{label}_abs_error_{model_slug}"
 
         output_dir = Path(directory or PLOTS)
-        return _save_tight_pdf(
-            fig,
-            output_dir / f"{filename}.pdf",
-            show,
-            top=1.0,
-            font_scale=font_scale,
-        )
+        saved_paths = []
+        x = diag["ship_speed_x"]
+        y = diag["ship_speed_y"]
+        for values, suffix in panels:
+            fig, ax = plt.subplots(figsize=(4.0, 3.2))
+            pcm = ax.pcolormesh(x, y, values, shading="auto")
+            fig.colorbar(pcm, ax=ax, label="MN")
+            ax.set_xlabel("ship speed x [m/s]")
+            ax.set_ylabel("ship speed y [m/s]")
+            ax.set_aspect("equal", adjustable="box")
+            saved_paths.append(
+                _save_tight_pdf(
+                    fig,
+                    output_dir / _suffixed_plot_filename(filename, suffix),
+                    show,
+                    top=1.0,
+                    font_scale=font_scale,
+                )
+            )
+
+        return saved_paths
 
     def plot_worst_fit_heatmaps(
         self,
@@ -2661,15 +2695,17 @@ class PropulsionModel:
         fitted_power = np.where(mask, self.P_fit, np.nan)
         abs_error = np.where(mask, np.abs(self.P_fit - self.P_real), np.nan)
 
-        fig, axes = plt.subplots(1, 3, figsize=(11.5, 3.6))
         panels = [
-            (true_power, "True B-series power", "MW"),
-            (fitted_power, "Fitted convex power", "MW"),
-            (abs_error, "Absolute error", "MW"),
+            (true_power, "true_b_series_power", "MW"),
+            (fitted_power, "fitted_convex_power", "MW"),
+            (abs_error, "absolute_error", "MW"),
         ]
         extent = [self.min_thrust, self.max_thrust, self.min_ua, self.max_ua]
 
-        for ax, (values, title, unit) in zip(axes, panels):
+        output_dir = Path(directory or PLOTS)
+        saved_paths = []
+        for values, suffix, unit in panels:
+            fig, ax = plt.subplots(figsize=(4.0, 3.2))
             pcm = ax.imshow(
                 values,
                 extent=extent,
@@ -2680,15 +2716,17 @@ class PropulsionModel:
             fig.colorbar(pcm, ax=ax, label=unit)
             ax.set_xlabel("resistance per propeller [MN]")
             ax.set_ylabel("advance speed [m/s]")
+            saved_paths.append(
+                _save_tight_pdf(
+                    fig,
+                    output_dir / _suffixed_plot_filename(filename, suffix),
+                    show,
+                    top=1.0,
+                    font_scale=font_scale,
+                )
+            )
 
-        output_dir = Path(directory or PLOTS)
-        return _save_tight_pdf(
-            fig,
-            output_dir / f"{filename}.pdf",
-            show,
-            top=1.0,
-            font_scale=font_scale,
-        )
+        return saved_paths
 
     def plot_feasibility_classification_pdf(
         self,

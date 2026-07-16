@@ -48,6 +48,7 @@ from lib.optimizers import (
     ShortestPathConstantSpeedController,
 )
 from lib.paths import CASES
+from lib.plotting import normalize_plot_text_size, plot_solutions
 from lib.sept_ile_boundary_routes import (
     DEFAULT_RESTRICTED_SETS,
     BoundaryRouteCandidate,
@@ -201,6 +202,18 @@ def _parse_args(argv=None):
     parser.add_argument("--solver-verbose", dest="solver_verbose", action="store_true", default=None)
     parser.add_argument("--quiet-solver", dest="solver_verbose", action="store_false")
     parser.add_argument("--cache-scope", choices=["case", "run", "global"], default=None)
+    parser.add_argument("--no-save-plots", dest="save_plots", action="store_false", default=None)
+    parser.add_argument("--save-plots", dest="save_plots", action="store_true")
+    parser.add_argument("--no-show-plots", dest="show_plots", action="store_false", default=None)
+    parser.add_argument("--show-plots", dest="show_plots", action="store_true")
+    parser.add_argument(
+        "--BIG",
+        dest="plot_text_size",
+        action="store_const",
+        const="big",
+        default=None,
+        help="Use the previous presentation-sized plot text instead of IEEE-sized text.",
+    )
     parser.add_argument("--save-solutions", dest="save_solutions", action="store_true", default=None)
     parser.add_argument("--no-save-solutions", dest="save_solutions", action="store_false")
     parser.add_argument("--console-log", dest="save_console_log", action="store_true", default=None)
@@ -615,6 +628,82 @@ def _best_summary_rows(
     return summary_rows, best_rows
 
 
+def _best_route_label(row: dict[str, Any] | None) -> str:
+    if not row:
+        return "best route"
+    try:
+        return f"route {int(row['route_index']):03d}"
+    except (KeyError, TypeError, ValueError):
+        return "best route"
+
+
+def _plot_best_solution_artifacts(
+    *,
+    run_context,
+    optimizer_ids: tuple[str, ...],
+    best_attempts: dict[str, dict[str, Any] | None],
+    map_obj,
+    save_plots: bool,
+    show_plots: bool,
+    plot_text_size: str,
+) -> dict[str, Any]:
+    if not save_plots:
+        return {}
+
+    plot_artifacts: dict[str, Any] = {}
+    comparison_solutions = []
+    comparison_labels = []
+
+    for optimizer_id in optimizer_ids:
+        best = best_attempts.get(optimizer_id)
+        if best is None:
+            continue
+
+        label = optimizer_display_label(optimizer_id)
+        row = best.get("row") or {}
+        route_label = _best_route_label(row)
+        eval_sol = best.get("solution")
+        runner = best.get("runner")
+        convex_sol = getattr(runner, "sol", None) if runner is not None else None
+
+        if convex_sol is not None or eval_sol is not None:
+            subfolder = f"relaxation_quality/{optimizer_id}"
+            plot_solutions(
+                [convex_sol, eval_sol],
+                [
+                    f"Convex {label} solution ({route_label})",
+                    f"{label} evaluated solution ({route_label})",
+                ],
+                benchmark_label=f"{label} evaluated solution ({route_label})",
+                show=False,
+                subfolder=subfolder,
+                map=map_obj,
+                output_root=run_context.plots_dir,
+                text_size=plot_text_size,
+            )
+            plot_artifacts[f"{optimizer_id}_relaxation_quality"] = f"plots/{subfolder}"
+
+        if eval_sol is not None and hasattr(eval_sol, "T_future") and _finite_cost(eval_sol):
+            comparison_solutions.append(eval_sol)
+            comparison_labels.append(f"{label} ({route_label})")
+
+    if len(comparison_solutions) >= 2:
+        subfolder = "all_sol_compared"
+        plot_solutions(
+            comparison_solutions,
+            comparison_labels,
+            benchmark_label=comparison_labels[0],
+            show=show_plots,
+            subfolder=subfolder,
+            map=map_obj,
+            output_root=run_context.plots_dir,
+            text_size=plot_text_size,
+        )
+        plot_artifacts["best_solution_comparison"] = f"plots/{subfolder}"
+
+    return plot_artifacts
+
+
 def _float_or_zero(value) -> float:
     try:
         number = float(value)
@@ -635,6 +724,11 @@ def _run_single_scenario(args, scenario):
     )
     unit_commitment = bool(
         _option(None, run_toml_options, "unit_commitment", False)
+    )
+    save_plots = bool(_option(args.save_plots, output_toml_options, "save_plots", True))
+    show_plots = bool(_option(args.show_plots, output_toml_options, "show_plots", False))
+    plot_text_size = normalize_plot_text_size(
+        _option(args.plot_text_size, output_toml_options, "plot_text_size", "default")
     )
     save_solutions = bool(
         _option(args.save_solutions, output_toml_options, "save_solutions", True)
@@ -659,6 +753,9 @@ def _run_single_scenario(args, scenario):
         "optimizers": list(optimizer_ids),
         "solver_verbose": solver_verbose,
         "unit_commitment": unit_commitment,
+        "save_plots": save_plots,
+        "show_plots": show_plots,
+        "plot_text_size": plot_text_size,
         "save_solutions": save_solutions,
         "save_console_log": save_console_log,
         "cache_scope": cache_scope,
@@ -898,6 +995,17 @@ def _run_single_scenario(args, scenario):
             attempts_by_optimizer=attempts_by_optimizer,
             save_solutions=save_solutions,
         )
+        solution_plot_artifacts = _plot_best_solution_artifacts(
+            run_context=run_context,
+            optimizer_ids=optimizer_ids,
+            best_attempts=best_attempts,
+            map_obj=map_obj,
+            save_plots=save_plots,
+            show_plots=show_plots,
+            plot_text_size=plot_text_size,
+        )
+        if solution_plot_artifacts:
+            log.progress("[BOUNDARY] Solution plots: %s", run_context.plots_dir)
         update_manifest(
             run_context,
             {
@@ -905,6 +1013,7 @@ def _run_single_scenario(args, scenario):
                 "boundary_attempts_json": "boundary_attempts.json",
                 "boundary_best_by_optimizer_csv": "boundary_best_by_optimizer.csv",
                 "boundary_best_by_optimizer_json": "boundary_best_by_optimizer.json",
+                "solution_plot_artifacts": solution_plot_artifacts,
             },
         )
         complete_run_results(run_context, summary_rows)

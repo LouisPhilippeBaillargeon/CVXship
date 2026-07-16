@@ -157,17 +157,9 @@ def _parse_args(argv=None):
     )
     parser.add_argument("--case", type=Path, default=None, help="Case directory containing ship/map/itinerary/weather TOMLs.")
     parser.add_argument("--resume-batch", type=Path, default=None, help="Resume a previous scenario batch directory.")
-    parser.add_argument("--name", help="Optional run name used in the result folder.")
     parser.add_argument("--variant", help="Scenario or weather variant name to run.")
-    parser.add_argument("--dimensions", choices=["1D", "2D", "both"], default=None)
-    parser.add_argument("--new-ship", dest="new_ship", action="store_true", default=None)
-    parser.add_argument("--reuse-ship", dest="new_ship", action="store_false")
-    parser.add_argument("--new-weather", dest="new_weather", action="store_true", default=None)
-    parser.add_argument("--reuse-weather", dest="new_weather", action="store_false")
     parser.add_argument("--solver-verbose", dest="solver_verbose", action="store_true", default=None)
     parser.add_argument("--quiet-solver", dest="solver_verbose", action="store_false")
-    parser.add_argument("--unit-commitment", dest="unit_commitment", action="store_true", default=None)
-    parser.add_argument("--no-unit-commitment", dest="unit_commitment", action="store_false")
     parser.add_argument(
         "--optimizer",
         "--o",
@@ -180,20 +172,6 @@ def _parse_args(argv=None):
         ),
     )
     parser.add_argument("--path-generator", choices=["shortest", "wrt", "saved"], default=None)
-    parser.add_argument("--path-solution-json", type=Path, default=None)
-    parser.add_argument("--wrt-algorithm", choices=["isofuel", "genetic"], default=None)
-    parser.add_argument("--wrt-source-dir", type=Path, default=None)
-    parser.add_argument("--wrt-python", default=None)
-    parser.add_argument("--wrt-route-geojson", "--wrt-precomputed-route", type=Path, default=None)
-    parser.add_argument("--wrt-timeout-s", type=float, default=None)
-    parser.add_argument("--wrt-boat-speed-mps", type=float, default=None)
-    parser.add_argument("--wrt-use-depth-constraint", dest="wrt_use_depth_constraint", action="store_true", default=None)
-    parser.add_argument("--no-wrt-depth-constraint", dest="wrt_use_depth_constraint", action="store_false")
-    parser.add_argument("--cache-scope", choices=["case", "run", "global"], default=None)
-    parser.add_argument("--no-save-plots", dest="save_plots", action="store_false", default=None)
-    parser.add_argument("--save-plots", dest="save_plots", action="store_true")
-    parser.add_argument("--no-show-plots", dest="show_plots", action="store_false", default=None)
-    parser.add_argument("--show-plots", dest="show_plots", action="store_true")
     parser.add_argument(
         "--BIG",
         dest="plot_text_size",
@@ -202,10 +180,6 @@ def _parse_args(argv=None):
         default=None,
         help="Use the previous presentation-sized plot text instead of IEEE-sized text.",
     )
-    parser.add_argument("--no-save-solutions", dest="save_solutions", action="store_false", default=None)
-    parser.add_argument("--save-solutions", dest="save_solutions", action="store_true")
-    parser.add_argument("--no-console-log", dest="save_console_log", action="store_false", default=None)
-    parser.add_argument("--console-log", dest="save_console_log", action="store_true")
     args = parser.parse_args(argv)
     if args.resume_batch is None and args.case is None:
         parser.error("--case is required unless --resume-batch is used.")
@@ -270,6 +244,65 @@ def _path_option(value, base_dir=None):
     if not path.is_absolute() and base_dir is not None:
         path = Path(base_dir) / path
     return path.resolve()
+
+
+def _normalize_path_generator(value):
+    path_generator = str(value).lower()
+    if path_generator in {"weather_routing_tool", "weatherroutingtool"}:
+        return "wrt"
+    if path_generator in {"saved_path", "path_solution"}:
+        return "saved"
+    if path_generator not in {"shortest", "wrt", "saved"}:
+        raise ValueError("path_generator must be one of: shortest, wrt, saved")
+    return path_generator
+
+
+def _run_path_option(run_toml_options, key, case_dir):
+    return _path_option(run_toml_options.get(key), base_dir=case_dir)
+
+
+def _resolve_path_options(args, run_toml_options, case_dir):
+    path_solution_json = _run_path_option(
+        run_toml_options,
+        "path_solution_json",
+        case_dir,
+    )
+    path_generator_raw = _option(args.path_generator, run_toml_options, "path_generator", None)
+    path_generator = _normalize_path_generator(
+        path_generator_raw
+        if path_generator_raw is not None
+        else ("saved" if path_solution_json is not None else "shortest")
+    )
+
+    wrt_algorithm = str(run_toml_options.get("wrt_algorithm", "genetic")).lower()
+    if wrt_algorithm not in {"isofuel", "genetic"}:
+        raise ValueError("wrt_algorithm must be one of: isofuel, genetic")
+
+    wrt_route_raw = run_toml_options.get(
+        "wrt_route_geojson",
+        run_toml_options.get("wrt_precomputed_route"),
+    )
+    wrt_route_geojson = _path_option(wrt_route_raw, base_dir=case_dir)
+    wrt_timeout_s = run_toml_options.get("wrt_timeout_s", 1800.0)
+    wrt_boat_speed_mps = run_toml_options.get("wrt_boat_speed_mps", None)
+    wrt_use_depth_constraint = bool(
+        run_toml_options.get("wrt_use_depth_constraint", True)
+    )
+
+    if path_generator == "saved" and path_solution_json is None:
+        raise ValueError("path_generator='saved' requires [run].path_solution_json.")
+
+    return SimpleNamespace(
+        path_generator=path_generator,
+        path_solution_json=path_solution_json,
+        wrt_algorithm=wrt_algorithm,
+        wrt_source_dir=_run_path_option(run_toml_options, "wrt_source_dir", case_dir),
+        wrt_route_geojson=wrt_route_geojson,
+        wrt_python=run_toml_options.get("wrt_python", None),
+        wrt_timeout_s=wrt_timeout_s,
+        wrt_boat_speed_mps=wrt_boat_speed_mps,
+        wrt_use_depth_constraint=wrt_use_depth_constraint,
+    )
 
 
 def _failed_optimizer_summary(optimizer, first_stage_optimizer):
@@ -540,14 +573,12 @@ def _save_path_artifacts(run_context, path_generator, path_obj):
         "path_solution_json_relative": _run_relative_path(run_context, path_solution_file),
         "path_waypoints_csv": str(csv_path),
         "path_waypoints_csv_relative": _run_relative_path(run_context, csv_path),
-        "reuse_path_solution_arg": f"--path-solution-json {path_solution_file}",
     }
     if raw_route_file is not None:
         artifacts.update(
             {
                 "raw_wrt_route_geojson": str(raw_route_file),
                 "raw_wrt_route_geojson_relative": _run_relative_path(run_context, raw_route_file),
-                "reuse_wrt_route_arg": f"--path-generator wrt --wrt-route-geojson {raw_route_file}",
             }
         )
     return artifacts
@@ -638,7 +669,7 @@ def _active_weather_variant(active_scenario, cli_variant):
 
 
 def _resolve_optimizer_plan(args, run_toml_options):
-    resolved_dimensions = str(_option(args.dimensions, run_toml_options, "dimensions", dimensions))
+    resolved_dimensions = str(run_toml_options.get("dimensions", dimensions))
     if resolved_dimensions not in {"1D", "2D", "both"}:
         raise ValueError("dimensions must be one of: 1D, 2D, both")
 
@@ -765,7 +796,7 @@ def _batch_record_is_complete(record):
 def _run_case_batch(args, scenarios):
     run_toml_options = load_case_run_options(args.case)
     expected = _expected_optimizer_keys(args, run_toml_options)
-    batch_dir = _unique_batch_dir(args.name or Path(args.case).name)
+    batch_dir = _unique_batch_dir(Path(args.case).name)
     manifest_path = batch_dir / "manifest.json"
     original_args = list(sys.argv[1:])
     scenario_records = {}
@@ -891,16 +922,16 @@ if __name__ == "__main__":
     cache_toml_options = load_case_cache_options(args.case)
     fit_range_toml_options = load_case_fit_range_options(args.case)
 
-    new_weather = bool(_option(args.new_weather, run_toml_options, "new_weather", new_weather))
-    new_ship = bool(_option(args.new_ship, run_toml_options, "new_ship", new_ship))
-    dimensions = str(_option(args.dimensions, run_toml_options, "dimensions", dimensions))
+    new_weather = bool(run_toml_options.get("new_weather", new_weather))
+    new_ship = bool(run_toml_options.get("new_ship", new_ship))
+    dimensions = str(run_toml_options.get("dimensions", dimensions))
     if dimensions not in {"1D", "2D", "both"}:
         raise ValueError("dimensions must be one of: 1D, 2D, both")
     selected_optimizer = _normalize_optimizer_selection(
         _option(args.optimizer, run_toml_options, "optimizer", None)
     )
     solver_verbose = bool(_option(args.solver_verbose, run_toml_options, "solver_verbose", solver_verbose))
-    unit_commitment = bool(_option(args.unit_commitment, run_toml_options, "unit_commitment", unit_commitment))
+    unit_commitment = bool(run_toml_options.get("unit_commitment", unit_commitment))
     run_jopse_c_transition_weather = _run_bool_option(
         run_toml_options,
         ("run_jopse_c_transition_weather", "run_jpcse_transit_wind"),
@@ -919,69 +950,24 @@ if __name__ == "__main__":
         ("ordered_sets",),
         True,
     )
-    path_solution_raw = (
-        args.path_solution_json
-        if args.path_solution_json is not None
-        else run_toml_options.get("path_solution_json")
-    )
-    path_solution_json = _path_option(
-        path_solution_raw,
-        base_dir=None if args.path_solution_json is not None else args.case,
-    )
-    path_generator_raw = _option(args.path_generator, run_toml_options, "path_generator", None)
-    path_generator = str(
-        path_generator_raw
-        if path_generator_raw is not None
-        else ("saved" if path_solution_json is not None else "shortest")
-    ).lower()
-    if path_generator in {"weather_routing_tool", "weatherroutingtool"}:
-        path_generator = "wrt"
-    if path_generator in {"saved_path", "path_solution"}:
-        path_generator = "saved"
-    if path_generator not in {"shortest", "wrt", "saved"}:
-        raise ValueError("path_generator must be one of: shortest, wrt, saved")
-    wrt_algorithm = str(_option(args.wrt_algorithm, run_toml_options, "wrt_algorithm", "genetic")).lower()
-    if wrt_algorithm not in {"isofuel", "genetic"}:
-        raise ValueError("wrt_algorithm must be one of: isofuel, genetic")
-    wrt_source_raw = (
-        args.wrt_source_dir
-        if args.wrt_source_dir is not None
-        else run_toml_options.get("wrt_source_dir")
-    )
-    wrt_route_raw = (
-        args.wrt_route_geojson
-        if args.wrt_route_geojson is not None
-        else run_toml_options.get("wrt_route_geojson")
-    )
-    wrt_source_dir = _path_option(
-        wrt_source_raw,
-        base_dir=None if args.wrt_source_dir is not None else args.case,
-    )
-    wrt_route_geojson = _path_option(
-        wrt_route_raw,
-        base_dir=None if args.wrt_route_geojson is not None else args.case,
-    )
-    wrt_python = _option(args.wrt_python, run_toml_options, "wrt_python", None)
-    wrt_timeout_s = _option(args.wrt_timeout_s, run_toml_options, "wrt_timeout_s", 1800.0)
-    wrt_boat_speed_mps = _option(args.wrt_boat_speed_mps, run_toml_options, "wrt_boat_speed_mps", None)
-    wrt_use_depth_constraint = bool(
-        _option(
-            args.wrt_use_depth_constraint,
-            run_toml_options,
-            "wrt_use_depth_constraint",
-            True,
-        )
-    )
-    if path_generator == "saved" and path_solution_json is None:
-        raise ValueError("path_generator='saved' requires --path-solution-json or [run].path_solution_json.")
-    save_plots = bool(_option(args.save_plots, output_toml_options, "save_plots", True))
-    show_plots = bool(_option(args.show_plots, output_toml_options, "show_plots", False))
+    path_options = _resolve_path_options(args, run_toml_options, args.case)
+    path_generator = path_options.path_generator
+    path_solution_json = path_options.path_solution_json
+    wrt_algorithm = path_options.wrt_algorithm
+    wrt_source_dir = path_options.wrt_source_dir
+    wrt_route_geojson = path_options.wrt_route_geojson
+    wrt_python = path_options.wrt_python
+    wrt_timeout_s = path_options.wrt_timeout_s
+    wrt_boat_speed_mps = path_options.wrt_boat_speed_mps
+    wrt_use_depth_constraint = path_options.wrt_use_depth_constraint
+    save_plots = bool(output_toml_options.get("save_plots", True))
+    show_plots = bool(output_toml_options.get("show_plots", False))
     plot_text_size = normalize_plot_text_size(
         _option(args.plot_text_size, output_toml_options, "plot_text_size", "default")
     )
-    save_solutions = bool(_option(args.save_solutions, output_toml_options, "save_solutions", True))
-    save_console_log = bool(_option(args.save_console_log, output_toml_options, "save_console_log", True))
-    cache_scope = str(_option(args.cache_scope, cache_toml_options, "scope", "case"))
+    save_solutions = bool(output_toml_options.get("save_solutions", True))
+    save_console_log = bool(output_toml_options.get("save_console_log", True))
+    cache_scope = str(cache_toml_options.get("scope", "case"))
     fit_range_factors = _fit_range_factor_options(fit_range_toml_options)
     raw_weather_override = load_weather_override_from_toml(
         args.case,
@@ -990,7 +976,6 @@ if __name__ == "__main__":
 
     run_options = {
         "case": args.case,
-        "name": args.name,
         "variant": args.variant,
         "scenario": active_scenario,
         "weather_variant": active_weather_variant,
@@ -1023,7 +1008,7 @@ if __name__ == "__main__":
     }
     run_context = create_run_context(
         case_dir=args.case,
-        run_name=args.name,
+        run_name=None,
         options=run_options,
         cache_scope=cache_scope,
         scenario=active_scenario,
@@ -1165,6 +1150,7 @@ if __name__ == "__main__":
     states = load_states(map, itinerary)
     ship = load_ship(case_dir=run_context.case_dir)
     x, y, _ = dx_dy_km(map, itinerary.transits[-1].lat, itinerary.transits[-1].lon)
+    trajectory_generation_time_s = None
 
     spacs_reference_path = None
     weather_override = None
@@ -1177,7 +1163,9 @@ if __name__ == "__main__":
             weather=None,
             ship=ship,
         )
+        trajectory_start = time.perf_counter()
         spacs_reference_path.compute([x, y], verbose=solver_verbose)
+        trajectory_generation_time_s = time.perf_counter() - trajectory_start
         weather_override = finalize_weather_override_against_spacs(
             raw_weather_override,
             path_set_ids=spacs_reference_path.sol.set_sequence,
@@ -1280,10 +1268,27 @@ if __name__ == "__main__":
             log.progress("[RUN] Reusing shortest-path solve used for synthetic weather direction")
 
     if path.sol is None:
+        trajectory_start = time.perf_counter()
         path.compute([x, y], verbose=solver_verbose)
+        trajectory_generation_time_s = time.perf_counter() - trajectory_start
+    elif trajectory_generation_time_s is None:
+        trajectory_generation_time_s = 0.0
+    run_context.trajectory_generation_time_s = float(trajectory_generation_time_s)
     path_artifacts = _save_path_artifacts(run_context, path_generator, path)
+    path_artifacts["trajectory_generation_time_s"] = run_context.trajectory_generation_time_s
     log.progress("[RUN] Saved path artifacts to %s", path_artifacts["path_solution_json"])
-    update_manifest(run_context, {"path_artifacts": path_artifacts})
+    log.progress(
+        "[RUN] Trajectory generation took %.3f seconds (%s)",
+        run_context.trajectory_generation_time_s,
+        path_generator,
+    )
+    update_manifest(
+        run_context,
+        {
+            "path_artifacts": path_artifacts,
+            "trajectory_generation_time_s": run_context.trajectory_generation_time_s,
+        },
+    )
 
     path_course_angles = path.compute_course_angles()
     course_angles = np.repeat(path_course_angles[:, None], weather.wind_x.shape[1], axis=1)
@@ -2065,6 +2070,11 @@ if __name__ == "__main__":
     log.progress("[RUN] Finalizing run summaries")
     summary_rows = complete_run_results(run_context, summary_rows)
     _print_result_table(summary_rows)
+    if run_context.trajectory_generation_time_s is not None:
+        log.progress(
+            "[RESULTS] Trajectory generation time: %.6f s",
+            run_context.trajectory_generation_time_s,
+        )
     log.debug("[RUN] saved %d solution summaries", len(summary_rows))
     log.debug("[RUN] summary=%s", run_context.run_dir / "summary.csv")
     if batch_manifest_path and batch_scenario_name:

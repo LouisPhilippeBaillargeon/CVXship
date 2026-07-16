@@ -13,8 +13,8 @@ ordered_sets = false
 scope = "case"
 
 [fit_range]
-lower_speed_factor = 0.85
-upper_speed_factor = 1.1
+lower_speed_factor = 0.9
+upper_speed_factor = 1.25
 lower_res_factor = 0.7
 upper_res_factor = 1.2
 lower_prop_factor = 0.7

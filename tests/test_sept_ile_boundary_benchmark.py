@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
+import benchmark_sept_ile_boundary as boundary
 from benchmark_sept_ile_boundary import _best_summary_rows, _select_better_attempt
 from lib.experiment import RunContext
 from lib.load_params import load_itinerary, load_map, load_ship, load_states
@@ -15,6 +16,14 @@ from lib.sept_ile_boundary_routes import (
 
 
 CASE_DIR = Path(__file__).resolve().parents[1] / "cases" / "sept-ile-grosse-ile"
+
+
+def test_boundary_benchmark_accepts_optimize_style_plot_flags():
+    args = boundary._parse_args(["--no-save-plots", "--show-plots", "--BIG"])
+
+    assert args.save_plots is False
+    assert args.show_plots is True
+    assert args.plot_text_size == "big"
 
 
 def test_sept_ile_boundary_corner_ids_match_current_case_geometry():
@@ -158,3 +167,64 @@ def test_best_summary_total_time_accounts_for_all_attempts(tmp_path):
     assert best_rows[0]["total_optimizer_solve_time_s"] == 10.0
     assert best_rows[0]["total_time_s"] == 142.0
     assert (run_dir / "boundary_best_by_optimizer.csv").exists()
+
+
+def test_best_solution_plot_artifacts_match_optimize_layout(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+    ctx = RunContext(
+        case_dir=CASE_DIR,
+        case_name="sept-ile-grosse-ile",
+        run_name="test",
+        run_id="test",
+        run_dir=run_dir,
+        inputs_dir=run_dir / "inputs",
+        plots_dir=run_dir / "plots",
+        solutions_dir=run_dir / "solutions",
+        cache_dir=run_dir / "cache",
+        weather_files={},
+    )
+
+    calls = []
+
+    def fake_plot_solutions(solutions, labels, **kwargs):
+        calls.append(
+            {
+                "solutions": solutions,
+                "labels": labels,
+                **kwargs,
+            }
+        )
+
+    monkeypatch.setattr(boundary, "plot_solutions", fake_plot_solutions)
+
+    def attempt(route_index, cost):
+        return {
+            "row": {"route_index": route_index},
+            "runner": SimpleNamespace(
+                sol=SimpleNamespace(estimated_cost=cost + 1.0, T_future=2)
+            ),
+            "solution": SimpleNamespace(estimated_cost=cost, T_future=2),
+        }
+
+    artifacts = boundary._plot_best_solution_artifacts(
+        run_context=ctx,
+        optimizer_ids=(FIPSE_TI, FIPSE_PA),
+        best_attempts={
+            FIPSE_TI: attempt(0, 10.0),
+            FIPSE_PA: attempt(1, 9.0),
+        },
+        map_obj=SimpleNamespace(),
+        save_plots=True,
+        show_plots=True,
+        plot_text_size="big",
+    )
+
+    assert [call["subfolder"] for call in calls] == [
+        f"relaxation_quality/{FIPSE_TI}",
+        f"relaxation_quality/{FIPSE_PA}",
+        "all_sol_compared",
+    ]
+    assert calls[0]["show"] is False
+    assert calls[-1]["show"] is True
+    assert calls[-1]["text_size"] == "big"
+    assert artifacts["best_solution_comparison"] == "plots/all_sol_compared"

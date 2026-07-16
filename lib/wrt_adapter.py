@@ -26,6 +26,83 @@ WRT_ROUTE_FILE_PRIORITY = (
 )
 
 
+WRT_GENETIC_ISOFUEL_CONFIGS: dict[str, dict[str, Any]] = {
+    "config.isofuel_single_route.json": {
+        "ALGORITHM_TYPE": "speedy_isobased",
+        "BOAT_TYPE": "speedy_isobased",
+        "BOAT_BREADTH": 32,
+        "BOAT_FUEL_RATE": 167,
+        "BOAT_HBR": 30,
+        "BOAT_LENGTH": 180,
+        "BOAT_SMCR_POWER": 6502,
+        "BOAT_SMCR_SPEED": 1000,
+        "BOAT_SPEED": 600,
+        "BOAT_DRAUGHT_AFT": 10,
+        "BOAT_DRAUGHT_FORE": 10,
+        "CONSTRAINTS_LIST": [
+            "land_crossing_global_land_mask",
+            "water_depth",
+            "on_map",
+        ],
+        "COURSES_FILE": "./path/doesnt/exist/data/courses_route.nc",
+        "DEPTH_DATA": "./path/doesnt/exist/data/depth_data.nc",
+        "WEATHER_DATA": "./path/doesnt/exist/data/weather_data.nc",
+        "ROUTE_PATH": "./path/doesnt/exist/workdir-isofuel-mini/",
+        "TIME_FORECAST": 90,
+        "DELTA_TIME_FORECAST": 3,
+        "DELTA_FUEL": 10000,
+        "ROUTER_HDGS_SEGMENTS": 30,
+        "ROUTER_HDGS_INCREMENTS_DEG": 6,
+        "ISOCHRONE_PRUNE_SECTOR_DEG_HALF": 91,
+        "ISOCHRONE_PRUNE_SEGMENTS": 4,
+        "ISOCHRONE_PRUNE_GROUPS": "branch",
+        "ISOCHRONE_MAX_ROUTING_STEPS": 500,
+        "ISOCHRONE_PRUNE_SYMMETRY_AXIS": "headings_based",
+        "ISOCHRONE_MINIMISATION_CRITERION": "squareddist_over_disttodest",
+        "ISOCHRONE_NUMBER_OF_ROUTES": 1,
+        "ROUTE_POSTPROCESSING": False,
+    },
+    "config.isofuel_multiple_routes.json": {
+        "BOAT_DRAUGHT_AFT": 10,
+        "BOAT_DRAUGHT_FORE": 10,
+        "CONSTRAINTS_LIST": [
+            "land_crossing_global_land_mask",
+            "water_depth",
+            "on_map",
+        ],
+        "TIME_FORECAST": 90,
+        "ROUTING_STEPS": 60,
+        "DELTA_TIME_FORECAST": 3,
+        "DELTA_FUEL": 10000,
+        "COURSES_FILE": "./path/doesnt/exist/data/courses_route.nc",
+        "DEPTH_DATA": "./path/doesnt/exist/data/depth_data.nc",
+        "WEATHER_DATA": "./path/doesnt/exist/data/weather_data.nc",
+        "ROUTE_PATH": "./path/doesnt/exist/workdir-genetic",
+        "ALGORITHM_TYPE": "speedy_isobased",
+        "ISOCHRONE_NUMBER_OF_ROUTES": 20,
+        "ISOCHRONE_PRUNE_GROUPS": "multiple_routes",
+        "ISOCHRONE_PRUNE_SEGMENTS": 200,
+        "ROUTER_HDGS_SEGMENTS": 30,
+        "ROUTER_HDGS_INCREMENTS_DEG": 6,
+        "ISOCHRONE_PRUNE_SECTOR_DEG_HALF": 91,
+        "ISOCHRONE_MINIMISATION_CRITERION": "squareddist_over_disttodest",
+        "GENETIC_NUMBER_GENERATIONS": 20,
+        "GENETIC_NUMBER_OFFSPRINGS": 2,
+        "GENETIC_POPULATION_SIZE": 20,
+        "GENETIC_POPULATION_TYPE": "grid_based",
+        "BOAT_TYPE": "speedy_isobased",
+        "BOAT_BREADTH": 32,
+        "BOAT_FUEL_RATE": 167,
+        "BOAT_HBR": 30,
+        "BOAT_LENGTH": 180,
+        "BOAT_SMCR_POWER": 6502,
+        "BOAT_SMCR_SPEED": 7,
+        "BOAT_SPEED": 600,
+        "ROUTE_POSTPROCESSING": False,
+    },
+}
+
+
 @dataclass
 class WRTPathRunFiles:
     work_dir: Path
@@ -34,6 +111,7 @@ class WRTPathRunFiles:
     weather_path: Path
     depth_path: Path
     runner_path: Path
+    genetic_config_dir: Path | None = None
     config: dict[str, Any] = field(default_factory=dict)
 
 
@@ -41,6 +119,17 @@ def _jsonable_path(path: Path | str | None) -> str | None:
     if path is None:
         return None
     return str(Path(path).resolve())
+
+
+def _write_wrt_genetic_config_templates(config_dir: Path) -> Path:
+    config_dir = Path(config_dir)
+    config_dir.mkdir(parents=True, exist_ok=True)
+    for filename, payload in WRT_GENETIC_ISOFUEL_CONFIGS.items():
+        path = config_dir / filename
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+            f.write("\n")
+    return config_dir
 
 
 def _normalise_time_coord(ds: xr.Dataset) -> xr.Dataset:
@@ -367,6 +456,7 @@ def prepare_wrt_run_files(
     work_dir = Path(work_dir).resolve()
     route_dir = work_dir / "routes"
     route_dir.mkdir(parents=True, exist_ok=True)
+    genetic_config_dir = _write_wrt_genetic_config_templates(work_dir / "genetic_configs")
 
     start_xy = np.asarray(
         [float(states.current_x_pos), float(states.current_y_pos)],
@@ -425,6 +515,8 @@ def prepare_wrt_run_files(
         "GENETIC_POPULATION_TYPE": "isofuel",
         "GENETIC_MUTATION_TYPE": "waypoints",
         "GENETIC_CROSSOVER_TYPE": "waypoints",
+        "GENETIC_CROSSOVER_PATCHER": "isofuel",
+        "GENETIC_REPAIR_TYPE": ["waypoints_infill", "constraint_violation"],
         "GENETIC_OBJECTIVES": {"fuel_consumption": 1.0},
         "ROUTE_POSTPROCESSING": False,
     }
@@ -447,6 +539,7 @@ def prepare_wrt_run_files(
         weather_path=weather_path,
         depth_path=depth_path,
         runner_path=runner_path,
+        genetic_config_dir=genetic_config_dir,
         config=config,
     )
 
@@ -454,11 +547,15 @@ def prepare_wrt_run_files(
 def _wrt_runner_script() -> str:
     return textwrap.dedent(
         """
+        import json
+        import os
         import sys
         import warnings
+        from pathlib import Path
 
         import numpy as np
 
+        import WeatherRoutingTool.algorithms.genetic.patcher as wrt_genetic_patcher
         from WeatherRoutingTool.config import Config, set_up_logging
         from WeatherRoutingTool.execute_routing import execute_routing
         from WeatherRoutingTool.ship.ship_config import ShipConfig
@@ -483,13 +580,65 @@ def _wrt_runner_script() -> str:
             return {"twa": twa.to_numpy(), "tws": tws.to_numpy()}
 
 
+        def _patch_isofuel_config_dir():
+            config_dir = os.environ.get("WRT_GENETIC_CONFIG_DIR")
+            if not config_dir:
+                return
+            config_dir = Path(config_dir)
+
+            def _setup_configuration_from_run_dir(self):
+                cfg_select = self.config.model_dump(
+                    include=[
+                        "DEFAULT_ROUTE",
+                        "DEPARTURE_TIME",
+                        "DEFAULT_MAP",
+                        "COURSES_FILE",
+                        "DEPTH_DATA",
+                        "WEATHER_DATA",
+                        "ROUTE_PATH",
+                        "BOAT_UNDER_KEEL_CLEARANCE",
+                        "BOAT_DRAUGHT_AFT",
+                        "BOAT_DRAUGHT_FORE",
+                        "GENETIC_POPULATION_SIZE",
+                    ],
+                )
+
+                cfg_path = config_dir / "config.isofuel_single_route.json"
+                if self.n_routes == "multiple":
+                    cfg_path = config_dir / "config.isofuel_multiple_routes.json"
+
+                with cfg_path.open() as fp:
+                    dt = json.load(fp)
+
+                cfg = Config.model_validate({**dt, **cfg_select})
+
+                ship_config_base = ShipConfig.assign_config(Path(self.config.CONFIG_PATH))
+                self.config_boat_dict = ship_config_base.model_dump(
+                    include=[
+                        "BOAT_UNDER_KEEL_CLEARANCE",
+                        "BOAT_DRAUGHT_AFT",
+                        "BOAT_DRAUGHT_FORE",
+                    ],
+                )
+
+                cfg.CONFIG_PATH = cfg_path
+                self.config = cfg
+                self.config.ISOCHRONE_NUMBER_OF_ROUTES = cfg_select["GENETIC_POPULATION_SIZE"]
+
+            wrt_genetic_patcher.IsofuelPatcher._setup_configuration = _setup_configuration_from_run_dir
+
+
         wrt_weather.WeatherCondFromFile.calculate_wind_function = _calculate_wind_function_compat
+        _patch_isofuel_config_dir()
 
         warnings.filterwarnings("default")
         set_up_logging(debug=False)
         config = Config.assign_config(sys.argv[1])
         ship_config = ShipConfig.assign_config(sys.argv[1])
         execute_routing(config, ship_config)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
         """
     ).strip() + "\n"
 
@@ -507,6 +656,8 @@ def run_weather_routing_tool(
     if source_dir:
         source_dir = str(Path(source_dir).resolve())
         env["PYTHONPATH"] = source_dir + os.pathsep + env.get("PYTHONPATH", "")
+    if run_files.genetic_config_dir is not None:
+        env["WRT_GENETIC_CONFIG_DIR"] = str(Path(run_files.genetic_config_dir).resolve())
 
     cmd = [
         python_executable or sys.executable,
@@ -514,14 +665,37 @@ def run_weather_routing_tool(
         str(run_files.config_path),
     ]
     log.debug("Running WeatherRoutingTool command: %s", cmd)
-    proc = subprocess.run(
-        cmd,
-        cwd=run_files.work_dir,
-        env=env,
-        text=True,
-        capture_output=True,
-        timeout=timeout_s,
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=run_files.work_dir,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired as exc:
+        try:
+            route_path = find_wrt_route_file(run_files.route_dir)
+        except FileNotFoundError:
+            stdout = _subprocess_output_text(exc.stdout)
+            stderr = _subprocess_output_text(exc.stderr)
+            tail = "\n".join((stdout + "\n" + stderr).splitlines()[-80:])
+            raise RuntimeError(
+                "WeatherRoutingTool route generation timed out before writing a route. "
+                "Install WeatherRoutingTool or set WRT_SOURCE_DIR/wrt_source_dir, then retry. "
+                f"Command: {cmd}\n{tail}"
+            ) from exc
+        log.warning(
+            "WeatherRoutingTool timed out after writing %s; continuing with the generated route.",
+            route_path,
+        )
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=_subprocess_output_text(exc.stdout),
+            stderr=_subprocess_output_text(exc.stderr),
+        )
     if verbose and proc.stdout:
         log.debug("WeatherRoutingTool stdout:\n%s", proc.stdout)
     if proc.returncode != 0:
@@ -532,6 +706,14 @@ def run_weather_routing_tool(
             f"Command: {cmd}\n{tail}"
         )
     return proc
+
+
+def _subprocess_output_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return str(value)
 
 
 def find_wrt_route_file(route_dir: Path) -> Path:

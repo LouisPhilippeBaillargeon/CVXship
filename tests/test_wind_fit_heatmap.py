@@ -62,19 +62,27 @@ def test_records_and_saves_worst_and_best_wind_fit_heatmaps(tmp_path):
     assert model.best_fit_heatmap["combination"] == "set 1, timestep 0"
     assert np.isnan(model.worst_fit_heatmap["abs_error"][0, 1])
 
-    worst_path = model.plot_worst_fit_heatmaps(
+    worst_paths = model.plot_worst_fit_heatmaps(
         directory=tmp_path,
         filename="worst_wind_fit",
     )
-    best_path = model.plot_best_fit_heatmaps(
+    best_paths = model.plot_best_fit_heatmaps(
         directory=tmp_path,
         filename="best_wind_fit",
     )
 
-    assert worst_path == tmp_path / "worst_wind_fit.pdf"
-    assert best_path == tmp_path / "best_wind_fit.pdf"
-    assert worst_path.exists()
-    assert best_path.exists()
+    assert worst_paths == [
+        tmp_path / "worst_wind_fit_true_wind_resistance.pdf",
+        tmp_path / "worst_wind_fit_fitted_wind_resistance.pdf",
+        tmp_path / "worst_wind_fit_absolute_error.pdf",
+    ]
+    assert best_paths == [
+        tmp_path / "best_wind_fit_true_wind_resistance.pdf",
+        tmp_path / "best_wind_fit_fitted_wind_resistance.pdf",
+        tmp_path / "best_wind_fit_absolute_error.pdf",
+    ]
+    assert all(path.exists() for path in worst_paths)
+    assert all(path.exists() for path in best_paths)
 
 
 def test_wind_fit_heatmap_subplots_have_no_titles(tmp_path, monkeypatch):
@@ -205,13 +213,17 @@ def test_propulsion_power_fit_heatmaps_pdf(tmp_path):
     model.power_fit_mean_abs_error = None
     model.power_fit_max_abs_error = None
 
-    path = model.plot_power_fit_heatmaps_pdf(
+    paths = model.plot_power_fit_heatmaps_pdf(
         directory=tmp_path,
         filename="propulsion_fit",
     )
 
-    assert path == tmp_path / "propulsion_fit.pdf"
-    assert path.exists()
+    assert paths == [
+        tmp_path / "propulsion_fit_true_b_series_power.pdf",
+        tmp_path / "propulsion_fit_fitted_convex_power.pdf",
+        tmp_path / "propulsion_fit_absolute_error.pdf",
+    ]
+    assert all(path.exists() for path in paths)
 
 
 def test_propulsion_power_fit_heatmap_subplots_have_no_titles(tmp_path, monkeypatch):

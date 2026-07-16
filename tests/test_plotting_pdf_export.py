@@ -27,3 +27,4 @@ def test_save_and_maybe_show_forces_pdf_and_strips_titles(tmp_path):
     assert ax.get_title() == ""
     assert ax.get_xlabel() == "x label"
     assert ax.get_ylabel() == "y label"
+    assert ax.get_xlim() == (0.0, 1.0)

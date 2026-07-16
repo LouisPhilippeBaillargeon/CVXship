@@ -19,6 +19,7 @@ from optimize import (
     _format_result_table,
     _parse_args,
     _print_result_table,
+    _resolve_path_options,
 )
 
 
@@ -51,52 +52,78 @@ def test_optimize_accepts_big_plot_flag():
     assert args.plot_text_size == "big"
 
 
-def test_optimize_accepts_wrt_path_generator_flags():
-    args = _parse_args(
-        [
-            "--case",
-            "cases/sept-iles-gaspe",
-            "--path-generator",
-            "wrt",
-            "--wrt-algorithm",
-            "isofuel",
-            "--wrt-source-dir",
-            "external/WeatherRoutingTool",
-        ]
-    )
+def test_optimize_accepts_path_generator_flag():
+    args = _parse_args(["--case", "cases/sept-iles-gaspe", "--path-generator", "wrt"])
 
     assert args.path_generator == "wrt"
-    assert args.wrt_algorithm == "isofuel"
-    assert args.wrt_source_dir == Path("external/WeatherRoutingTool")
 
 
-def test_optimize_accepts_saved_path_solution_flag():
-    args = _parse_args(
-        [
-            "--case",
-            "cases/sept-iles-gaspe",
-            "--path-solution-json",
-            "results/runs/demo/routes/path_solution.json",
-        ]
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["--name", "demo"],
+        ["--dimensions", "1D"],
+        ["--new-ship"],
+        ["--reuse-ship"],
+        ["--new-weather"],
+        ["--reuse-weather"],
+        ["--unit-commitment"],
+        ["--no-unit-commitment"],
+        ["--path-solution-json", "results/runs/demo/routes/path_solution.json"],
+        ["--wrt-algorithm", "isofuel"],
+        ["--wrt-source-dir", "external/WeatherRoutingTool"],
+        ["--wrt-python", "python"],
+        ["--wrt-route-geojson", "results/runs/demo/routes/wrt_route_raw.json"],
+        ["--wrt-precomputed-route", "results/runs/demo/routes/wrt_route_raw.json"],
+        ["--wrt-timeout-s", "60"],
+        ["--wrt-boat-speed-mps", "5"],
+        ["--wrt-use-depth-constraint"],
+        ["--no-wrt-depth-constraint"],
+        ["--cache-scope", "run"],
+        ["--no-save-plots"],
+        ["--save-plots"],
+        ["--no-show-plots"],
+        ["--show-plots"],
+        ["--no-save-solutions"],
+        ["--save-solutions"],
+        ["--no-console-log"],
+        ["--console-log"],
+    ],
+)
+def test_optimize_rejects_toml_backed_cli_flags(extra_args):
+    with pytest.raises(SystemExit):
+        _parse_args(["--case", "cases/sept-iles-gaspe", *extra_args])
+
+
+def test_path_options_are_resolved_from_case_toml(tmp_path):
+    case_dir = tmp_path / "case"
+    case_dir.mkdir()
+    args = _parse_args(["--case", str(case_dir)])
+
+    options = _resolve_path_options(
+        args,
+        {
+            "path_solution_json": "routes/path_solution.json",
+            "wrt_algorithm": "isofuel",
+            "wrt_source_dir": "external/WeatherRoutingTool",
+            "wrt_route_geojson": "routes/wrt_route_raw.geojson",
+            "wrt_python": "python3",
+            "wrt_timeout_s": 60,
+            "wrt_boat_speed_mps": 5.5,
+            "wrt_use_depth_constraint": False,
+        },
+        case_dir,
     )
 
-    assert args.path_solution_json == Path("results/runs/demo/routes/path_solution.json")
-
-
-def test_optimize_accepts_precomputed_wrt_route_flag():
-    args = _parse_args(
-        [
-            "--case",
-            "cases/sept-iles-gaspe",
-            "--path-generator",
-            "wrt",
-            "--wrt-precomputed-route",
-            "results/runs/demo/routes/wrt_route_raw.json",
-        ]
-    )
-
-    assert args.path_generator == "wrt"
-    assert args.wrt_route_geojson == Path("results/runs/demo/routes/wrt_route_raw.json")
+    assert options.path_generator == "saved"
+    assert options.path_solution_json == (case_dir / "routes/path_solution.json").resolve()
+    assert options.wrt_algorithm == "isofuel"
+    assert options.wrt_source_dir == (case_dir / "external/WeatherRoutingTool").resolve()
+    assert options.wrt_route_geojson == (case_dir / "routes/wrt_route_raw.geojson").resolve()
+    assert options.wrt_python == "python3"
+    assert options.wrt_timeout_s == 60
+    assert options.wrt_boat_speed_mps == 5.5
+    assert options.wrt_use_depth_constraint is False
 
 
 def test_optimize_accepts_short_optimizer_flag():

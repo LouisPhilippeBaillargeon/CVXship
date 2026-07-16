@@ -6,7 +6,7 @@
 # min_depth     : Minimum navigable water depth (m)
 # ============================
 [info]
-max_speed       = 10
+max_speed       = 11.27
 rho_water       = 1025
 rho_air         = 1.224
 min_depth       = 15.525
@@ -30,8 +30,8 @@ B               = 25.4
 LWL             = 175.0
 CB              = 0.572
 T               = 9.5
-AL_air          = 3700
-AF_air          = 750
+AL_air          = 3710
+AF_air          = 756
 total_wet_area  = 4927.6
 CDt             = 0.9
 CDlAF_bow       = 0.55

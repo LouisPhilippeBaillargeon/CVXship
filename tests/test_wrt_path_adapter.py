@@ -1,12 +1,20 @@
 import json
+import subprocess
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from lib.load_params import load_itinerary, load_map, load_states
+from lib.load_params import load_itinerary, load_map, load_ship, load_states
 from lib.optimizers import SavedPath, ShortestPath, WeatherRoutingToolPath
-from lib.wrt_adapter import _latlon_route_bounds, parse_wrt_route_geojson, split_polyline_by_map_sets
+from lib.wrt_adapter import (
+    WRTPathRunFiles,
+    _latlon_route_bounds,
+    parse_wrt_route_geojson,
+    prepare_wrt_run_files,
+    run_weather_routing_tool,
+    split_polyline_by_map_sets,
+)
 from lib.weather_interpolation import xy_km_to_latlon
 from lib.utils import dx_dy_km
 
@@ -137,6 +145,120 @@ def test_wrt_default_map_uses_full_cvx_map_extent():
     assert bounds[1] <= -64.0
     assert bounds[2] > 47.7
     assert bounds[3] > -58.0
+
+
+def test_genetic_wrt_config_uses_documented_isofuel_components(tmp_path, monkeypatch):
+    map_obj = load_map(Path("cases/halifax-grande-entree"))
+    itinerary = load_itinerary(map_obj, Path("cases/halifax-grande-entree"))
+    states = load_states(map_obj, itinerary)
+    ship = load_ship(Path("cases/halifax-grande-entree"))
+    end_x, end_y, _ = dx_dy_km(
+        map_obj,
+        itinerary.transits[-1].lat,
+        itinerary.transits[-1].lon,
+    )
+
+    def _fake_weather_file(path, weather_files):
+        path.touch()
+        return path
+
+    def _fake_depth_file(path, default_map, **kwargs):
+        path.touch()
+        return path
+
+    monkeypatch.setattr("lib.wrt_adapter.write_wrt_weather_file", _fake_weather_file)
+    monkeypatch.setattr("lib.wrt_adapter.write_wrt_depth_file", _fake_depth_file)
+
+    run_files = prepare_wrt_run_files(
+        map_obj=map_obj,
+        itinerary=itinerary,
+        states=states,
+        ship=ship,
+        end_xy=np.array([end_x, end_y], dtype=float),
+        work_dir=tmp_path,
+        weather_files={"atmo": tmp_path / "atmo.nc", "currents": tmp_path / "currents.nc"},
+        algorithm="genetic",
+    )
+
+    config = run_files.config
+    assert config["ALGORITHM_TYPE"] == "genetic"
+    assert config["GENETIC_POPULATION_TYPE"] == "isofuel"
+    assert config["GENETIC_CROSSOVER_PATCHER"] == "isofuel"
+    assert config["GENETIC_REPAIR_TYPE"] == ["waypoints_infill", "constraint_violation"]
+    assert "water_depth" in config["CONSTRAINTS_LIST"]
+    assert (run_files.genetic_config_dir / "config.isofuel_single_route.json").exists()
+    assert (run_files.genetic_config_dir / "config.isofuel_multiple_routes.json").exists()
+
+
+def test_genetic_wrt_config_can_opt_out_of_depth_constraint(tmp_path, monkeypatch):
+    map_obj = load_map(Path("cases/halifax-grande-entree"))
+    itinerary = load_itinerary(map_obj, Path("cases/halifax-grande-entree"))
+    states = load_states(map_obj, itinerary)
+    ship = load_ship(Path("cases/halifax-grande-entree"))
+    end_x, end_y, _ = dx_dy_km(
+        map_obj,
+        itinerary.transits[-1].lat,
+        itinerary.transits[-1].lon,
+    )
+
+    def _fake_weather_file(path, weather_files):
+        path.touch()
+        return path
+
+    def _fake_depth_file(path, default_map, **kwargs):
+        path.touch()
+        return path
+
+    monkeypatch.setattr("lib.wrt_adapter.write_wrt_weather_file", _fake_weather_file)
+    monkeypatch.setattr("lib.wrt_adapter.write_wrt_depth_file", _fake_depth_file)
+
+    run_files = prepare_wrt_run_files(
+        map_obj=map_obj,
+        itinerary=itinerary,
+        states=states,
+        ship=ship,
+        end_xy=np.array([end_x, end_y], dtype=float),
+        work_dir=tmp_path,
+        weather_files={"atmo": tmp_path / "atmo.nc", "currents": tmp_path / "currents.nc"},
+        algorithm="genetic",
+        use_depth_constraint=False,
+    )
+
+    assert "water_depth" not in run_files.config["CONSTRAINTS_LIST"]
+
+
+def test_wrt_timeout_after_route_file_continues(tmp_path, monkeypatch):
+    route_dir = tmp_path / "routes"
+    route_dir.mkdir()
+    (route_dir / "min_fuel_route.json").write_text("{}", encoding="utf-8")
+    runner_path = tmp_path / "run_wrt.py"
+    config_path = tmp_path / "wrt_config.json"
+    runner_path.write_text("", encoding="utf-8")
+    config_path.write_text("{}", encoding="utf-8")
+    run_files = WRTPathRunFiles(
+        work_dir=tmp_path,
+        route_dir=route_dir,
+        config_path=config_path,
+        weather_path=tmp_path / "weather.nc",
+        depth_path=tmp_path / "depth.nc",
+        runner_path=runner_path,
+    )
+
+    def _timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(
+            cmd=args[0],
+            timeout=kwargs.get("timeout"),
+            output="partial out",
+            stderr="partial err",
+        )
+
+    monkeypatch.setattr("lib.wrt_adapter.subprocess.run", _timeout)
+
+    proc = run_weather_routing_tool(run_files, timeout_s=0.01)
+
+    assert proc.returncode == 0
+    assert proc.stdout == "partial out"
+    assert proc.stderr == "partial err"
 
 
 def test_weather_routing_tool_path_accepts_precomputed_geojson(tmp_path, monkeypatch):

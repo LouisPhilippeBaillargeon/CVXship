@@ -45,6 +45,7 @@ class RunContext:
     cache_dir: Path
     weather_files: dict[str, Path]
     weather_override: dict[str, Any] | None = None
+    trajectory_generation_time_s: float | None = None
     scenario_name: str | None = None
     weather_variant: str | None = None
     settings: dict[str, Any] = field(default_factory=dict)
@@ -358,6 +359,9 @@ def save_solution_record(
 
     label = canonicalize_optimizer_label(label)
     row = summarize_solution(key, label, sol)
+    row["trajectory_generation_time_s"] = _float_or_none(
+        getattr(ctx, "trajectory_generation_time_s", None)
+    )
     row.update(weather_override_summary_fields(getattr(ctx, "weather_override", None)))
     row["solution_file"] = str(Path("solutions") / filename) if save_solutions else ""
     _log_solution_quality(label, sol)
@@ -365,7 +369,7 @@ def save_solution_record(
 
 
 def write_run_summary_files(ctx: RunContext, rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
-    rows = list(rows)
+    rows = _attach_run_summary_fields(ctx, rows)
     _write_summary_csv(ctx.run_dir / "summary.csv", rows)
     _write_json(ctx.run_dir / "summary.json", rows)
     return rows
@@ -383,12 +387,45 @@ def complete_run_results(
             "status": "completed",
             "completed_at": datetime.now().isoformat(timespec="seconds"),
             "elapsed_seconds": time.perf_counter() - ctx.start_perf_counter,
+            "trajectory_generation_time_s": _float_or_none(
+                getattr(ctx, "trajectory_generation_time_s", None)
+            ),
             "solution_count": len(rows),
             "summary_csv": "summary.csv",
             "summary_json": "summary.json",
         },
     )
     return rows
+
+
+def _attach_run_summary_fields(
+    ctx: RunContext,
+    rows: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    trajectory_time = _float_or_none(getattr(ctx, "trajectory_generation_time_s", None))
+    out = []
+    for row in rows:
+        row = dict(row)
+        if trajectory_time is not None:
+            row["trajectory_generation_time_s"] = trajectory_time
+        else:
+            row.setdefault("trajectory_generation_time_s", None)
+        out.append(row)
+    return out
+
+
+def _fit_range_warning_log_suffix(rec: dict[str, Any]) -> str:
+    details = []
+    bound_side = str(rec.get("bound_side", "") or "")
+    if bound_side:
+        bound_text = bound_side.replace("_and_", " and ").replace("_", " ")
+        details.append(f"bound={bound_text} out-of-bounds")
+
+    recommendation = str(rec.get("recommendation", "") or "")
+    if recommendation:
+        details.append(f"recommendation={recommendation}")
+
+    return f", {', '.join(details)}" if details else ""
 
 
 def _log_solution_quality(label: str, sol: Any) -> None:
@@ -406,12 +443,13 @@ def _log_solution_quality(label: str, sol: Any) -> None:
 
     for key, rec in (getattr(sol, "fit_range_warnings", {}) or {}).items():
         log.warning(
-            "[FIT WARNING] %s: %s: %s count=%s, max_amount=%.6g",
+            "[FIT WARNING] %s: %s: %s count=%s, max_amount=%.6g%s",
             label,
             key,
             rec.get("message", ""),
             rec.get("count", 0),
             float(rec.get("max_amount", 0.0)),
+            _fit_range_warning_log_suffix(rec),
         )
 
     for key, rec in (getattr(sol, "validation_errors", {}) or {}).items():
@@ -644,6 +682,7 @@ def _write_summary_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "first_stage_optimizer",
         "estimated_cost",
         "solve_time",
+        "trajectory_generation_time_s",
         "zone_membership_binary_count",
         "total_distance",
         "final_soc",
