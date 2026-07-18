@@ -347,6 +347,8 @@ def save_solution_record(
     sol: Any,
     *,
     save_solutions: bool = True,
+    path_generation: str | None = None,
+    path_generation_time_s: float | None = None,
 ) -> dict[str, Any] | None:
     if sol is None:
         return None
@@ -359,6 +361,17 @@ def save_solution_record(
 
     label = canonicalize_optimizer_label(label)
     row = summarize_solution(key, label, sol)
+    row["path_generation"] = (
+        str(path_generation)
+        if path_generation not in (None, "")
+        else str(getattr(sol, "path_generation", "") or "")
+    )
+    row["speed_energy"] = label
+    row["path_generation_time_s"] = _float_or_none(
+        path_generation_time_s
+        if path_generation_time_s is not None
+        else getattr(sol, "path_generation_time_s", None)
+    )
     row["trajectory_generation_time_s"] = _float_or_none(
         getattr(ctx, "trajectory_generation_time_s", None)
     )
@@ -406,6 +419,9 @@ def _attach_run_summary_fields(
     out = []
     for row in rows:
         row = dict(row)
+        row.setdefault("path_generation", "")
+        row.setdefault("speed_energy", row.get("label", ""))
+        row.setdefault("path_generation_time_s", row.get("trajectory_generation_time_s"))
         if trajectory_time is not None:
             row["trajectory_generation_time_s"] = trajectory_time
         else:
@@ -677,6 +693,9 @@ def _int_or_none(value: Any) -> int | None:
 
 def _write_summary_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     fieldnames = [
+        "path_generation",
+        "speed_energy",
+        "path_generation_time_s",
         "key",
         "label",
         "first_stage_optimizer",

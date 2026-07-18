@@ -58,6 +58,12 @@ def test_optimize_accepts_path_generator_flag():
     assert args.path_generator == "wrt"
 
 
+def test_optimize_accepts_both_path_generator_flag():
+    args = _parse_args(["--case", "cases/sept-iles-gaspe", "--path-generator", "both"])
+
+    assert args.path_generator == "both"
+
+
 @pytest.mark.parametrize(
     "extra_args",
     [
@@ -124,6 +130,16 @@ def test_path_options_are_resolved_from_case_toml(tmp_path):
     assert options.wrt_timeout_s == 60
     assert options.wrt_boat_speed_mps == 5.5
     assert options.wrt_use_depth_constraint is False
+
+
+def test_path_options_accept_both_from_case_toml(tmp_path):
+    case_dir = tmp_path / "case"
+    case_dir.mkdir()
+    args = _parse_args(["--case", str(case_dir)])
+
+    options = _resolve_path_options(args, {"path_generator": "both"}, case_dir)
+
+    assert options.path_generator == "both"
 
 
 def test_optimize_accepts_short_optimizer_flag():

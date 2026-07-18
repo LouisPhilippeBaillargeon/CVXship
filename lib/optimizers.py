@@ -23,7 +23,7 @@ from lib.wrt_adapter import (
     prepare_wrt_run_files,
     run_weather_routing_tool,
     sets_containing_point,
-    snap_waypoints_to_map_sets,
+    validate_wrt_route_depth,
 )
 from lib.debug_diagnostics import record_optimizer_debug
 from lib.optimizer_names import (
@@ -5022,18 +5022,17 @@ class WeatherRoutingToolPath(ShortestPath):
             start_xy=start,
             end_xy=end,
         )
+        validate_wrt_route_depth(
+            self.map,
+            raw_waypoints,
+            min_depth_m=float(getattr(getattr(self.ship, "info", None), "min_depth", 0.0)),
+        )
         waypoints, set_sequence = self._build_set_aligned_route_from_wrt_polyline(
             raw_waypoints,
             solver=solver,
             verbose=verbose,
             max_set_hops=max_set_hops,
             max_set_sequences=max_set_sequences,
-        )
-
-        self._validate_polyline_segments_inside_sets(
-            waypoints=waypoints,
-            set_sequence=set_sequence,
-            tol=map_set_tolerance_km(self.map),
         )
 
         total_distance = self._polyline_length(waypoints)
@@ -5068,88 +5067,18 @@ class WeatherRoutingToolPath(ShortestPath):
         max_set_hops: Optional[int] = None,
         max_set_sequences: Optional[int] = None,
     ) -> tuple[np.ndarray, list[int]]:
-        set_tol = map_set_tolerance_km(self.map)
-        waypoints, snap_metadata = snap_waypoints_to_map_sets(
-            self.map,
-            raw_waypoints,
-            set_tol_km=min(set_tol, 1e-8),
-        )
-        if snap_metadata["count"]:
-            log.warning(
-                "Snapped %d WRT route points into the CVXship convex-set map "
-                "(max %.3f km, mean %.3f km).",
-                snap_metadata["count"],
-                snap_metadata["max_distance_km"],
-                snap_metadata["mean_distance_km"],
-            )
-        waypoints = drop_duplicate_waypoints(waypoints)
+        del solver, verbose, max_set_hops, max_set_sequences
 
-        corner_xy, set_edges = self._load_set_geometry()
-        aligned_points = [np.asarray(waypoints[0], dtype=float)]
-        set_sequence: list[int] = []
-
-        for segment_idx, next_point in enumerate(waypoints[1:]):
-            start = np.asarray(aligned_points[-1], dtype=float)
-            end = np.asarray(next_point, dtype=float)
-
-            start_sets = sets_containing_point(self.map, start, tol=set_tol)
-            end_sets = sets_containing_point(self.map, end, tol=set_tol)
-            if not start_sets or not end_sets:
-                raise ValueError(
-                    "WeatherRoutingTool route point could not be assigned to a "
-                    f"convex set after snapping. segment={segment_idx}, "
-                    f"start_sets={start_sets}, end_sets={end_sets}."
-                )
-
-            common_sets = sorted(set(start_sets) & set(end_sets))
-            if common_sets:
-                set_id = self._choose_wrt_segment_set(
-                    start,
-                    end,
-                    common_sets,
-                    set_tol,
-                )
-                self._append_wrt_route_segment(
-                    aligned_points,
-                    set_sequence,
-                    end,
-                    set_id,
-                )
-                continue
-
-            bridge = self._solve_wrt_bridge_segment(
-                start=start,
-                end=end,
-                start_sets=start_sets,
-                end_sets=end_sets,
-                corner_xy=corner_xy,
-                set_edges=set_edges,
-                solver=solver,
-                verbose=verbose,
-                max_set_hops=max_set_hops,
-                max_set_sequences=max_set_sequences,
-            )
-            log.debug(
-                "Bridged WRT route segment %s across convex sets %s.",
-                segment_idx,
-                bridge.set_sequence,
-            )
-            for point, set_id in zip(bridge.waypoints[1:], bridge.set_sequence):
-                self._append_wrt_route_segment(
-                    aligned_points,
-                    set_sequence,
-                    point,
-                    set_id,
-                )
-
-        aligned_waypoints = np.asarray(aligned_points, dtype=float)
-        if aligned_waypoints.shape[0] < 2:
+        waypoints = drop_duplicate_waypoints(np.asarray(raw_waypoints, dtype=float))
+        if waypoints.shape[0] < 2:
             raise ValueError("WeatherRoutingToolPath route collapsed to fewer than two points.")
-        if len(set_sequence) != aligned_waypoints.shape[0] - 1:
-            raise ValueError(
-                "Internal WeatherRoutingTool route alignment produced inconsistent set ids."
-            )
-        return aligned_waypoints, set_sequence
+
+        # WRT routes are fixed paths in map coordinates. They are allowed to
+        # pass outside CVXship's convex sets, so these ids are only inert
+        # per-segment placeholders for fixed-path result shapes. optimize.py
+        # rejects WRT when map speed-limit bands would make these ids semantic.
+        set_sequence = [0 for _ in range(waypoints.shape[0] - 1)]
+        return waypoints, set_sequence
 
     def _solve_wrt_bridge_segment(
         self,

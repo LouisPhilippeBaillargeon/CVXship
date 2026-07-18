@@ -30,16 +30,30 @@ def test_save_solution_record_writes_pickle_and_refreshes_summary(tmp_path):
         is_valid=True,
     )
 
-    row = save_solution_record(ctx, "fipse_st", "FiPSE-ST", sol)
+    row = save_solution_record(
+        ctx,
+        "fipse_st",
+        "FiPSE-ST",
+        sol,
+        path_generation="shortest path",
+        path_generation_time_s=0.5,
+    )
     write_run_summary_files(ctx, [row])
 
     assert (ctx.solutions_dir / "fipse_st.pkl").exists()
     assert (run_dir / "summary.csv").exists()
     assert (run_dir / "summary.json").exists()
     assert row["zone_membership_binary_count"] == 18
+    assert row["path_generation"] == "shortest path"
+    assert row["speed_energy"] == "FiPSE-ST"
+    assert row["path_generation_time_s"] == 0.5
     assert row["trajectory_generation_time_s"] == 1.234
     summary_csv = (run_dir / "summary.csv").read_text(encoding="utf-8")
+    assert summary_csv.splitlines()[0].startswith(
+        "path_generation,speed_energy,path_generation_time_s"
+    )
     assert "zone_membership_binary_count" in summary_csv
+    assert "path_generation_time_s" in summary_csv
     assert "trajectory_generation_time_s" in summary_csv
     assert "1.234" in summary_csv
     assert Path(row["solution_file"]) == Path("solutions/fipse_st.pkl")

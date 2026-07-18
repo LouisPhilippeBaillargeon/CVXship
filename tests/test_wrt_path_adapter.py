@@ -1,6 +1,7 @@
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -8,12 +9,14 @@ import pytest
 from lib.load_params import load_itinerary, load_map, load_ship, load_states
 from lib.optimizers import SavedPath, ShortestPath, WeatherRoutingToolPath
 from lib.wrt_adapter import (
+    WRTPathInfeasibleError,
     WRTPathRunFiles,
     _latlon_route_bounds,
     parse_wrt_route_geojson,
     prepare_wrt_run_files,
     run_weather_routing_tool,
     split_polyline_by_map_sets,
+    validate_wrt_route_depth,
 )
 from lib.weather_interpolation import xy_km_to_latlon
 from lib.utils import dx_dy_km
@@ -291,7 +294,7 @@ def test_weather_routing_tool_path_accepts_precomputed_geojson(tmp_path, monkeyp
     assert sol.status.startswith("wrt:precomputed:")
 
 
-def test_weather_routing_tool_path_bridges_nonadjacent_wrt_sets(tmp_path):
+def test_weather_routing_tool_path_preserves_nonadjacent_wrt_route(tmp_path):
     map_obj, itinerary, states, end_pos, shortest_sol = _case_shortest_path(
         Path("cases/halifax-grande-entree")
     )
@@ -314,11 +317,38 @@ def test_weather_routing_tool_path_bridges_nonadjacent_wrt_sets(tmp_path):
     )
     sol = path.compute(end_pos)
 
-    assert sol.set_sequence == shortest_sol.set_sequence
-    assert sol.waypoints.shape[0] > raw_route.shape[0]
+    del shortest_sol
+    np.testing.assert_allclose(sol.waypoints, raw_route)
     assert len(sol.set_sequence) == sol.waypoints.shape[0] - 1
-    for z0, z1 in zip(sol.set_sequence[:-1], sol.set_sequence[1:]):
-        assert int(map_obj.set_adj[z0, z1]) == 1
+    assert sol.set_sequence == [0]
+
+
+def test_validate_wrt_route_depth_rejects_shallow_samples(tmp_path):
+    depth_dir = tmp_path / "map"
+    depth_dir.mkdir()
+    (depth_dir / "depth_grid.csv").write_text(
+        "x_km,y_km,depth_m\n"
+        "0,0,-20\n"
+        "1,0,-5\n"
+        "2,0,-20\n",
+        encoding="utf-8",
+    )
+    map_obj = SimpleNamespace(
+        info=SimpleNamespace(
+            resolution_km=1.0,
+            span_km_east=2.0,
+            span_km_north=1.0,
+        ),
+        navigability_map_path=depth_dir / "navigability_map.npy",
+    )
+
+    with pytest.raises(WRTPathInfeasibleError, match="insufficient"):
+        validate_wrt_route_depth(
+            map_obj,
+            np.array([[0.0, 0.0], [2.0, 0.0]], dtype=float),
+            min_depth_m=10.0,
+            sample_spacing_km=1.0,
+        )
 
 
 def test_saved_path_loads_saved_waypoints_and_set_sequence(tmp_path):

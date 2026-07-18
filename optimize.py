@@ -171,7 +171,7 @@ def _parse_args(argv=None):
             f"Choices: {optimizer_choice_text()}."
         ),
     )
-    parser.add_argument("--path-generator", choices=["shortest", "wrt", "saved"], default=None)
+    parser.add_argument("--path-generator", choices=["shortest", "wrt", "both", "saved"], default=None)
     parser.add_argument(
         "--BIG",
         dest="plot_text_size",
@@ -252,9 +252,42 @@ def _normalize_path_generator(value):
         return "wrt"
     if path_generator in {"saved_path", "path_solution"}:
         return "saved"
-    if path_generator not in {"shortest", "wrt", "saved"}:
-        raise ValueError("path_generator must be one of: shortest, wrt, saved")
+    if path_generator not in {"shortest", "wrt", "both", "saved"}:
+        raise ValueError("path_generator must be one of: shortest, wrt, both, saved")
     return path_generator
+
+
+def _path_generation_label(generator, *, wrt_algorithm="genetic"):
+    if generator == "shortest":
+        return "shortest path"
+    if generator == "wrt":
+        return str(wrt_algorithm)
+    if generator == "saved":
+        return "saved path"
+    return str(generator)
+
+
+def _path_candidate_key(generator, *, wrt_algorithm="genetic"):
+    if generator == "wrt":
+        return f"wrt_{wrt_algorithm}"
+    return str(generator)
+
+
+def _path_generators_to_run(path_generator):
+    if path_generator == "both":
+        return ["shortest", "wrt"]
+    return [path_generator]
+
+
+def _fixed_path_optimizer_ids_for_dimensions(resolved_dimensions):
+    keys = [SPACS, GREEDY, FIPSE_TI]
+    if resolved_dimensions in ("1D", "both"):
+        keys.extend([FIPSE_PA, FIPSE_ST])
+    return keys
+
+
+def _path_scoped_key(path_key, optimizer_id, *, use_path_scope):
+    return f"{path_key}__{optimizer_id}" if use_path_scope else optimizer_id
 
 
 def _run_path_option(run_toml_options, key, case_dir):
@@ -394,7 +427,8 @@ def _format_result_table(summary_rows):
         return ["[RESULTS] No solution summaries were written."]
 
     header = (
-        f"{'solution':<36s} {'cost':>14s} {'solve_s':>10s} "
+        f"{'path generation':<16s} {'speed-energy':<28s} "
+        f"{'path_s':>10s} {'cost':>14s} {'solve_s':>10s} "
         f"{'zone_bins':>9s} {'valid':>8s} {'solver':>18s} "
         f"{'warns':>7s} {'errors':>7s}"
     )
@@ -404,7 +438,14 @@ def _format_result_table(summary_rows):
         "-" * len(header),
     ]
     for row in rows:
-        label = str(_row_value(row, "label", _row_value(row, "key", "")))[:36]
+        path_generation = str(_row_value(row, "path_generation", ""))[:16]
+        label = str(
+            _row_value(
+                row,
+                "speed_energy",
+                _row_value(row, "label", _row_value(row, "key", "")),
+            )
+        )[:28]
         is_valid = bool(_row_value(row, "is_valid", True))
         validity = "valid" if is_valid else "invalid"
         solver_status = str(_row_value(row, "solver_status", "") or "n/a")[:18]
@@ -417,7 +458,9 @@ def _format_result_table(summary_rows):
             else f"{warning_count}+{fit_warning_count}f"
         )
         lines.append(
-            f"{label:<36s} "
+            f"{path_generation:<16s} "
+            f"{label:<28s} "
+            f"{_row_float_label(row, 'path_generation_time_s', width=10)} "
             f"{_row_float_label(row, 'estimated_cost', width=14)} "
             f"{_row_float_label(row, 'solve_time', width=10)} "
             f"{_row_int_label(row, 'zone_membership_binary_count', width=9)} "
@@ -521,11 +564,13 @@ def _run_relative_path(run_context, path):
         return str(path)
 
 
-def _save_path_artifacts(run_context, path_generator, path_obj):
+def _save_path_artifacts(run_context, path_generator, path_obj, *, path_key=None):
     if path_obj.sol is None:
         raise RuntimeError("Cannot save path artifacts before path.compute().")
 
     routes_dir = run_context.run_dir / "routes"
+    if path_key:
+        routes_dir = routes_dir / str(path_key)
     routes_dir.mkdir(parents=True, exist_ok=True)
 
     raw_route_file = None
@@ -698,15 +743,42 @@ def _expected_optimizer_keys(args, run_toml_options):
         args,
         run_toml_options,
     )
-    keys = [SPACS, GREEDY, FIPSE_TI]
+    path_generator_raw = _option(args.path_generator, run_toml_options, "path_generator", None)
+    path_solution_json = run_toml_options.get("path_solution_json")
+    path_generator = _normalize_path_generator(
+        path_generator_raw
+        if path_generator_raw is not None
+        else ("saved" if path_solution_json is not None else "shortest")
+    )
+    if path_generator == "wrt" and selected_optimizer is None:
+        resolved_dimensions = "1D"
+
+    use_path_scope = path_generator == "both"
+    fixed_path_generators = ["shortest"] if path_generator == "both" else [path_generator]
+    if selected_optimizer is None:
+        fixed_optimizer_ids = _fixed_path_optimizer_ids_for_dimensions(resolved_dimensions)
+    else:
+        fixed_optimizer_ids = [SPACS, GREEDY, FIPSE_TI]
+        if selected_optimizer in {FIPSE_PA, FIPSE_ST} and selected_optimizer not in fixed_optimizer_ids:
+            fixed_optimizer_ids.append(selected_optimizer)
+    keys = []
+    for generator in fixed_path_generators:
+        path_key = _path_candidate_key(
+            generator,
+            wrt_algorithm=str(run_toml_options.get("wrt_algorithm", "genetic")).lower(),
+        )
+        for optimizer_id in fixed_optimizer_ids:
+            keys.append(
+                _path_scoped_key(path_key, optimizer_id, use_path_scope=use_path_scope)
+            )
+
     if selected_optimizer is not None:
+        if selected_optimizer in {SPACS, GREEDY, FIPSE_TI, FIPSE_PA, FIPSE_ST}:
+            return keys
         if selected_optimizer not in keys:
             keys.append(selected_optimizer)
         return keys
 
-    if resolved_dimensions in ("1D", "both"):
-        keys.append(FIPSE_PA)
-        keys.append(FIPSE_ST)
     if resolved_dimensions in ("2D", "both"):
         keys.append(JOPSE_D)
     if resolved_dimensions == "both":
@@ -1114,7 +1186,18 @@ if __name__ == "__main__":
 
     def save_evaluated_solutions(*records):
         new_rows = []
-        for key, label, sol in records:
+        for record in records:
+            if len(record) == 3:
+                key, label, sol = record
+                path_generation_for_row = None
+                path_generation_time_for_row = None
+            elif len(record) == 5:
+                key, label, sol, path_generation_for_row, path_generation_time_for_row = record
+            else:
+                raise ValueError(
+                    "solution records must be (key, label, sol) or "
+                    "(key, label, sol, path_generation, path_generation_time_s)."
+                )
             if optimizer_is_done(key):
                 log.progress("[RUN] Skipping saved %s result already present in summary", label)
                 continue
@@ -1124,10 +1207,12 @@ if __name__ == "__main__":
                 label,
                 sol,
                 save_solutions=save_solutions,
+                path_generation=path_generation_for_row,
+                path_generation_time_s=path_generation_time_for_row,
             )
             if row is None:
                 continue
-            solution_records.append((key, label, sol))
+            solution_records.append((key, label, sol, path_generation_for_row))
             summary_rows.append(row)
             completed_solution_keys.add(key)
             new_rows.append(row)
@@ -1150,7 +1235,26 @@ if __name__ == "__main__":
     states = load_states(map, itinerary)
     ship = load_ship(case_dir=run_context.case_dir)
     x, y, _ = dx_dy_km(map, itinerary.transits[-1].lat, itinerary.transits[-1].lon)
-    trajectory_generation_time_s = None
+    shortest_generation_time_s = None
+
+    if path_generator in {"wrt", "both"} and getattr(map, "speed_limit_bands", None):
+        message = (
+            "WRT path generation is not supported for cases with map.toml "
+            "speed_limit bands. Use path_generator = 'shortest' or remove "
+            "the speed limits."
+        )
+        print(message)
+        log.error("[RUN] %s", message)
+        sys.exit(1)
+    if path_generator == "wrt" and selected_optimizer in {
+        JOPSE_D,
+        JOPSE_C_DEPARTURE,
+        JOPSE_C_TRANSITION,
+    }:
+        raise ValueError(
+            "WRT path generation is only supported by fixed-path speed-energy "
+            "optimizers. Use path_generator='shortest' or 'both' for 2D optimizers."
+        )
 
     spacs_reference_path = None
     weather_override = None
@@ -1165,7 +1269,7 @@ if __name__ == "__main__":
         )
         trajectory_start = time.perf_counter()
         spacs_reference_path.compute([x, y], verbose=solver_verbose)
-        trajectory_generation_time_s = time.perf_counter() - trajectory_start
+        shortest_generation_time_s = time.perf_counter() - trajectory_start
         weather_override = finalize_weather_override_against_spacs(
             raw_weather_override,
             path_set_ids=spacs_reference_path.sol.set_sequence,
@@ -1216,41 +1320,43 @@ if __name__ == "__main__":
     _assert_finite("weather.current_x", weather.current_x)
     _assert_finite("weather.current_y", weather.current_y)
 
-    if path_generator == "saved":
-        path = SavedPath(
-            map=map,
-            itinerary=itinerary,
-            states=states,
-            weather=weather,
-            ship=ship,
-            path_solution_json=path_solution_json,
-        )
-        log.progress("[RUN] Loading saved path solution")
-    elif path_generator == "wrt":
-        path = WeatherRoutingToolPath(
-            map=map,
-            itinerary=itinerary,
-            states=states,
-            weather=weather,
-            ship=ship,
-            algorithm=wrt_algorithm,
-            work_dir=run_context.cache_dir / "wrt_path",
-            weather_files=run_context.weather_files,
-            wrt_source_dir=wrt_source_dir,
-            python_executable=wrt_python,
-            route_geojson_path=wrt_route_geojson,
-            boat_speed_mps=(
-                None if wrt_boat_speed_mps is None else float(wrt_boat_speed_mps)
-            ),
-            timeout_s=float(wrt_timeout_s),
-            use_depth_constraint=wrt_use_depth_constraint,
-        )
-        if wrt_route_geojson is not None:
-            log.progress("[RUN] Loading precomputed WeatherRoutingTool route (%s)", wrt_route_geojson)
-        else:
-            log.progress("[RUN] Starting WeatherRoutingTool path solve (%s)", wrt_algorithm)
-    else:
-        path = (
+    def build_path_object(generator):
+        if generator == "saved":
+            log.progress("[RUN] Loading saved path solution")
+            return SavedPath(
+                map=map,
+                itinerary=itinerary,
+                states=states,
+                weather=weather,
+                ship=ship,
+                path_solution_json=path_solution_json,
+            )
+        if generator == "wrt":
+            path_obj = WeatherRoutingToolPath(
+                map=map,
+                itinerary=itinerary,
+                states=states,
+                weather=weather,
+                ship=ship,
+                algorithm=wrt_algorithm,
+                work_dir=run_context.cache_dir / "wrt_path",
+                weather_files=run_context.weather_files,
+                wrt_source_dir=wrt_source_dir,
+                python_executable=wrt_python,
+                route_geojson_path=wrt_route_geojson,
+                boat_speed_mps=(
+                    None if wrt_boat_speed_mps is None else float(wrt_boat_speed_mps)
+                ),
+                timeout_s=float(wrt_timeout_s),
+                use_depth_constraint=wrt_use_depth_constraint,
+            )
+            if wrt_route_geojson is not None:
+                log.progress("[RUN] Loading precomputed WeatherRoutingTool route (%s)", wrt_route_geojson)
+            else:
+                log.progress("[RUN] Starting WeatherRoutingTool path solve (%s)", wrt_algorithm)
+            return path_obj
+
+        path_obj = (
             spacs_reference_path
             if spacs_reference_path is not None
             else ShortestPath(
@@ -1261,34 +1367,105 @@ if __name__ == "__main__":
                 ship=ship,
             )
         )
-        path.weather = weather
-        if path.sol is None:
+        path_obj.weather = weather
+        if path_obj.sol is None:
             log.progress("[RUN] Starting shortest-path solve")
         else:
             log.progress("[RUN] Reusing shortest-path solve used for synthetic weather direction")
+        return path_obj
 
-    if path.sol is None:
-        trajectory_start = time.perf_counter()
-        path.compute([x, y], verbose=solver_verbose)
-        trajectory_generation_time_s = time.perf_counter() - trajectory_start
-    elif trajectory_generation_time_s is None:
-        trajectory_generation_time_s = 0.0
-    run_context.trajectory_generation_time_s = float(trajectory_generation_time_s)
-    path_artifacts = _save_path_artifacts(run_context, path_generator, path)
-    path_artifacts["trajectory_generation_time_s"] = run_context.trajectory_generation_time_s
-    log.progress("[RUN] Saved path artifacts to %s", path_artifacts["path_solution_json"])
-    log.progress(
-        "[RUN] Trajectory generation took %.3f seconds (%s)",
-        run_context.trajectory_generation_time_s,
-        path_generator,
+    def compute_path_candidate(generator):
+        path_obj = build_path_object(generator)
+        generation_time_s = 0.0
+        if path_obj.sol is None:
+            trajectory_start = time.perf_counter()
+            path_obj.compute([x, y], verbose=solver_verbose)
+            generation_time_s = time.perf_counter() - trajectory_start
+        elif generator == "shortest" and shortest_generation_time_s is not None:
+            generation_time_s = float(shortest_generation_time_s)
+
+        path_key = _path_candidate_key(generator, wrt_algorithm=wrt_algorithm)
+        path_generation = _path_generation_label(generator, wrt_algorithm=wrt_algorithm)
+        artifacts = _save_path_artifacts(
+            run_context,
+            generator,
+            path_obj,
+            path_key=path_key if path_generator == "both" else None,
+        )
+        artifacts["path_generation_time_s"] = float(generation_time_s)
+        artifacts["path_generation"] = path_generation
+        log.progress("[RUN] Saved %s path artifacts to %s", path_generation, artifacts["path_solution_json"])
+        log.progress(
+            "[RUN] Path generation took %.3f seconds (%s)",
+            generation_time_s,
+            path_generation,
+        )
+        return SimpleNamespace(
+            generator=generator,
+            key=path_key,
+            path_generation=path_generation,
+            path=path_obj,
+            path_generation_time_s=float(generation_time_s),
+            artifacts=artifacts,
+        )
+
+    path_candidates = []
+    path_failures = []
+    for generator in _path_generators_to_run(path_generator):
+        try:
+            path_candidates.append(compute_path_candidate(generator))
+        except Exception as exc:
+            if generator == "wrt" and path_generator == "both":
+                failure = {
+                    "generator": "wrt",
+                    "path_generation": _path_generation_label("wrt", wrt_algorithm=wrt_algorithm),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+                path_failures.append(failure)
+                log.error(
+                    "[RUN] WRT path generation failed; continuing with shortest path only: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+                continue
+            raise
+
+    if not path_candidates:
+        raise RuntimeError("No path generator produced a usable path.")
+
+    primary_path_candidate = next(
+        (candidate for candidate in path_candidates if candidate.generator == "shortest"),
+        path_candidates[0],
+    )
+    path = primary_path_candidate.path
+    run_context.trajectory_generation_time_s = float(
+        primary_path_candidate.path_generation_time_s
     )
     update_manifest(
         run_context,
         {
-            "path_artifacts": path_artifacts,
+            "path_artifacts": primary_path_candidate.artifacts,
+            "path_candidates": [
+                {
+                    "generator": candidate.generator,
+                    "key": candidate.key,
+                    "path_generation": candidate.path_generation,
+                    "path_generation_time_s": candidate.path_generation_time_s,
+                    "artifacts": candidate.artifacts,
+                }
+                for candidate in path_candidates
+            ],
+            "path_failures": path_failures,
             "trajectory_generation_time_s": run_context.trajectory_generation_time_s,
         },
     )
+
+    if path_generator == "wrt" and dimensions in {"2D", "both"} and selected_optimizer is None:
+        log.warning(
+            "[RUN] WRT-only path generation is not a convex-set route; skipping 2D optimizers."
+        )
+        dimensions = "1D"
 
     path_course_angles = path.compute_course_angles()
     course_angles = np.repeat(path_course_angles[:, None], weather.wind_x.shape[1], axis=1)
@@ -1650,225 +1827,328 @@ if __name__ == "__main__":
         )
         return result
 
-    if optimizer_is_done(SPACS):
-        log.progress("[RUN] Skipping %s evaluated result already present in summary", spacs_label)
-    else:
-        _, spacs_eval_sol, _, _ = evaluate_solution(
-            spacs,
-            spacs_label,
-        )
-        save_evaluated_solutions(
-            (SPACS, spacs_label, spacs_eval_sol),
+    use_path_scope = path_generator == "both"
+
+    def path_optimizer_key(candidate, optimizer_id):
+        return _path_scoped_key(
+            candidate.key,
+            optimizer_id,
+            use_path_scope=use_path_scope,
         )
 
-        maybe_plot_solutions(
-            [spacs.sol, spacs_eval_sol],
-            [f"{spacs_label} estimated solution", f"{spacs_label} evaluated solution"],
-            benchmark_label=f"{spacs_label} evaluated solution",
-            show=False,
-            subfolder=relaxation_quality_dir(SPACS),
-            map=spacs.map,
+    def path_record(candidate, optimizer_id, label, sol):
+        return (
+            path_optimizer_key(candidate, optimizer_id),
+            label,
+            sol,
+            candidate.path_generation,
+            candidate.path_generation_time_s,
         )
 
-    if optimizer_is_done(GREEDY):
-        log.progress("[RUN] Skipping %s result already present in summary", greedy_label)
-    else:
-        greedy = GreedyEnergyDispatchController(
-            map=map,
-            itinerary=itinerary,
-            states=states,
-            weather=weather,
-            ship=ship,
-            path_sol=path.sol,
-            course_angles=course_angles,
-        )
-        greedy.wind_model = base_wind_model
-        greedy.propulsion_model = propulsion_model
-        greedy.generator_models = generatorModels
-        greedy.calm_model = calm_model
-        greedy.nc_sources = nc_sources
-        log.progress("[RUN] Starting %s benchmark", greedy_label)
-        greedy.compute()
-        _, greedy_eval_sol, _, _ = evaluate_solution(
-            greedy,
-            greedy_label,
-        )
-        save_evaluated_solutions(
-            (GREEDY, greedy_label, greedy_eval_sol),
-        )
-        maybe_plot_solutions(
-            [greedy.sol, greedy_eval_sol],
-            [f"{greedy_label} direct dispatch", f"{greedy_label} evaluated solution"],
-            benchmark_label=f"{greedy_label} evaluated solution",
-            show=False,
-            subfolder=relaxation_quality_dir(GREEDY),
-            map=map,
+    def primary_path_record(optimizer_id, label, sol):
+        return (
+            optimizer_id,
+            label,
+            sol,
+            primary_path_candidate.path_generation,
+            primary_path_candidate.path_generation_time_s,
         )
 
-    # ============================================================
-    # FiPSE-TI continuous fixed-path preflight.
-    # Run before any binary formulation so fixed-path issues fail fast.
-    # ============================================================
-    if optimizer_is_done(FIPSE_TI):
-        log.progress("[RUN] Skipping %s result already present in summary", fipse_ti_label)
-    else:
-        fipse_ti_runner = FixedPathTrajectoryIndexedSpeedEnergyOptimizer(
-            wind_model=wind_model_1D,
-            propulsion_model=propulsion_model,
-            calm_model=calm_model,
-            generator_models=generatorModels,
-            map=map,
-            itinerary=itinerary,
-            states=states,
-            weather=weather,
-            ship=ship,
-            ref_speed=ref_speed,
-            waypoints=path.sol.waypoints,
-            path_set_ids=path.sol.set_sequence,
+    def path_log_label(candidate, label):
+        if not use_path_scope:
+            return label
+        return f"{label} ({candidate.path_generation})"
+
+    def ref_speed_for_path(path_sol):
+        return float(path_sol.total_distance / sail_time * 1000.0 / 3600.0)
+
+    def run_fixed_path_suite(candidate):
+        candidate_path = candidate.path
+        candidate_course_angles = np.repeat(
+            candidate_path.compute_course_angles()[:, None],
+            weather.wind_x.shape[1],
+            axis=1,
         )
-        fipse_ti_runner.nc_sources = nc_sources
-        log.progress("[RUN] Starting %s preflight optimization", fipse_ti_label)
-        fipse_ti_ok = fipse_ti_runner.optimize(
-            unit_commitment=False,
-            verbose=solver_verbose,
-        )
-        if not fipse_ti_ok:
-            log.error(
-                "[ABORT] %s preflight failed before binary optimizers could run; "
-                "reason=%s.",
-                fipse_ti_label,
-                getattr(fipse_ti_runner, "failure_reason", "unknown"),
+        candidate_ref_speed = ref_speed_for_path(candidate_path.sol)
+
+        spacs_key = path_optimizer_key(candidate, SPACS)
+        if candidate is primary_path_candidate:
+            path_spacs = spacs
+        else:
+            path_spacs = ShortestPathConstantSpeedController(
+                map=map,
+                itinerary=itinerary,
+                states=states,
+                weather=weather,
+                ship=ship,
+                path_sol=candidate_path.sol,
+                course_angles=candidate_course_angles,
             )
-            sys.exit(1)
+            path_spacs.compute()
+        path_spacs.wind_model = base_wind_model
+        path_spacs.propulsion_model = propulsion_model
+        path_spacs.generator_models = generatorModels
+        path_spacs.calm_model = calm_model
 
-        _, fipse_ti_eval_sol, _, _ = evaluate_solution(
-            fipse_ti_runner,
-            fipse_ti_label,
-        )
-        save_evaluated_solutions(
-            (FIPSE_TI, fipse_ti_label, fipse_ti_eval_sol),
-        )
-        maybe_plot_solutions(
-            [fipse_ti_runner.sol, fipse_ti_eval_sol],
-            [f"Convex {fipse_ti_label} solution", f"{fipse_ti_label} evaluated solution"],
-            benchmark_label=f"{fipse_ti_label} evaluated solution",
-            show=False,
-            subfolder=relaxation_quality_dir(FIPSE_TI),
-            map=fipse_ti_runner.map,
-        )
-
-    if (
-        (dimensions == "1D" or dimensions == "both")
-        and should_run_optimizer(FIPSE_PA)
-        and not optimizer_is_done(FIPSE_PA)
-    ):
-        fipse_pa_runner = FixedPathPathAveragedSpeedEnergyOptimizer(
-            wind_model=wind_model_1D,
-            propulsion_model=propulsion_model,
-            calm_model=calm_model,
-            generator_models=generatorModels,
-            map=map,
-            itinerary=itinerary,
-            states=states,
-            weather=weather,
-            ship=ship,
-            ref_speed=ref_speed,
-            waypoints=path.sol.waypoints,
-            path_set_ids=path.sol.set_sequence,
-        )
-        fipse_pa_runner.nc_sources = nc_sources
-
-        log.progress("[RUN] Starting %s optimization", fipse_pa_label)
-        ok = fipse_pa_runner.optimize(
-            unit_commitment=False,
-            verbose=solver_verbose,
-        )
-        if ok:
-            log.debug("%s optimization succeeded.", fipse_pa_label)
-            _, fipse_pa_eval_sol, _, _ = evaluate_solution(
-                fipse_pa_runner,
-                fipse_pa_label,
+        if optimizer_is_done(spacs_key):
+            log.progress(
+                "[RUN] Skipping %s evaluated result already present in summary",
+                path_log_label(candidate, spacs_label),
+            )
+        else:
+            _, spacs_eval_sol, _, _ = evaluate_solution(
+                path_spacs,
+                path_log_label(candidate, spacs_label),
             )
             save_evaluated_solutions(
-                (FIPSE_PA, fipse_pa_label, fipse_pa_eval_sol),
+                path_record(candidate, SPACS, spacs_label, spacs_eval_sol),
             )
+
             maybe_plot_solutions(
-                [fipse_pa_runner.sol, fipse_pa_eval_sol],
+                [path_spacs.sol, spacs_eval_sol],
                 [
-                    f"Convex {fipse_pa_label} solution",
-                    f"{fipse_pa_label} evaluated solution",
+                    f"{path_log_label(candidate, spacs_label)} estimated solution",
+                    f"{path_log_label(candidate, spacs_label)} evaluated solution",
                 ],
-                benchmark_label=f"{fipse_pa_label} evaluated solution",
+                benchmark_label=f"{path_log_label(candidate, spacs_label)} evaluated solution",
                 show=False,
-                subfolder=relaxation_quality_dir(FIPSE_PA),
-                map=fipse_pa_runner.map,
+                subfolder=relaxation_quality_dir(spacs_key),
+                map=path_spacs.map,
+            )
+
+        greedy_key = path_optimizer_key(candidate, GREEDY)
+        if optimizer_is_done(greedy_key):
+            log.progress(
+                "[RUN] Skipping %s result already present in summary",
+                path_log_label(candidate, greedy_label),
             )
         else:
-            log.error("%s optimization failed.", fipse_pa_label)
-            fipse_pa_eval_sol = _failed_optimizer_summary(
-                fipse_pa_runner,
-                fipse_pa_label,
+            greedy = GreedyEnergyDispatchController(
+                map=map,
+                itinerary=itinerary,
+                states=states,
+                weather=weather,
+                ship=ship,
+                path_sol=candidate_path.sol,
+                course_angles=candidate_course_angles,
+            )
+            greedy.wind_model = base_wind_model
+            greedy.propulsion_model = propulsion_model
+            greedy.generator_models = generatorModels
+            greedy.calm_model = calm_model
+            greedy.nc_sources = nc_sources
+            log.progress("[RUN] Starting %s benchmark", path_log_label(candidate, greedy_label))
+            greedy.compute()
+            _, greedy_eval_sol, _, _ = evaluate_solution(
+                greedy,
+                path_log_label(candidate, greedy_label),
             )
             save_evaluated_solutions(
-                (FIPSE_PA, fipse_pa_label, fipse_pa_eval_sol),
-            )
-
-    if (
-        (dimensions == "1D" or dimensions == "both")
-        and should_run_optimizer(FIPSE_ST)
-        and not optimizer_is_done(FIPSE_ST)
-    ):
-        optimizer = FixedPathSpaceTimeSpeedEnergyOptimizer(
-            wind_model          = wind_model_1D,
-            propulsion_model    = propulsion_model,
-            calm_model          = calm_model,
-            generator_models    = generatorModels,
-            map                 = map,
-            itinerary           = itinerary,
-            states              = states,
-            weather             = weather,
-            ship                = ship,
-            waypoints           = path.sol.waypoints,
-            path_set_ids       = path.sol.set_sequence,
-            ref_speed           = ref_speed
-        )
-        optimizer.nc_sources = nc_sources
-
-        log.progress("[RUN] Starting %s optimization", fipse_st_label)
-        ok = optimizer.optimize(
-            unit_commitment     = unit_commitment,
-            restrict_to_base    = False,
-            min_timestep        = False,
-            base_solution       = spacs.sol,
-            base_set_radius = 1,
-            verbose             = solver_verbose,
-        )
-        if ok:
-            log.debug("%s optimization succeeded.", fipse_st_label)
-            _, fipse_st_eval_sol, _, _ = evaluate_solution(
-                optimizer,
-                fipse_st_label,
-            )
-            save_evaluated_solutions(
-                (FIPSE_ST, fipse_st_label, fipse_st_eval_sol),
+                path_record(candidate, GREEDY, greedy_label, greedy_eval_sol),
             )
             maybe_plot_solutions(
-                [optimizer.sol, fipse_st_eval_sol],
-                [f"Convex {fipse_st_label} solution", f"{fipse_st_label} evaluated solution"],
-                benchmark_label=f"{fipse_st_label} evaluated solution",
+                [greedy.sol, greedy_eval_sol],
+                [
+                    f"{path_log_label(candidate, greedy_label)} direct dispatch",
+                    f"{path_log_label(candidate, greedy_label)} evaluated solution",
+                ],
+                benchmark_label=f"{path_log_label(candidate, greedy_label)} evaluated solution",
                 show=False,
-                subfolder=relaxation_quality_dir(FIPSE_ST),
-                map=optimizer.map,
-            )
-        else:
-            log.error("%s optimization failed.", fipse_st_label)
-            fipse_st_eval_sol = _failed_optimizer_summary(optimizer, fipse_st_label)
-            save_evaluated_solutions(
-                (FIPSE_ST, fipse_st_label, fipse_st_eval_sol),
+                subfolder=relaxation_quality_dir(greedy_key),
+                map=map,
             )
 
-        if dimensions == "1D":
-            print_debug_report()
+        # ============================================================
+        # FiPSE-TI continuous fixed-path preflight.
+        # Run before any binary formulation so fixed-path issues fail fast.
+        # ============================================================
+        fipse_ti_key = path_optimizer_key(candidate, FIPSE_TI)
+        if optimizer_is_done(fipse_ti_key):
+            log.progress(
+                "[RUN] Skipping %s result already present in summary",
+                path_log_label(candidate, fipse_ti_label),
+            )
+        else:
+            fipse_ti_runner = FixedPathTrajectoryIndexedSpeedEnergyOptimizer(
+                wind_model=wind_model_1D,
+                propulsion_model=propulsion_model,
+                calm_model=calm_model,
+                generator_models=generatorModels,
+                map=map,
+                itinerary=itinerary,
+                states=states,
+                weather=weather,
+                ship=ship,
+                ref_speed=candidate_ref_speed,
+                waypoints=candidate_path.sol.waypoints,
+                path_set_ids=candidate_path.sol.set_sequence,
+            )
+            fipse_ti_runner.nc_sources = nc_sources
+            log.progress(
+                "[RUN] Starting %s preflight optimization",
+                path_log_label(candidate, fipse_ti_label),
+            )
+            fipse_ti_ok = fipse_ti_runner.optimize(
+                unit_commitment=False,
+                verbose=solver_verbose,
+            )
+            if not fipse_ti_ok:
+                log.error(
+                    "[ABORT] %s preflight failed before binary optimizers could run; "
+                    "reason=%s.",
+                    path_log_label(candidate, fipse_ti_label),
+                    getattr(fipse_ti_runner, "failure_reason", "unknown"),
+                )
+                fipse_ti_eval_sol = _failed_optimizer_summary(
+                    fipse_ti_runner,
+                    fipse_ti_label,
+                )
+                save_evaluated_solutions(
+                    path_record(candidate, FIPSE_TI, fipse_ti_label, fipse_ti_eval_sol),
+                )
+                if candidate.generator == "wrt" and path_generator == "both":
+                    return
+                sys.exit(1)
+
+            _, fipse_ti_eval_sol, _, _ = evaluate_solution(
+                fipse_ti_runner,
+                path_log_label(candidate, fipse_ti_label),
+            )
+            save_evaluated_solutions(
+                path_record(candidate, FIPSE_TI, fipse_ti_label, fipse_ti_eval_sol),
+            )
+            maybe_plot_solutions(
+                [fipse_ti_runner.sol, fipse_ti_eval_sol],
+                [
+                    f"Convex {path_log_label(candidate, fipse_ti_label)} solution",
+                    f"{path_log_label(candidate, fipse_ti_label)} evaluated solution",
+                ],
+                benchmark_label=f"{path_log_label(candidate, fipse_ti_label)} evaluated solution",
+                show=False,
+                subfolder=relaxation_quality_dir(fipse_ti_key),
+                map=fipse_ti_runner.map,
+            )
+
+        fipse_pa_key = path_optimizer_key(candidate, FIPSE_PA)
+        if (
+            (dimensions == "1D" or dimensions == "both")
+            and should_run_optimizer(FIPSE_PA)
+            and not optimizer_is_done(fipse_pa_key)
+        ):
+            fipse_pa_runner = FixedPathPathAveragedSpeedEnergyOptimizer(
+                wind_model=wind_model_1D,
+                propulsion_model=propulsion_model,
+                calm_model=calm_model,
+                generator_models=generatorModels,
+                map=map,
+                itinerary=itinerary,
+                states=states,
+                weather=weather,
+                ship=ship,
+                ref_speed=candidate_ref_speed,
+                waypoints=candidate_path.sol.waypoints,
+                path_set_ids=candidate_path.sol.set_sequence,
+            )
+            fipse_pa_runner.nc_sources = nc_sources
+
+            log.progress("[RUN] Starting %s optimization", path_log_label(candidate, fipse_pa_label))
+            ok = fipse_pa_runner.optimize(
+                unit_commitment=False,
+                verbose=solver_verbose,
+            )
+            if ok:
+                log.debug("%s optimization succeeded.", path_log_label(candidate, fipse_pa_label))
+                _, fipse_pa_eval_sol, _, _ = evaluate_solution(
+                    fipse_pa_runner,
+                    path_log_label(candidate, fipse_pa_label),
+                )
+                save_evaluated_solutions(
+                    path_record(candidate, FIPSE_PA, fipse_pa_label, fipse_pa_eval_sol),
+                )
+                maybe_plot_solutions(
+                    [fipse_pa_runner.sol, fipse_pa_eval_sol],
+                    [
+                        f"Convex {path_log_label(candidate, fipse_pa_label)} solution",
+                        f"{path_log_label(candidate, fipse_pa_label)} evaluated solution",
+                    ],
+                    benchmark_label=f"{path_log_label(candidate, fipse_pa_label)} evaluated solution",
+                    show=False,
+                    subfolder=relaxation_quality_dir(fipse_pa_key),
+                    map=fipse_pa_runner.map,
+                )
+            else:
+                log.error("%s optimization failed.", path_log_label(candidate, fipse_pa_label))
+                fipse_pa_eval_sol = _failed_optimizer_summary(
+                    fipse_pa_runner,
+                    fipse_pa_label,
+                )
+                save_evaluated_solutions(
+                    path_record(candidate, FIPSE_PA, fipse_pa_label, fipse_pa_eval_sol),
+                )
+
+        fipse_st_key = path_optimizer_key(candidate, FIPSE_ST)
+        if (
+            (dimensions == "1D" or dimensions == "both")
+            and should_run_optimizer(FIPSE_ST)
+            and not optimizer_is_done(fipse_st_key)
+        ):
+            optimizer = FixedPathSpaceTimeSpeedEnergyOptimizer(
+                wind_model          = wind_model_1D,
+                propulsion_model    = propulsion_model,
+                calm_model          = calm_model,
+                generator_models    = generatorModels,
+                map                 = map,
+                itinerary           = itinerary,
+                states              = states,
+                weather             = weather,
+                ship                = ship,
+                waypoints           = candidate_path.sol.waypoints,
+                path_set_ids       = candidate_path.sol.set_sequence,
+                ref_speed           = candidate_ref_speed
+            )
+            optimizer.nc_sources = nc_sources
+
+            log.progress("[RUN] Starting %s optimization", path_log_label(candidate, fipse_st_label))
+            ok = optimizer.optimize(
+                unit_commitment     = unit_commitment,
+                restrict_to_base    = False,
+                min_timestep        = False,
+                base_solution       = path_spacs.sol,
+                base_set_radius = 1,
+                verbose             = solver_verbose,
+            )
+            if ok:
+                log.debug("%s optimization succeeded.", path_log_label(candidate, fipse_st_label))
+                _, fipse_st_eval_sol, _, _ = evaluate_solution(
+                    optimizer,
+                    path_log_label(candidate, fipse_st_label),
+                )
+                save_evaluated_solutions(
+                    path_record(candidate, FIPSE_ST, fipse_st_label, fipse_st_eval_sol),
+                )
+                maybe_plot_solutions(
+                    [optimizer.sol, fipse_st_eval_sol],
+                    [
+                        f"Convex {path_log_label(candidate, fipse_st_label)} solution",
+                        f"{path_log_label(candidate, fipse_st_label)} evaluated solution",
+                    ],
+                    benchmark_label=f"{path_log_label(candidate, fipse_st_label)} evaluated solution",
+                    show=False,
+                    subfolder=relaxation_quality_dir(fipse_st_key),
+                    map=optimizer.map,
+                )
+            else:
+                log.error("%s optimization failed.", path_log_label(candidate, fipse_st_label))
+                fipse_st_eval_sol = _failed_optimizer_summary(optimizer, fipse_st_label)
+                save_evaluated_solutions(
+                    path_record(candidate, FIPSE_ST, fipse_st_label, fipse_st_eval_sol),
+                )
+
+    for candidate in path_candidates:
+        run_fixed_path_suite(candidate)
+
+    if dimensions == "1D":
+        print_debug_report()
 
     if (
         (dimensions == "2D" or dimensions == "both")
@@ -1910,7 +2190,7 @@ if __name__ == "__main__":
                 jopse_d_label,
             )
             save_evaluated_solutions(
-                (JOPSE_D, jopse_d_label, jopse_d_eval_sol),
+                primary_path_record(JOPSE_D, jopse_d_label, jopse_d_eval_sol),
             )
             maybe_plot_solutions(
                 [optimizer.sol, jopse_d_eval_sol],
@@ -1924,7 +2204,7 @@ if __name__ == "__main__":
             log.error("%s optimization failed.", jopse_d_label)
             jopse_d_eval_sol = _failed_optimizer_summary(optimizer, jopse_d_label)
             save_evaluated_solutions(
-                (JOPSE_D, jopse_d_label, jopse_d_eval_sol),
+                primary_path_record(JOPSE_D, jopse_d_label, jopse_d_eval_sol),
             )
 
         if dimensions == "2D":
@@ -1971,7 +2251,7 @@ if __name__ == "__main__":
                 log.error("%s optimization failed.", label)
                 failed_sol = _failed_optimizer_summary(optimizer, label)
                 save_evaluated_solutions(
-                    (key, label, failed_sol),
+                    primary_path_record(key, label, failed_sol),
                 )
                 return optimizer, failed_sol
 
@@ -1981,7 +2261,7 @@ if __name__ == "__main__":
                 label,
             )
             save_evaluated_solutions(
-                (key, label, eval_sol),
+                primary_path_record(key, label, eval_sol),
             )
             for name in [
                 "prop_power",
@@ -2054,7 +2334,7 @@ if __name__ == "__main__":
 
     available_comparison = [
         (label, sol)
-        for _, label, sol in solution_records
+        for _, label, sol, _ in solution_records
         if sol is not None
     ]
     if not resume_mode and len(available_comparison) >= 2:

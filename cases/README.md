@@ -72,10 +72,15 @@ python optimize.py --case cases/sept-iles-gaspe --path-generator wrt
 Set the WRT details in `case.toml` under `[run]`:
 
 ```toml
-path_generator = "wrt"      # default: "shortest"
+path_generator = "both"     # "shortest", "wrt", or "both"; default: "shortest"
 wrt_algorithm = "genetic"   # or "isofuel"
 wrt_source_dir = "C:/path/to/WeatherRoutingTool"
 ```
+
+When `path_generator = "both"`, fixed-path speed-energy methods are run for
+both the local shortest path and the WRT path. If WRT fails or its route crosses
+locally insufficient depth, the run keeps the shortest-path fixed-path results.
+When `path_generator = "wrt"`, WRT failure stops the run.
 
 The SPaCS-derived model fit range can be expanded or tightened per case in
 `case.toml`:
@@ -116,8 +121,10 @@ path_solution_json = "../../results/runs/<run_id>/routes/path_solution.json" # r
 
 For WRT runs, the WRT water-depth constraint is enabled by default and uses
 `ship.toml` `[info].min_depth` as the required water depth. Disable that WRT
-pre-check with `wrt_use_depth_constraint = false` if you only want CVXship's
-local convex-set validation to police navigability.
+pre-check with `wrt_use_depth_constraint = false` only to skip WRT's own depth
+constraint; CVXship still validates the parsed WRT route against the local
+`map/depth_grid.csv`. WRT path generation is not supported for cases with
+`map.toml` `[[speed_limit]]` bands.
 
 Build or edit a case map with:
 

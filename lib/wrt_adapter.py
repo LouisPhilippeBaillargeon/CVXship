@@ -26,6 +26,10 @@ WRT_ROUTE_FILE_PRIORITY = (
 )
 
 
+class WRTPathInfeasibleError(ValueError):
+    """Raised when a WRT route is geometrically parsed but not navigable."""
+
+
 WRT_GENETIC_ISOFUEL_CONFIGS: dict[str, dict[str, Any]] = {
     "config.isofuel_single_route.json": {
         "ALGORITHM_TYPE": "speedy_isobased",
@@ -810,6 +814,108 @@ def drop_duplicate_waypoints(waypoints: np.ndarray, tol: float = 1e-8) -> np.nda
     if len(cleaned) < 2:
         raise ValueError("Route collapsed to fewer than two distinct waypoints.")
     return np.asarray(cleaned, dtype=float)
+
+
+def _depth_grid_path_for_map(map_obj) -> Path:
+    nav_path = getattr(map_obj, "navigability_map_path", None)
+    if nav_path is None:
+        raise FileNotFoundError("Map has no navigability_map_path; cannot validate WRT route depth.")
+    return Path(nav_path).with_name("depth_grid.csv")
+
+
+def validate_wrt_route_depth(
+    map_obj,
+    waypoints: np.ndarray,
+    *,
+    min_depth_m: float,
+    sample_spacing_km: float | None = None,
+) -> dict[str, Any]:
+    waypoints = drop_duplicate_waypoints(np.asarray(waypoints, dtype=float))
+    min_depth_m = float(min_depth_m)
+    if min_depth_m <= 0.0:
+        return {
+            "sample_count": 0,
+            "min_depth_m": min_depth_m,
+            "shallow_sample_count": 0,
+        }
+
+    depth_grid_path = _depth_grid_path_for_map(map_obj)
+    if not depth_grid_path.exists():
+        raise FileNotFoundError(
+            f"Missing depth grid for WRT route validation: {depth_grid_path}"
+        )
+
+    depth_df = pd.read_csv(depth_grid_path)
+    x_col = "x_km" if "x_km" in depth_df.columns else "x"
+    y_col = "y_km" if "y_km" in depth_df.columns else "y"
+    required = {x_col, y_col, "depth_m"}
+    missing = required - set(depth_df.columns)
+    if missing:
+        raise ValueError(f"{depth_grid_path} is missing columns: {sorted(missing)}")
+
+    depth_df = depth_df[[x_col, y_col, "depth_m"]].copy()
+    depth_df[x_col] = pd.to_numeric(depth_df[x_col], errors="coerce")
+    depth_df[y_col] = pd.to_numeric(depth_df[y_col], errors="coerce")
+    depth_df["depth_m"] = pd.to_numeric(depth_df["depth_m"], errors="coerce")
+    depth_df = depth_df.dropna(subset=[x_col, y_col])
+    if depth_df.empty:
+        raise ValueError(f"{depth_grid_path} has no usable depth samples.")
+
+    if sample_spacing_km is None:
+        resolution = float(
+            getattr(getattr(map_obj, "info", None), "resolution_km", 1.0) or 1.0
+        )
+        sample_spacing_km = max(0.05, 0.5 * resolution)
+    sample_spacing_km = float(sample_spacing_km)
+    if sample_spacing_km <= 0.0:
+        raise ValueError("sample_spacing_km must be positive.")
+
+    samples = []
+    for a, b in zip(waypoints[:-1], waypoints[1:]):
+        length = float(np.linalg.norm(b - a))
+        n_steps = max(1, int(math.ceil(length / sample_spacing_km)))
+        for alpha in np.linspace(0.0, 1.0, n_steps + 1):
+            samples.append((1.0 - alpha) * a + alpha * b)
+    sample_xy = np.asarray(samples, dtype=float)
+
+    info = getattr(map_obj, "info", None)
+    outside = np.zeros(sample_xy.shape[0], dtype=bool)
+    if info is not None:
+        outside = (
+            (sample_xy[:, 0] < 0.0)
+            | (sample_xy[:, 1] < 0.0)
+            | (sample_xy[:, 0] > float(getattr(info, "span_km_east", np.inf)))
+            | (sample_xy[:, 1] > float(getattr(info, "span_km_north", np.inf)))
+        )
+
+    from scipy.spatial import cKDTree
+
+    tree = cKDTree(depth_df[[x_col, y_col]].to_numpy(dtype=float))
+    _, idx = tree.query(sample_xy, k=1)
+    sampled_depth = depth_df["depth_m"].to_numpy(dtype=float)[idx]
+    shallow = outside | ~np.isfinite(sampled_depth) | (sampled_depth > -min_depth_m)
+    if np.any(shallow):
+        bad_depth = sampled_depth[shallow]
+        bad_points = sample_xy[shallow]
+        worst_idx = int(np.nanargmax(np.nan_to_num(bad_depth, nan=np.inf)))
+        worst_point = bad_points[worst_idx]
+        worst_depth = float(bad_depth[worst_idx])
+        reason = "outside depth grid" if bool(outside[shallow][worst_idx]) else "insufficient depth"
+        raise WRTPathInfeasibleError(
+            "WRT route is infeasible in the local depth grid: "
+            f"{int(np.sum(shallow))}/{sample_xy.shape[0]} sampled points have "
+            f"insufficient or unknown depth. Required depth={min_depth_m:.3f} m; "
+            f"worst sample depth={worst_depth:.3f} m at "
+            f"xy=({worst_point[0]:.3f}, {worst_point[1]:.3f}) km "
+            f"({reason})."
+        )
+
+    return {
+        "sample_count": int(sample_xy.shape[0]),
+        "min_depth_m": min_depth_m,
+        "shallow_sample_count": 0,
+        "shallowest_depth_m": float(np.nanmax(sampled_depth)),
+    }
 
 
 def sets_containing_point(map_obj, point: np.ndarray, tol: float = 1e-8) -> list[int]:

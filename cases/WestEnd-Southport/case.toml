@@ -8,6 +8,7 @@ new_weather = true
 solver_verbose = false
 unit_commitment = false
 ordered_sets = false
+path_generator = "both"
 
 [cache]
 scope = "case"
