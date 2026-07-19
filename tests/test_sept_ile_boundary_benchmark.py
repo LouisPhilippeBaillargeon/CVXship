@@ -7,7 +7,7 @@ import benchmark_sept_ile_boundary as boundary
 from benchmark_sept_ile_boundary import _best_summary_rows, _select_better_attempt
 from lib.experiment import RunContext
 from lib.load_params import load_itinerary, load_map, load_ship, load_states
-from lib.optimizer_names import FIPSE_PA, FIPSE_ST, FIPSE_TI
+from lib.optimizer_names import FIPSE_PA, FIPSE_ST, FIPSE_TI, FIPSE_TI_SMOOTH
 from lib.sept_ile_boundary_routes import (
     build_boundary_entry_points,
     build_boundary_routes,
@@ -24,6 +24,11 @@ def test_boundary_benchmark_accepts_optimize_style_plot_flags():
     assert args.save_plots is False
     assert args.show_plots is True
     assert args.plot_text_size == "big"
+
+
+def test_boundary_benchmark_accepts_smooth_interpolation_optimizer_alias():
+    assert boundary._parse_optimizer_ids("smooth_interpolation") == (FIPSE_TI_SMOOTH,)
+    assert FIPSE_TI_SMOOTH in boundary._parse_optimizer_ids("all")
 
 
 def test_sept_ile_boundary_corner_ids_match_current_case_geometry():
@@ -93,6 +98,118 @@ def test_best_attempt_prefers_valid_solution_before_cost():
     best = _select_better_attempt(best, valid_lower)
 
     assert best is valid_lower
+
+
+def test_fipse_ti_boundary_attempt_iterates_reference_and_keeps_best(monkeypatch):
+    created_runners = []
+
+    class FakeFipseTiRunner:
+        def __init__(self, **_kwargs):
+            self.reference_inputs = []
+            self.optimizer_weather_fit_time_s = 0.0
+            self.solver_status = "optimal"
+            self.failure_reason = ""
+            created_runners.append(self)
+
+        def optimize(
+            self,
+            *,
+            unit_commitment=False,
+            verbose=False,
+            reference_path_distance=None,
+        ):
+            assert unit_commitment is False
+            self.reference_inputs.append(
+                None
+                if reference_path_distance is None
+                else np.asarray(reference_path_distance, dtype=float).copy()
+            )
+            iteration = len(self.reference_inputs)
+            self.solve_time = 1.0
+            self.optimizer_weather_fit_time_s += 0.25
+            self.sol = SimpleNamespace(
+                estimated_cost=100.0 - iteration,
+                path_distance=np.array([0.0, float(iteration), 3.0]),
+                solve_time=self.solve_time,
+                T_future=2,
+            )
+            return True
+
+    evaluated_costs = {1: 10.0, 2: 8.0, 3: 9.0}
+
+    def fake_evaluate_solution(runner, _label, **_kwargs):
+        iteration = len(runner.reference_inputs)
+        return SimpleNamespace(
+            estimated_cost=evaluated_costs[iteration],
+            is_valid=True,
+            solve_time=runner.solve_time,
+            T_future=2,
+        )
+
+    monkeypatch.setitem(boundary.OPTIMIZER_CLASSES, FIPSE_TI, FakeFipseTiRunner)
+    monkeypatch.setattr(boundary, "_evaluate_solution", fake_evaluate_solution)
+
+    route = SimpleNamespace(
+        route_index=7,
+        entry=SimpleNamespace(
+            point=np.array([1.0, 2.0]),
+            distance_km=3.0,
+            fraction=0.4,
+        ),
+        path=SimpleNamespace(
+            total_distance=3.0,
+            waypoints=np.array([[0.0, 0.0], [3.0, 0.0]]),
+            set_sequence=np.array([0]),
+        ),
+    )
+
+    attempt = boundary._run_optimizer_attempt(
+        optimizer_id=FIPSE_TI,
+        route=route,
+        map_obj=SimpleNamespace(),
+        itinerary=SimpleNamespace(),
+        states=SimpleNamespace(),
+        weather=SimpleNamespace(),
+        ship=SimpleNamespace(),
+        nc_sources=object(),
+        generator_models=[],
+        calm_model=SimpleNamespace(),
+        propulsion_model=SimpleNamespace(),
+        wind_model_1d=SimpleNamespace(),
+        ref_speed=1.0,
+        spacs_solution=SimpleNamespace(),
+        fit_timings={
+            "calm_fit_time_s": 1.0,
+            "propulsion_fit_time_s": 2.0,
+            "wind_1d_fit_time_s": 3.0,
+        },
+        fit_range=SimpleNamespace(
+            min_speed=0.1,
+            max_speed=1.0,
+            min_resistance=0.2,
+            max_resistance=2.0,
+            min_prop_power=0.3,
+            max_prop_power=3.0,
+        ),
+        solver_verbose=False,
+        unit_commitment=True,
+        fipse_ti_iterations=3,
+    )
+
+    runner = created_runners[0]
+    assert runner.reference_inputs[0] is None
+    np.testing.assert_allclose(runner.reference_inputs[1], [0.0, 1.0, 3.0])
+    np.testing.assert_allclose(runner.reference_inputs[2], [0.0, 2.0, 3.0])
+    np.testing.assert_allclose(runner.sol.path_distance, [0.0, 2.0, 3.0])
+
+    assert attempt["row"]["status"] == "evaluated"
+    assert attempt["solution"].estimated_cost == 8.0
+    assert attempt["solution"].fipse_ti_best_iteration == 2
+    assert attempt["solution"].fipse_ti_completed_iterations == 3
+    assert attempt["row"]["evaluated_cost"] == 8.0
+    assert attempt["row"]["solve_time_s"] == 3.0
+    assert attempt["row"]["optimizer_weather_fit_time_s"] == 0.75
+    assert attempt["row"]["attempt_total_time_s"] == 9.75
 
 
 def test_best_summary_total_time_accounts_for_all_attempts(tmp_path):

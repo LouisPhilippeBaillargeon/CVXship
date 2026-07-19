@@ -27,6 +27,8 @@ def test_save_solution_record_writes_pickle_and_refreshes_summary(tmp_path):
         zone_membership_binary_count=18,
         first_stage_optimizer="FiPSE-ST",
         solver_status="optimal",
+        optimizer_estimated_cost=10.0,
+        evaluation_delta_cost=2.5,
         is_valid=True,
     )
 
@@ -46,6 +48,8 @@ def test_save_solution_record_writes_pickle_and_refreshes_summary(tmp_path):
     assert row["zone_membership_binary_count"] == 18
     assert row["path_generation"] == "shortest path"
     assert row["speed_energy"] == "FiPSE-ST"
+    assert row["optimizer_estimated_cost"] == 10.0
+    assert row["evaluation_delta_cost"] == 2.5
     assert row["path_generation_time_s"] == 0.5
     assert row["trajectory_generation_time_s"] == 1.234
     summary_csv = (run_dir / "summary.csv").read_text(encoding="utf-8")
@@ -53,6 +57,8 @@ def test_save_solution_record_writes_pickle_and_refreshes_summary(tmp_path):
         "path_generation,speed_energy,path_generation_time_s"
     )
     assert "zone_membership_binary_count" in summary_csv
+    assert "optimizer_estimated_cost" in summary_csv
+    assert "evaluation_delta_cost" in summary_csv
     assert "path_generation_time_s" in summary_csv
     assert "trajectory_generation_time_s" in summary_csv
     assert "1.234" in summary_csv

@@ -526,6 +526,12 @@ def summarize_solution(key: str, label: str, sol: Any) -> dict[str, Any]:
             getattr(sol, "first_stage_optimizer", "") or ""
         ),
         "estimated_cost": _float_or_none(getattr(sol, "estimated_cost", None)),
+        "optimizer_estimated_cost": _float_or_none(
+            getattr(sol, "optimizer_estimated_cost", None)
+        ),
+        "evaluation_delta_cost": _float_or_none(
+            getattr(sol, "evaluation_delta_cost", None)
+        ),
         "solve_time": _float_or_none(getattr(sol, "solve_time", None)),
         "zone_membership_binary_count": _int_or_none(
             getattr(sol, "zone_membership_binary_count", None)
@@ -700,6 +706,8 @@ def _write_summary_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "label",
         "first_stage_optimizer",
         "estimated_cost",
+        "optimizer_estimated_cost",
+        "evaluation_delta_cost",
         "solve_time",
         "trajectory_generation_time_s",
         "zone_membership_binary_count",

@@ -1,10 +1,13 @@
+import json
 from pathlib import Path
+import tempfile
 import unittest
 
 import numpy as np
 
 from lib.load_params import load_itinerary, load_map, load_ship, load_states
 from lib.optimizers import (
+    SavedPath,
     ShortestPath,
     _ordered_ids_for_free_set_optimizer,
     _ordered_ids_from_solution,
@@ -41,8 +44,8 @@ class ShortestPathTests(unittest.TestCase):
 
         sol = path.compute(end_pos)
 
-        self.assertEqual(sol.set_sequence, [4, 0, 5, 6, 7, 8])
-        self.assertAlmostEqual(sol.total_distance, 402.44803502508984, places=6)
+        self.assertEqual(sol.set_sequence, [2, 0, 3, 4])
+        self.assertAlmostEqual(sol.total_distance, 436.0048103962264, places=6)
         self.assertEqual(len(sol.set_sequence), sol.waypoints.shape[0] - 1)
         self.assertTrue(np.all(np.linalg.norm(np.diff(sol.waypoints, axis=0), axis=1) > 0.0))
 
@@ -64,9 +67,9 @@ class ShortestPathTests(unittest.TestCase):
         )
         sol = path.compute(end_pos)
 
-        self.assertEqual(bfs_seq, [4, 0, 1, 2, 8])
+        self.assertEqual(bfs_seq, [2, 0, 4])
         self.assertLess(sol.total_distance, bfs_sol.total_distance)
-        self.assertEqual(map_obj.nb_sets, 9)
+        self.assertEqual(map_obj.nb_sets, 5)
 
     def test_shortest_path_output_feeds_constant_speed_reference(self):
         map_obj, itinerary, states, path, end_pos = self._sept_iles_gaspe_path()
@@ -85,6 +88,38 @@ class ShortestPathTests(unittest.TestCase):
         self.assertEqual(ref["set_selection"].shape[1], map_obj.nb_sets)
         self.assertEqual(ref["path_distance"].shape[0], itinerary.nb_timesteps + 1)
         self.assertAlmostEqual(ref["total_distance_km"], sol.total_distance, places=6)
+
+    def test_saved_path_loads_saved_waypoints_and_set_sequence(self):
+        map_obj, itinerary, states, path, end_pos = self._sept_iles_gaspe_path()
+        sol = path.compute(end_pos)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path_json = Path(temp_dir) / "path_solution.json"
+            path_json.write_text(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "waypoints": sol.waypoints.tolist(),
+                        "set_sequence": sol.set_sequence,
+                        "total_distance": sol.total_distance,
+                        "status": sol.status,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            saved_path = SavedPath(
+                map=map_obj,
+                itinerary=itinerary,
+                states=states,
+                weather=None,
+                ship=None,
+                path_solution_json=path_json,
+            )
+            saved_sol = saved_path.compute(end_pos)
+
+            self.assertEqual(saved_sol.set_sequence, sol.set_sequence)
+            np.testing.assert_allclose(saved_sol.waypoints, sol.waypoints)
+            self.assertEqual(saved_sol.status, f"saved:{path_json.name}")
 
     def test_ordered_sets_use_current_halifax_route_sequence(self):
         map_obj = load_map(HALIFAX_GRANDE_ENTREE_CASE_DIR)

@@ -9,7 +9,6 @@ solver_verbose = false
 unit_commitment = false
 ordered_sets = true
 scenarios = ["jan01_synthetic_storm"]
-path_generator = "both"
 
 [cache]
 scope = "case"

@@ -10,6 +10,7 @@ SPACS = "spacs"
 GREEDY = "greedy"
 FIPSE_ST = "fipse_st"
 FIPSE_TI = "fipse_ti"
+FIPSE_TI_SMOOTH = "fipse_ti_smooth"
 FIPSE_PA = "fipse_pa"
 JOPSE_D = "jopse_d"
 JOPSE_C_DEPARTURE = "jopse_c_departure"
@@ -18,6 +19,7 @@ JOPSE_C_TRANSITION = "jopse_c_transition"
 BASELINE_IDS = (SPACS, GREEDY)
 SELECTABLE_OPTIMIZER_IDS = (
     FIPSE_TI,
+    FIPSE_TI_SMOOTH,
     FIPSE_PA,
     FIPSE_ST,
     JOPSE_D,
@@ -93,6 +95,28 @@ OPTIMIZER_NAMES = {
             "Fixed-Path Speed-and-Energy Optimizer with Trajectory-Indexed Weather",
             "FiPSE TI",
             "FiPSE-TI",
+        ),
+    ),
+    FIPSE_TI_SMOOTH: OptimizerName(
+        id=FIPSE_TI_SMOOTH,
+        display_label="FiPSE-TI-SI",
+        formal_name=(
+            "Fixed-Path Speed-and-Energy Optimizer with "
+            "Smooth-Interpolated Trajectory Weather"
+        ),
+        class_name="FixedPathSmoothInterpolatedSpeedEnergyOptimizer",
+        aliases=(
+            "FixedPathSmoothInterpolatedSpeedEnergyOptimizer",
+            "Fixed-Path Speed-and-Energy Optimizer with Smooth-Interpolated Trajectory Weather",
+            "Fixed Path Smooth Interpolated Weather",
+            "smooth_interpolation",
+            "smooth interpolation",
+            "fipse_smooth_interpolation",
+            "fipse_ti_smooth_interpolation",
+            "fipse_ti_smooth",
+            "FiPSE TI smooth",
+            "FiPSE-TI smooth",
+            "FiPSE-TI-SI",
         ),
     ),
     FIPSE_PA: OptimizerName(

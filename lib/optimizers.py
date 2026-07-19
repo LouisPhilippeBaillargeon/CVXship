@@ -15,21 +15,12 @@ from lib.models import BaseWindModel, WindModel1D, WindModelTransition1D, WindMo
 from lib.weather import Weather
 from lib.utils import classify_timesteps, dx_dy_km, compute_port_set_indices, point_in_sets, _compute_tight_big_M_set, _compute_min_set_timesteps, _compute_min_crossing_distance_per_set, build_constant_speed_path_reference, xy_from_path_distance, _ordered_set_corner_ids, _set_edges_from_corner_ids, ship_speed_limit_matrix, build_speed_limit_partitions
 from lib.weather_interpolation import build_path_segment_weather_inputs, interpolated_weather_at, query_time_for_segment, sample_weather_average
-from lib.wrt_adapter import (
-    drop_duplicate_waypoints,
-    find_wrt_route_file,
-    map_set_tolerance_km,
-    parse_wrt_route_geojson,
-    prepare_wrt_run_files,
-    run_weather_routing_tool,
-    sets_containing_point,
-    validate_wrt_route_depth,
-)
 from lib.debug_diagnostics import record_optimizer_debug
 from lib.optimizer_names import (
     FIPSE_PA,
     FIPSE_ST,
     FIPSE_TI,
+    FIPSE_TI_SMOOTH,
     JOPSE_C_DEPARTURE,
     JOPSE_C_TRANSITION,
     JOPSE_D,
@@ -44,6 +35,7 @@ _CVXPY_SUCCESS_STATUSES = {cp.OPTIMAL, cp.OPTIMAL_INACCURATE}
 _SPACS_LABEL = optimizer_display_label(SPACS)
 _FIPSE_ST_LABEL = optimizer_display_label(FIPSE_ST)
 _FIPSE_TI_LABEL = optimizer_display_label(FIPSE_TI)
+_FIPSE_TI_SMOOTH_LABEL = optimizer_display_label(FIPSE_TI_SMOOTH)
 _JOPSE_D_LABEL = optimizer_display_label(JOPSE_D)
 _JOPSE_C_DEPARTURE_LABEL = optimizer_display_label(JOPSE_C_DEPARTURE)
 _JOPSE_C_TRANSITION_LABEL = optimizer_display_label(JOPSE_C_TRANSITION)
@@ -394,6 +386,8 @@ class Solution:
     pre_redispatch_ems_validation_warnings: Dict = field(default_factory=dict)
     pre_redispatch_ems_validation_errors: Dict = field(default_factory=dict)
     fit_range_warnings    : Dict = field(default_factory=dict)
+    optimizer_estimated_cost: Optional[float] = None
+    evaluation_delta_cost : Optional[float] = None
 
 
 @dataclass
@@ -3401,6 +3395,48 @@ def _fixed_path_equidistant_sample_points(waypoints, n_points: int = 10):
     return distances, points
 
 
+def _validate_smooth_interpolation_sample_count(n_points: int) -> int:
+    if isinstance(n_points, bool):
+        raise ValueError("smooth_interpolation_sample_count must be a positive odd integer.")
+    try:
+        n = int(n_points)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "smooth_interpolation_sample_count must be a positive odd integer."
+        ) from exc
+    if n < 1 or n % 2 == 0:
+        raise ValueError("smooth_interpolation_sample_count must be a positive odd integer.")
+    return n
+
+
+def _smooth_interpolation_reference_distances(
+    path_distance,
+    timestep_index: int,
+    *,
+    n_points: int = 5,
+) -> np.ndarray:
+    d_ref = np.asarray(path_distance, dtype=float).reshape(-1)
+    if d_ref.size < 2:
+        raise ValueError("path_distance must contain at least two timestep edges.")
+    if not np.all(np.isfinite(d_ref)):
+        raise ValueError("path_distance must contain only finite values.")
+
+    n = _validate_smooth_interpolation_sample_count(n_points)
+    half_width = n // 2
+    center_index = float(timestep_index) + 0.5
+    query_indices = center_index + 0.5 * np.arange(-half_width, half_width + 1)
+    max_index = float(d_ref.size - 1)
+    query_indices = query_indices[
+        (query_indices >= 0.0)
+        & (query_indices <= max_index)
+    ]
+    if query_indices.size == 0:
+        raise ValueError("smooth interpolation produced no in-range reference samples.")
+
+    edge_indices = np.arange(d_ref.size, dtype=float)
+    return np.interp(query_indices, edge_indices, d_ref)
+
+
 @dataclass
 class FixedPathTrajectoryIndexedSpeedEnergyOptimizer:
     """
@@ -3427,6 +3463,7 @@ class FixedPathTrajectoryIndexedSpeedEnergyOptimizer:
     path_set_ids       : List[int]
     weather_sampling_mode: str = "trajectory_midpoint"
     path_average_sample_count: int = 10
+    smooth_interpolation_sample_count: int = 5
     optimizer_id: str = FIPSE_TI
 
     sol: Optional[Solution] = field(default=None, init=False)
@@ -3439,6 +3476,8 @@ class FixedPathTrajectoryIndexedSpeedEnergyOptimizer:
     sampled_course_angle: Optional[np.ndarray] = field(default=None, init=False)
     path_average_distances: Optional[np.ndarray] = field(default=None, init=False)
     path_average_points: Optional[np.ndarray] = field(default=None, init=False)
+    smooth_interpolation_distances: Optional[List[np.ndarray]] = field(default=None, init=False)
+    smooth_interpolation_points: Optional[List[np.ndarray]] = field(default=None, init=False)
     nc_sources: Optional[dict] = field(default=None, init=False)
     solver_status: Optional[str] = field(default=None, init=False)
     solve_time: Optional[float] = field(default=None, init=False)
@@ -3447,7 +3486,33 @@ class FixedPathTrajectoryIndexedSpeedEnergyOptimizer:
     def _optimizer_label(self):
         return optimizer_display_label(self.optimizer_id)
 
-    def _precompute_timesampled_weather_models(self):
+    def _validate_weather_reference_path_distance(
+        self,
+        path_distance,
+        *,
+        T_future: int,
+        total_path_length: float,
+        tol: float = 1e-7,
+    ) -> np.ndarray:
+        d_ref = np.asarray(path_distance, dtype=float).reshape(-1)
+        expected_shape = (T_future + 1,)
+        if d_ref.shape != expected_shape:
+            raise ValueError(
+                "reference_path_distance must have shape "
+                f"{expected_shape}, got {d_ref.shape}."
+            )
+        if not np.all(np.isfinite(d_ref)):
+            raise ValueError("reference_path_distance must contain only finite values.")
+        if np.any(np.diff(d_ref) < -tol):
+            raise ValueError("reference_path_distance must be nondecreasing.")
+        if np.min(d_ref) < -tol or np.max(d_ref) > total_path_length + tol:
+            raise ValueError(
+                "reference_path_distance must stay within the fixed path bounds "
+                f"[0, {total_path_length:.6g}] km."
+            )
+        return np.clip(d_ref, 0.0, total_path_length)
+
+    def _precompute_timesampled_weather_models(self, reference_path_distance=None):
         T_future = self.itinerary.nb_timesteps - self.states.timesteps_completed
 
         ref = build_constant_speed_path_reference(
@@ -3472,6 +3537,21 @@ class FixedPathTrajectoryIndexedSpeedEnergyOptimizer:
         segment_lengths = np.linalg.norm(segment_vecs, axis=1)
         segment_dirs = segment_vecs / segment_lengths[:, None]
         D_breaks = np.concatenate(([0.0], np.cumsum(segment_lengths)))
+        total_path_length = float(D_breaks[-1])
+
+        if reference_path_distance is not None:
+            d_ref = self._validate_weather_reference_path_distance(
+                reference_path_distance,
+                T_future=T_future,
+                total_path_length=total_path_length,
+            )
+            ref = dict(ref)
+            ref["constant_speed_path_distance"] = np.asarray(
+                ref["path_distance"],
+                dtype=float,
+            )
+            ref["path_distance"] = d_ref
+            self.ref = ref
 
         wind_x_ts = np.zeros((1, T_future))
         wind_y_ts = np.zeros((1, T_future))
@@ -3496,12 +3576,25 @@ class FixedPathTrajectoryIndexedSpeedEnergyOptimizer:
                 waypoints,
                 self.path_average_sample_count,
             )
+            self.smooth_interpolation_distances = None
+            self.smooth_interpolation_points = None
+        elif weather_sampling_mode == "smooth_interpolation":
+            _validate_smooth_interpolation_sample_count(
+                self.smooth_interpolation_sample_count
+            )
+            self.path_average_distances = None
+            self.path_average_points = None
+            self.smooth_interpolation_distances = []
+            self.smooth_interpolation_points = []
         elif weather_sampling_mode == "trajectory_midpoint":
             self.path_average_distances = None
             self.path_average_points = None
+            self.smooth_interpolation_distances = None
+            self.smooth_interpolation_points = None
         else:
             raise ValueError(
-                "weather_sampling_mode must be one of: trajectory_midpoint, path_average"
+                "weather_sampling_mode must be one of: "
+                "trajectory_midpoint, smooth_interpolation, path_average"
             )
 
         for t in range(T_future):
@@ -3523,6 +3616,24 @@ class FixedPathTrajectoryIndexedSpeedEnergyOptimizer:
                     self.nc_sources,
                     self.map,
                     self.path_average_points,
+                    query_time,
+                )
+            elif weather_sampling_mode == "smooth_interpolation":
+                sample_distances = _smooth_interpolation_reference_distances(
+                    d_ref,
+                    t,
+                    n_points=self.smooth_interpolation_sample_count,
+                )
+                sample_points = np.vstack([
+                    xy_from_path_distance(waypoints, d_sample)
+                    for d_sample in sample_distances
+                ])
+                self.smooth_interpolation_distances.append(sample_distances)
+                self.smooth_interpolation_points.append(sample_points)
+                w = sample_weather_average(
+                    self.nc_sources,
+                    self.map,
+                    sample_points,
                     query_time,
                 )
             else:
@@ -3562,10 +3673,12 @@ class FixedPathTrajectoryIndexedSpeedEnergyOptimizer:
         unit_commitment=False,
         initial_gen_on=None,
         verbose=False,
+        reference_path_distance=None,
     ):
         constraints = []
         self.zone_membership_binary_count = 0
         self.failure_reason = None
+        self.sol = None
         optimizer_label = self._optimizer_label()
         _require_convex_ship_models(self, optimizer_label)
 
@@ -3581,7 +3694,9 @@ class FixedPathTrajectoryIndexedSpeedEnergyOptimizer:
             raise ValueError("No timesteps left to optimize; trip is finished.")
 
         T_future = self.itinerary.nb_timesteps - self.states.timesteps_completed
-        self._precompute_timesampled_weather_models()
+        self._precompute_timesampled_weather_models(
+            reference_path_distance=reference_path_distance,
+        )
         timestep_dt_h = _future_dt_h(self.itinerary, self.states, T_future)
         auxiliary_power = _future_auxiliary_power(self.itinerary, self.states, T_future)
 
@@ -4030,6 +4145,23 @@ class FixedPathTrajectoryIndexedSpeedEnergyOptimizer:
             },
         )
         return 1
+
+
+@dataclass
+class FixedPathSmoothInterpolatedSpeedEnergyOptimizer(
+    FixedPathTrajectoryIndexedSpeedEnergyOptimizer
+):
+    """
+    Fixed-path speed-and-energy optimizer with smoothed trajectory weather.
+
+    The optimization model is identical to FiPSE-TI. Each timestep samples
+    several nearby reference-trajectory positions at the timestep midpoint time
+    and averages the resulting frozen weather values.
+    """
+
+    weather_sampling_mode: str = "smooth_interpolation"
+    smooth_interpolation_sample_count: int = 5
+    optimizer_id: str = FIPSE_TI_SMOOTH
 
 
 @dataclass
@@ -4926,6 +5058,11 @@ class ShortestPath:
         return float(np.sum(np.linalg.norm(np.diff(points, axis=0), axis=1)))
 
 
+def map_set_tolerance_km(map_obj) -> float:
+    resolution = float(getattr(getattr(map_obj, "info", None), "resolution_km", 1.0) or 1.0)
+    return max(1e-6, min(0.02, 0.01 * resolution))
+
+
 @dataclass
 class SavedPath(ShortestPath):
     path_solution_json: Path
@@ -4984,248 +5121,6 @@ class SavedPath(ShortestPath):
         )
         return self.sol
 
-
-@dataclass
-class WeatherRoutingToolPath(ShortestPath):
-    algorithm: str = "genetic"
-    work_dir: Optional[Path] = None
-    weather_files: Optional[dict] = None
-    wrt_source_dir: Optional[Path] = None
-    python_executable: Optional[str] = None
-    route_geojson_path: Optional[Path] = None
-    config_overrides: Optional[dict] = None
-    boat_speed_mps: Optional[float] = None
-    timeout_s: float = 1800.0
-    route_bbox_margin_deg: float = 0.25
-    use_depth_constraint: bool = True
-    last_route_geojson_path: Optional[Path] = field(default=None, init=False)
-    last_route_source: Optional[str] = field(default=None, init=False)
-
-    def compute(
-        self,
-        end_pos,
-        solver: Optional[str] = None,
-        verbose: bool = False,
-        max_set_hops: Optional[int] = None,
-        max_set_sequences: Optional[int] = None,
-    ) -> ShortestPathSolution:
-        start = np.asarray(
-            [self.states.current_x_pos, self.states.current_y_pos],
-            dtype=float,
-        )
-        end = np.asarray(end_pos, dtype=float)
-
-        route_path = self._route_geojson_path(start, end, verbose=verbose)
-        raw_waypoints = parse_wrt_route_geojson(
-            route_path,
-            self.map,
-            start_xy=start,
-            end_xy=end,
-        )
-        validate_wrt_route_depth(
-            self.map,
-            raw_waypoints,
-            min_depth_m=float(getattr(getattr(self.ship, "info", None), "min_depth", 0.0)),
-        )
-        waypoints, set_sequence = self._build_set_aligned_route_from_wrt_polyline(
-            raw_waypoints,
-            solver=solver,
-            verbose=verbose,
-            max_set_hops=max_set_hops,
-            max_set_sequences=max_set_sequences,
-        )
-
-        total_distance = self._polyline_length(waypoints)
-        if total_distance <= 0.0:
-            raise ValueError("WeatherRoutingToolPath produced zero route distance.")
-
-        route_status_kind = (
-            "precomputed"
-            if self.last_route_source == "precomputed"
-            else str(self.algorithm)
-        )
-        self.sol = ShortestPathSolution(
-            waypoints=waypoints,
-            transition_points=np.asarray(waypoints[1:-1], dtype=float),
-            set_sequence=[int(z) for z in set_sequence],
-            portal_endpoints=[],
-            total_distance=float(total_distance),
-            status=f"wrt:{route_status_kind}:{route_path.name}",
-        )
-
-        log.debug("WeatherRoutingToolPath route_file = %s", route_path)
-        log.debug("WeatherRoutingToolPath selected_set_sequence = %s", self.sol.set_sequence)
-        log.debug("WeatherRoutingToolPath total_distance = %s", self.sol.total_distance)
-        return self.sol
-
-    def _build_set_aligned_route_from_wrt_polyline(
-        self,
-        raw_waypoints: np.ndarray,
-        *,
-        solver: Optional[str] = None,
-        verbose: bool = False,
-        max_set_hops: Optional[int] = None,
-        max_set_sequences: Optional[int] = None,
-    ) -> tuple[np.ndarray, list[int]]:
-        del solver, verbose, max_set_hops, max_set_sequences
-
-        waypoints = drop_duplicate_waypoints(np.asarray(raw_waypoints, dtype=float))
-        if waypoints.shape[0] < 2:
-            raise ValueError("WeatherRoutingToolPath route collapsed to fewer than two points.")
-
-        # WRT routes are fixed paths in map coordinates. They are allowed to
-        # pass outside CVXship's convex sets, so these ids are only inert
-        # per-segment placeholders for fixed-path result shapes. optimize.py
-        # rejects WRT when map speed-limit bands would make these ids semantic.
-        set_sequence = [0 for _ in range(waypoints.shape[0] - 1)]
-        return waypoints, set_sequence
-
-    def _solve_wrt_bridge_segment(
-        self,
-        *,
-        start: np.ndarray,
-        end: np.ndarray,
-        start_sets: list[int],
-        end_sets: list[int],
-        corner_xy: Dict[int, np.ndarray],
-        set_edges: Dict[int, set[frozenset[int]]],
-        solver: Optional[str] = None,
-        verbose: bool = False,
-        max_set_hops: Optional[int] = None,
-        max_set_sequences: Optional[int] = None,
-    ) -> ShortestPathSolution:
-        candidate_sequences = self._candidate_set_sequences(
-            start_sets,
-            end_sets,
-            max_set_hops=max_set_hops,
-            max_set_sequences=max_set_sequences,
-        )
-
-        if not candidate_sequences:
-            raise ValueError(
-                "No convex-set bridge found for WeatherRoutingTool route segment "
-                f"from sets {start_sets} to sets {end_sets}."
-            )
-
-        best: Optional[ShortestPathSolution] = None
-        failures = []
-
-        for seq in candidate_sequences:
-            try:
-                candidate = self._solve_set_sequence(
-                    set_seq_idx=seq,
-                    start=start,
-                    end=end,
-                    corner_xy=corner_xy,
-                    set_edges=set_edges,
-                    solver=solver,
-                    verbose=verbose,
-                )
-            except Exception as exc:
-                failures.append((seq, exc))
-                log.debug("WRT bridge candidate failed: seq=%s, error=%s", seq, exc)
-                continue
-
-            if best is None or (
-                candidate.total_distance,
-                len(candidate.set_sequence),
-            ) < (
-                best.total_distance,
-                len(best.set_sequence),
-            ):
-                best = candidate
-
-        if best is None:
-            detail = "; ".join(
-                f"{seq}: {type(exc).__name__}: {exc}" for seq, exc in failures[:5]
-            )
-            raise RuntimeError(
-                "WeatherRoutingToolPath could not solve a convex-set bridge."
-                + (f" First failures: {detail}" if detail else "")
-            )
-
-        return best
-
-    def _choose_wrt_segment_set(
-        self,
-        start: np.ndarray,
-        end: np.ndarray,
-        candidate_sets: list[int],
-        set_tol: float,
-    ) -> int:
-        midpoint = 0.5 * (np.asarray(start, dtype=float) + np.asarray(end, dtype=float))
-        midpoint_sets = set(sets_containing_point(self.map, midpoint, tol=set_tol))
-        for set_id in candidate_sets:
-            if int(set_id) in midpoint_sets:
-                return int(set_id)
-        return max(candidate_sets, key=lambda z: self._set_margin(midpoint, int(z)))
-
-    def _set_margin(self, point: np.ndarray, set_id: int) -> float:
-        point = np.asarray(point, dtype=float)
-        vals = (
-            self.map.set_ineq[0, :, set_id] * point[1]
-            + self.map.set_ineq[1, :, set_id] * point[0]
-            + self.map.set_ineq[2, :, set_id]
-        )
-        return float(np.min(vals))
-
-    @staticmethod
-    def _append_wrt_route_segment(
-        points: list[np.ndarray],
-        set_sequence: list[int],
-        point: np.ndarray,
-        set_id: int,
-        tol: float = 1e-8,
-    ) -> None:
-        point = np.asarray(point, dtype=float)
-        if np.linalg.norm(point - points[-1]) <= tol:
-            return
-        points.append(point)
-        set_sequence.append(int(set_id))
-
-    def _route_geojson_path(self, start: np.ndarray, end: np.ndarray, verbose: bool = False) -> Path:
-        if self.route_geojson_path is not None:
-            path = Path(self.route_geojson_path)
-            if not path.exists():
-                raise FileNotFoundError(f"WeatherRoutingTool route file does not exist: {path}")
-            self.last_route_geojson_path = path.resolve()
-            self.last_route_source = "precomputed"
-            return path
-
-        if self.weather_files is None:
-            raise ValueError(
-                "WeatherRoutingToolPath requires weather_files when route_geojson_path is not provided."
-            )
-
-        work_dir = Path(self.work_dir) if self.work_dir is not None else Path("cache") / "wrt_path"
-        run_files = prepare_wrt_run_files(
-            map_obj=self.map,
-            itinerary=self.itinerary,
-            states=self.states,
-            ship=self.ship,
-            end_xy=end,
-            work_dir=work_dir,
-            weather_files=self.weather_files,
-            algorithm=self.algorithm,
-            boat_speed_mps=self.boat_speed_mps,
-            route_bbox_margin_deg=self.route_bbox_margin_deg,
-            use_depth_constraint=self.use_depth_constraint,
-            config_overrides=self.config_overrides,
-        )
-        run_weather_routing_tool(
-            run_files,
-            wrt_source_dir=self.wrt_source_dir,
-            python_executable=self.python_executable,
-            timeout_s=self.timeout_s,
-            verbose=verbose,
-        )
-        route_path = find_wrt_route_file(run_files.route_dir)
-        self.last_route_geojson_path = route_path.resolve()
-        self.last_route_source = "generated"
-        return route_path
-
-
-WRTPath = WeatherRoutingToolPath
 
 # Legacy import aliases kept for compatibility with old scripts and notebooks.
 JPDSE = JointPathDiscreteSpeedEnergyOptimizer

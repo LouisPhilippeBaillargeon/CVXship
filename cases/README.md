@@ -34,6 +34,15 @@ departure_date = "2025-03-01"
 weather_variant = "mar01"
 ```
 
+FiPSE-TI re-freezes trajectory-indexed weather iteratively. Configure the total
+number of FiPSE-TI solves in `case.toml`; the first solve is the original
+constant-speed-reference solve:
+
+```toml
+[run]
+fipse_ti_iterations = 5  # default; total solves, not extra refinement solves
+```
+
 Weather variants stay in `weather.toml`:
 
 ```toml
@@ -62,25 +71,9 @@ python optimize.py --resume-batch results/batches/<batch_id>
 python optimize.py --case cases/halifax-grande-entree --optimizer jopse_d --variant jan01
 ```
 
-Use the 52North WeatherRoutingTool path generator instead of the local
-shortest path with:
-
-```powershell
-python optimize.py --case cases/sept-iles-gaspe --path-generator wrt
-```
-
-Set the WRT details in `case.toml` under `[run]`:
-
-```toml
-path_generator = "both"     # "shortest", "wrt", or "both"; default: "shortest"
-wrt_algorithm = "genetic"   # or "isofuel"
-wrt_source_dir = "C:/path/to/WeatherRoutingTool"
-```
-
-When `path_generator = "both"`, fixed-path speed-energy methods are run for
-both the local shortest path and the WRT path. If WRT fails or its route crosses
-locally insufficient depth, the run keeps the shortest-path fixed-path results.
-When `path_generator = "wrt"`, WRT failure stops the run.
+`optimize.py` generates one shortest path for the case and uses it as the fixed
+route for the downstream speed-energy modules. The generated route is saved
+before any optimizer is called.
 
 The SPaCS-derived model fit range can be expanded or tightened per case in
 `case.toml`:
@@ -95,36 +88,20 @@ lower_prop_factor = 0.7
 upper_prop_factor = 1.2
 ```
 
-If WeatherRoutingTool is already importable in Python, `wrt_source_dir` is not
-needed. You can also set `WRT_SOURCE_DIR` in the environment, or set
-`wrt_route_geojson = "<file>"` to reuse a route already written by WRT. In that
-reuse mode CVXship skips the WRT input-file preparation and subprocess call,
-then directly projects the supplied route into `path.sol.waypoints` and
-`path.sol.set_sequence` like the local shortest path.
-
-Every run saves the generated route before any optimizer is called:
+Every run saves the generated route:
 
 - `results/runs/<run_id>/routes/path_solution.json`: CVXship-ready projected
   waypoints, set sequence, and distance.
 - `results/runs/<run_id>/routes/path_waypoints.csv`: the same waypoints in a
   spreadsheet-friendly format.
-- `results/runs/<run_id>/routes/wrt_route_raw.json`: the raw WRT GeoJSON route
-  when WRT generated or supplied the route.
 
-The fastest reuse path is:
+To reuse a previously saved CVXship path:
 
 ```toml
 [run]
 path_generator = "saved"
 path_solution_json = "../../results/runs/<run_id>/routes/path_solution.json" # relative to the case dir
 ```
-
-For WRT runs, the WRT water-depth constraint is enabled by default and uses
-`ship.toml` `[info].min_depth` as the required water depth. Disable that WRT
-pre-check with `wrt_use_depth_constraint = false` only to skip WRT's own depth
-constraint; CVXship still validates the parsed WRT route against the local
-`map/depth_grid.csv`. WRT path generation is not supported for cases with
-`map.toml` `[[speed_limit]]` bands.
 
 Build or edit a case map with:
 

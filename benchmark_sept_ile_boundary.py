@@ -38,11 +38,13 @@ from lib.optimizer_names import (
     FIPSE_PA,
     FIPSE_ST,
     FIPSE_TI,
+    FIPSE_TI_SMOOTH,
     normalize_optimizer_id,
     optimizer_display_label,
 )
 from lib.optimizers import (
     FixedPathPathAveragedSpeedEnergyOptimizer,
+    FixedPathSmoothInterpolatedSpeedEnergyOptimizer,
     FixedPathSpaceTimeSpeedEnergyOptimizer,
     FixedPathTrajectoryIndexedSpeedEnergyOptimizer,
     ShortestPathConstantSpeedController,
@@ -58,8 +60,10 @@ from lib.utils import _assert_finite, classify_timesteps
 from lib.weather_interpolation import prepare_nc_interp_source
 from optimize import (
     _active_weather_variant,
+    _best_feasible_iteration_record,
     _cost_or_nan,
     _failed_optimizer_summary,
+    _fipse_ti_iteration_count,
     _fit_range_factor_options,
     _option,
     _print_result_table,
@@ -67,7 +71,7 @@ from optimize import (
 )
 
 
-FIXED_PATH_OPTIMIZERS = (FIPSE_TI, FIPSE_PA, FIPSE_ST)
+FIXED_PATH_OPTIMIZERS = (FIPSE_TI, FIPSE_TI_SMOOTH, FIPSE_PA, FIPSE_ST)
 
 
 class TimedFixedPathTrajectoryIndexedSpeedEnergyOptimizer(
@@ -75,12 +79,16 @@ class TimedFixedPathTrajectoryIndexedSpeedEnergyOptimizer(
 ):
     optimizer_weather_fit_time_s = 0.0
 
-    def _precompute_timesampled_weather_models(self):
+    def _precompute_timesampled_weather_models(self, *args, **kwargs):
         start = time.perf_counter()
         try:
-            return super()._precompute_timesampled_weather_models()
+            return super()._precompute_timesampled_weather_models(*args, **kwargs)
         finally:
-            self.optimizer_weather_fit_time_s = time.perf_counter() - start
+            elapsed = time.perf_counter() - start
+            self.optimizer_weather_fit_time_s = (
+                float(getattr(self, "optimizer_weather_fit_time_s", 0.0) or 0.0)
+                + elapsed
+            )
 
 
 class TimedFixedPathPathAveragedSpeedEnergyOptimizer(
@@ -88,12 +96,33 @@ class TimedFixedPathPathAveragedSpeedEnergyOptimizer(
 ):
     optimizer_weather_fit_time_s = 0.0
 
-    def _precompute_timesampled_weather_models(self):
+    def _precompute_timesampled_weather_models(self, *args, **kwargs):
         start = time.perf_counter()
         try:
-            return super()._precompute_timesampled_weather_models()
+            return super()._precompute_timesampled_weather_models(*args, **kwargs)
         finally:
-            self.optimizer_weather_fit_time_s = time.perf_counter() - start
+            elapsed = time.perf_counter() - start
+            self.optimizer_weather_fit_time_s = (
+                float(getattr(self, "optimizer_weather_fit_time_s", 0.0) or 0.0)
+                + elapsed
+            )
+
+
+class TimedFixedPathSmoothInterpolatedSpeedEnergyOptimizer(
+    FixedPathSmoothInterpolatedSpeedEnergyOptimizer
+):
+    optimizer_weather_fit_time_s = 0.0
+
+    def _precompute_timesampled_weather_models(self, *args, **kwargs):
+        start = time.perf_counter()
+        try:
+            return super()._precompute_timesampled_weather_models(*args, **kwargs)
+        finally:
+            elapsed = time.perf_counter() - start
+            self.optimizer_weather_fit_time_s = (
+                float(getattr(self, "optimizer_weather_fit_time_s", 0.0) or 0.0)
+                + elapsed
+            )
 
 
 class TimedFixedPathSpaceTimeSpeedEnergyOptimizer(
@@ -111,6 +140,7 @@ class TimedFixedPathSpaceTimeSpeedEnergyOptimizer(
 
 OPTIMIZER_CLASSES = {
     FIPSE_TI: TimedFixedPathTrajectoryIndexedSpeedEnergyOptimizer,
+    FIPSE_TI_SMOOTH: TimedFixedPathSmoothInterpolatedSpeedEnergyOptimizer,
     FIPSE_PA: TimedFixedPathPathAveragedSpeedEnergyOptimizer,
     FIPSE_ST: TimedFixedPathSpaceTimeSpeedEnergyOptimizer,
 }
@@ -372,6 +402,109 @@ def _evaluate_solution(runner, label: str, *, solver_verbose: bool, nc_sources):
     return eval_sol
 
 
+def _finite_float_or_none(value) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if np.isfinite(number) else None
+
+
+def _run_fipse_ti_iterations(
+    runner,
+    label: str,
+    *,
+    fipse_ti_iterations: int,
+    solver_verbose: bool,
+    nc_sources,
+):
+    previous_path_distance = None
+    total_solve_time_s = 0.0
+    iteration_records = []
+
+    for iteration in range(1, int(fipse_ti_iterations) + 1):
+        iteration_label = f"{label} iteration {iteration}/{fipse_ti_iterations}"
+        log.progress("[BOUNDARY] Starting %s", iteration_label)
+        ok = runner.optimize(
+            unit_commitment=False,
+            verbose=solver_verbose,
+            reference_path_distance=previous_path_distance,
+        )
+
+        iteration_solve_time = _finite_float_or_none(
+            getattr(runner, "solve_time", None)
+        )
+        if iteration_solve_time is not None:
+            total_solve_time_s += iteration_solve_time
+
+        record = {
+            "iteration": iteration,
+            "optimizer_estimated_cost": None,
+            "evaluated_cost": None,
+            "evaluator_feasible": False,
+            "failure_reason": getattr(runner, "failure_reason", "") or "",
+            "optimizer_solution": None,
+            "evaluated_solution": None,
+            "optimizer_solved": bool(ok),
+        }
+
+        if not ok or runner.sol is None:
+            iteration_records.append(record)
+            break
+
+        record["optimizer_solution"] = runner.sol
+        optimizer_cost = _cost_or_nan(runner.sol)
+        record["optimizer_estimated_cost"] = (
+            float(optimizer_cost) if np.isfinite(optimizer_cost) else None
+        )
+        runner.sol.first_stage_optimizer = label
+
+        eval_sol = _evaluate_solution(
+            runner,
+            iteration_label,
+            solver_verbose=solver_verbose,
+            nc_sources=nc_sources,
+        )
+        record["evaluated_solution"] = eval_sol
+        evaluated_cost = _cost_or_nan(eval_sol)
+        record["evaluated_cost"] = (
+            float(evaluated_cost) if np.isfinite(evaluated_cost) else None
+        )
+        record["evaluator_feasible"] = (
+            bool(getattr(eval_sol, "is_valid", True))
+            and np.isfinite(_cost_or_nan(eval_sol))
+        )
+        record["failure_reason"] = (
+            getattr(eval_sol, "failure_reason", "")
+            or record["failure_reason"]
+            or ""
+        )
+        iteration_records.append(record)
+
+        previous_path_distance = np.asarray(
+            runner.sol.path_distance,
+            dtype=float,
+        ).copy()
+
+    best_record = _best_feasible_iteration_record(iteration_records)
+    if best_record is None:
+        eval_sol = _failed_optimizer_summary(runner, label)
+        eval_sol.solve_time = total_solve_time_s
+        return False, eval_sol, iteration_records
+
+    best_record["selected_best"] = True
+    runner.sol = best_record["optimizer_solution"]
+    runner.solve_time = total_solve_time_s
+    runner.sol.first_stage_optimizer = label
+    eval_sol = best_record["evaluated_solution"]
+    eval_sol.solve_time = total_solve_time_s
+    eval_sol.first_stage_optimizer = label
+    eval_sol.fipse_ti_iterations = int(fipse_ti_iterations)
+    eval_sol.fipse_ti_completed_iterations = len(iteration_records)
+    eval_sol.fipse_ti_best_iteration = best_record["iteration"]
+    return True, eval_sol, iteration_records
+
+
 def _run_optimizer_attempt(
     *,
     optimizer_id: str,
@@ -392,6 +525,7 @@ def _run_optimizer_attempt(
     fit_range: FitRange,
     solver_verbose: bool,
     unit_commitment: bool,
+    fipse_ti_iterations: int,
 ):
     label = optimizer_display_label(optimizer_id)
     optimizer_cls = OPTIMIZER_CLASSES[optimizer_id]
@@ -417,7 +551,24 @@ def _run_optimizer_attempt(
         label,
     )
     optimize_start = time.perf_counter()
-    if optimizer_id == FIPSE_ST:
+    if optimizer_id in {FIPSE_TI, FIPSE_TI_SMOOTH}:
+        _ok, eval_sol, iteration_records = _run_fipse_ti_iterations(
+            runner,
+            label,
+            fipse_ti_iterations=fipse_ti_iterations,
+            solver_verbose=solver_verbose,
+            nc_sources=nc_sources,
+        )
+        has_evaluated_iteration = any(
+            record.get("evaluated_solution") is not None
+            for record in iteration_records
+        )
+        status = (
+            "evaluated"
+            if has_evaluated_iteration
+            else "failed"
+        )
+    elif optimizer_id == FIPSE_ST:
         ok = runner.optimize(
             unit_commitment=unit_commitment,
             restrict_to_base=False,
@@ -431,20 +582,19 @@ def _run_optimizer_attempt(
             unit_commitment=False,
             verbose=solver_verbose,
         )
+        if ok and runner.sol is not None:
+            runner.sol.first_stage_optimizer = label
+            eval_sol = _evaluate_solution(
+                runner,
+                label,
+                solver_verbose=solver_verbose,
+                nc_sources=nc_sources,
+            )
+            status = "evaluated"
+        else:
+            eval_sol = _failed_optimizer_summary(runner, label)
+            status = "failed"
     optimize_wall_time_s = time.perf_counter() - optimize_start
-
-    if ok and runner.sol is not None:
-        runner.sol.first_stage_optimizer = label
-        eval_sol = _evaluate_solution(
-            runner,
-            label,
-            solver_verbose=solver_verbose,
-            nc_sources=nc_sources,
-        )
-        status = "evaluated"
-    else:
-        eval_sol = _failed_optimizer_summary(runner, label)
-        status = "failed"
 
     optimizer_weather_fit_time_s = float(
         getattr(runner, "optimizer_weather_fit_time_s", 0.0) or 0.0
@@ -738,6 +888,7 @@ def _run_single_scenario(args, scenario):
     )
     cache_scope = str(_option(args.cache_scope, cache_toml_options, "scope", "case"))
     fit_range_factors = _fit_range_factor_options(fit_range_toml_options)
+    fipse_ti_iterations = _fipse_ti_iteration_count(run_toml_options)
     optimizer_ids = _parse_optimizer_ids(args.optimizers)
     restricted_sets = _parse_set_ids(args.restricted_sets)
     weather_variant = _active_weather_variant(scenario, args.variant)
@@ -753,6 +904,7 @@ def _run_single_scenario(args, scenario):
         "optimizers": list(optimizer_ids),
         "solver_verbose": solver_verbose,
         "unit_commitment": unit_commitment,
+        "fipse_ti_iterations": fipse_ti_iterations,
         "save_plots": save_plots,
         "show_plots": show_plots,
         "plot_text_size": plot_text_size,
@@ -928,6 +1080,7 @@ def _run_single_scenario(args, scenario):
                         fit_range=fit_range,
                         solver_verbose=solver_verbose,
                         unit_commitment=unit_commitment,
+                        fipse_ti_iterations=fipse_ti_iterations,
                     )
                     attempt_rows.append(attempt["row"])
                     attempts_by_optimizer[optimizer_id].append(attempt["row"])

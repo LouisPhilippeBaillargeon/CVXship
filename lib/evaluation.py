@@ -1762,6 +1762,15 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         getattr(sol, "first_stage_optimizer", None)
         or type(runner).__name__
     )
+    optimizer_estimated_cost = None
+    if getattr(sol, "solver_status", None):
+        try:
+            source_cost = float(getattr(sol, "estimated_cost", np.nan))
+        except (TypeError, ValueError):
+            source_cost = np.nan
+        if np.isfinite(source_cost):
+            optimizer_estimated_cost = source_cost
+
     active_validation_warnings = _merge_validation_maps(
         route_validation_warnings,
         ems_validation_warnings,
@@ -1775,6 +1784,11 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         None
         if propulsion_infeasible
         else float(np.sum(total_cost_all) + generator_transition_cost)
+    )
+    evaluation_delta_cost = (
+        None
+        if optimizer_estimated_cost is None or evaluated_cost is None
+        else float(evaluated_cost) - optimizer_estimated_cost
     )
     failure_reason = getattr(sol, "failure_reason", None)
     if propulsion_infeasible and not failure_reason:
@@ -1836,6 +1850,8 @@ def compute_non_convex_cost_all_timesteps_nc_interpolated(
         pre_redispatch_ems_validation_warnings={},
         pre_redispatch_ems_validation_errors={},
         fit_range_warnings=getattr(sol, "fit_range_warnings", {}) or {},
+        optimizer_estimated_cost=optimizer_estimated_cost,
+        evaluation_delta_cost=evaluation_delta_cost,
     )
 
     def _log_propulsion_infeasible_error(source_label, rec):

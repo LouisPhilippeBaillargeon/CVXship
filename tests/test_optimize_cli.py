@@ -9,12 +9,18 @@ from lib.optimizer_names import (
     FIPSE_PA,
     FIPSE_ST,
     FIPSE_TI,
+    FIPSE_TI_SMOOTH,
     JOPSE_C_DEPARTURE,
     canonicalize_optimizer_label,
 )
 from optimize import (
     FIT_ERROR_REPORT_COLUMNS,
+    FIPSE_TI_ITERATIONS_DEFAULT,
+    FIPSE_TI_SMOOTH_SAMPLE_COUNT_DEFAULT,
+    _best_feasible_iteration_record,
     _expected_optimizer_keys,
+    _fipse_ti_iteration_count,
+    _fipse_ti_smooth_sample_count,
     _fit_range_factor_options,
     _format_result_table,
     _parse_args,
@@ -52,16 +58,38 @@ def test_optimize_accepts_big_plot_flag():
     assert args.plot_text_size == "big"
 
 
-def test_optimize_accepts_path_generator_flag():
-    args = _parse_args(["--case", "cases/sept-iles-gaspe", "--path-generator", "wrt"])
+def test_optimize_accepts_shortest_path_generator_flag():
+    args = _parse_args(["--case", "cases/sept-iles-gaspe", "--path-generator", "shortest"])
 
-    assert args.path_generator == "wrt"
+    assert args.path_generator == "shortest"
 
 
-def test_optimize_accepts_both_path_generator_flag():
-    args = _parse_args(["--case", "cases/sept-iles-gaspe", "--path-generator", "both"])
+def test_optimize_accepts_saved_path_generator_flag():
+    args = _parse_args(["--case", "cases/sept-iles-gaspe", "--path-generator", "saved"])
 
-    assert args.path_generator == "both"
+    assert args.path_generator == "saved"
+
+
+def test_fipse_ti_iterations_default_and_case_toml_override():
+    assert _fipse_ti_iteration_count({}) == FIPSE_TI_ITERATIONS_DEFAULT
+    assert _fipse_ti_iteration_count({"fipse_ti_iterations": 3}) == 3
+
+
+def test_fipse_ti_smooth_sample_count_default_and_case_toml_override():
+    assert _fipse_ti_smooth_sample_count({}) == FIPSE_TI_SMOOTH_SAMPLE_COUNT_DEFAULT
+    assert _fipse_ti_smooth_sample_count({"fipse_ti_smooth_sample_count": 3}) == 3
+
+
+@pytest.mark.parametrize("value", [0, -1, True, "many"])
+def test_fipse_ti_iterations_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="fipse_ti_iterations"):
+        _fipse_ti_iteration_count({"fipse_ti_iterations": value})
+
+
+@pytest.mark.parametrize("value", [0, -1, 2, True, "many"])
+def test_fipse_ti_smooth_sample_count_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="fipse_ti_smooth_sample_count"):
+        _fipse_ti_smooth_sample_count({"fipse_ti_smooth_sample_count": value})
 
 
 @pytest.mark.parametrize(
@@ -76,15 +104,6 @@ def test_optimize_accepts_both_path_generator_flag():
         ["--unit-commitment"],
         ["--no-unit-commitment"],
         ["--path-solution-json", "results/runs/demo/routes/path_solution.json"],
-        ["--wrt-algorithm", "isofuel"],
-        ["--wrt-source-dir", "external/WeatherRoutingTool"],
-        ["--wrt-python", "python"],
-        ["--wrt-route-geojson", "results/runs/demo/routes/wrt_route_raw.json"],
-        ["--wrt-precomputed-route", "results/runs/demo/routes/wrt_route_raw.json"],
-        ["--wrt-timeout-s", "60"],
-        ["--wrt-boat-speed-mps", "5"],
-        ["--wrt-use-depth-constraint"],
-        ["--no-wrt-depth-constraint"],
         ["--cache-scope", "run"],
         ["--no-save-plots"],
         ["--save-plots"],
@@ -110,36 +129,22 @@ def test_path_options_are_resolved_from_case_toml(tmp_path):
         args,
         {
             "path_solution_json": "routes/path_solution.json",
-            "wrt_algorithm": "isofuel",
-            "wrt_source_dir": "external/WeatherRoutingTool",
-            "wrt_route_geojson": "routes/wrt_route_raw.geojson",
-            "wrt_python": "python3",
-            "wrt_timeout_s": 60,
-            "wrt_boat_speed_mps": 5.5,
-            "wrt_use_depth_constraint": False,
         },
         case_dir,
     )
 
     assert options.path_generator == "saved"
     assert options.path_solution_json == (case_dir / "routes/path_solution.json").resolve()
-    assert options.wrt_algorithm == "isofuel"
-    assert options.wrt_source_dir == (case_dir / "external/WeatherRoutingTool").resolve()
-    assert options.wrt_route_geojson == (case_dir / "routes/wrt_route_raw.geojson").resolve()
-    assert options.wrt_python == "python3"
-    assert options.wrt_timeout_s == 60
-    assert options.wrt_boat_speed_mps == 5.5
-    assert options.wrt_use_depth_constraint is False
 
 
-def test_path_options_accept_both_from_case_toml(tmp_path):
+def test_path_options_accept_shortest_from_case_toml(tmp_path):
     case_dir = tmp_path / "case"
     case_dir.mkdir()
     args = _parse_args(["--case", str(case_dir)])
 
-    options = _resolve_path_options(args, {"path_generator": "both"}, case_dir)
+    options = _resolve_path_options(args, {"path_generator": "shortest"}, case_dir)
 
-    assert options.path_generator == "both"
+    assert options.path_generator == "shortest"
 
 
 def test_optimize_accepts_short_optimizer_flag():
@@ -154,13 +159,21 @@ def test_optimize_accepts_path_average_optimizer_alias():
     assert args.optimizer == FIPSE_PA
 
 
+def test_optimize_accepts_smooth_interpolation_optimizer_alias():
+    args = _parse_args(["--case", "cases/sept-iles-gaspe", "--o", "smooth_interpolation"])
+
+    assert args.optimizer == FIPSE_TI_SMOOTH
+
+
 def test_default_expected_optimizers_include_path_average_benchmark():
     args = _parse_args(["--case", "cases/sept-iles-gaspe"])
 
     keys = _expected_optimizer_keys(args, {})
 
+    assert FIPSE_TI_SMOOTH in keys
     assert FIPSE_PA in keys
-    assert keys.index(FIPSE_TI) < keys.index(FIPSE_PA) < keys.index(FIPSE_ST)
+    assert keys.index(FIPSE_TI) < keys.index(FIPSE_TI_SMOOTH)
+    assert keys.index(FIPSE_TI_SMOOTH) < keys.index(FIPSE_PA) < keys.index(FIPSE_ST)
 
 
 def test_optimize_normalizes_optimizer_alias():
@@ -262,6 +275,41 @@ def test_format_result_table_includes_solution_statuses():
     assert "invalid" in table
     assert "infeasible" in table
     assert "energy_status" not in table
+
+
+def test_best_fipse_ti_iteration_ignores_infeasible_but_allows_warnings():
+    records = [
+        {
+            "iteration": 1,
+            "evaluated_cost": 10.0,
+            "evaluated_solution": SimpleNamespace(
+                estimated_cost=10.0,
+                is_valid=False,
+                validation_errors={"speed_limit_violation": {}},
+            ),
+        },
+        {
+            "iteration": 2,
+            "evaluated_cost": 12.0,
+            "evaluated_solution": SimpleNamespace(
+                estimated_cost=12.0,
+                is_valid=True,
+                fit_range_warnings={"wind_speed_outside_fit_range": {}},
+            ),
+        },
+        {
+            "iteration": 3,
+            "evaluated_cost": 13.0,
+            "evaluated_solution": SimpleNamespace(
+                estimated_cost=13.0,
+                is_valid=True,
+            ),
+        },
+    ]
+
+    best = _best_feasible_iteration_record(records)
+
+    assert best["iteration"] == 2
 
 
 def test_print_result_table_is_visible_when_verbose_disabled(tmp_path, capsys):

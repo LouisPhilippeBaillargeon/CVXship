@@ -176,6 +176,72 @@ def _save_and_maybe_show(
     else:
         plt.close(fig)
 
+
+def plot_iteration_objective(
+    iterations,
+    evaluated_costs,
+    *,
+    best_iteration=None,
+    show: bool = False,
+    directory=PLOTS,
+    filename: str = "iteration_objective",
+    text_size: str | bool = "default",
+):
+    set_ieee_plot_style()
+    font_scale = plot_font_scale(text_size)
+    iterations = np.asarray(iterations, dtype=int).reshape(-1)
+    evaluated_costs = np.asarray(evaluated_costs, dtype=float).reshape(-1)
+    if iterations.shape != evaluated_costs.shape:
+        raise ValueError("iterations and evaluated_costs must have the same shape.")
+
+    fig, ax = plt.subplots(figsize=(4.0, 3.0), dpi=150)
+    finite = np.isfinite(evaluated_costs)
+    if np.any(finite):
+        ax.plot(
+            iterations,
+            evaluated_costs,
+            "-o",
+            linewidth=1.2,
+            markersize=4,
+            label="evaluated objective",
+        )
+        if best_iteration is not None:
+            best_mask = (iterations == int(best_iteration)) & finite
+            if np.any(best_mask):
+                ax.scatter(
+                    iterations[best_mask],
+                    evaluated_costs[best_mask],
+                    s=42,
+                    marker="*",
+                    color="tab:red",
+                    zorder=3,
+                    label="best feasible",
+                )
+        ax.legend()
+    else:
+        ax.text(
+            0.5,
+            0.5,
+            "No feasible evaluated iterations",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+        ax.set_ylim(0.0, 1.0)
+
+    if iterations.size:
+        ax.set_xticks(iterations)
+    _finalize_axis(ax, "iteration", "evaluated objective [$]")
+    path = _pdf_output_path(directory, filename)
+    _save_and_maybe_show(
+        fig,
+        filename,
+        show,
+        directory=directory,
+        font_scale=font_scale,
+    )
+    return path
+
 def _get_solution_positions(sol, n_expected=None):
     if not hasattr(sol, "ship_pos") or sol.ship_pos is None:
         return None

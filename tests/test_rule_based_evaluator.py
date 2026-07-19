@@ -600,6 +600,16 @@ class SpeedLimitEvaluatorTests(unittest.TestCase):
         self.assertEqual(evaluated.generator_transition_cost, 0.0)
         self.assertEqual(evaluated.estimated_cost, 0.0)
 
+    def test_solver_objective_delta_is_preserved_on_evaluated_solution(self):
+        runner = self._runner_for_fixed_path([0.0, 5.0])
+        runner.sol.estimated_cost = 2.5
+        runner.sol.solver_status = "optimal"
+
+        evaluated = self._evaluate(runner)
+
+        self.assertEqual(evaluated.optimizer_estimated_cost, 2.5)
+        self.assertEqual(evaluated.evaluation_delta_cost, -2.5)
+
     def test_segmented_fixed_path_commands_are_not_treated_as_half_steps(self):
         runner = self._runner_for_fixed_path(
             [0.0, 10.0],
